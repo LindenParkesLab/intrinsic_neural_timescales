@@ -286,6 +286,76 @@ class SubjectLevelINTsMeasures:
         
         return measures_dict
     
+    def calculate_individual_sa_differential_speedup(self, return_extra=False):
+            """
+            For each subject and condition: Calculate SA differential speedup in INTs.
+            
+            INTs speedup = task INTs - baseline INTs (more negative = faster timescales)
+            SA differential speedup = association_speedup - sensorimotor_speedup
+            
+            Returns:
+            --------
+            measures_dict : dict
+                Keys: '{condition}_sa_differential_speedup', '{condition}_sa_speedup_correlation'
+                Values: arrays of shape (n_subjects,)
+            """
+            baseline_data = self.data_dict[self.baseline]
+            measures_dict = {}
+            
+            # Define region types using SA axis percentiles
+            sa_percentiles = np.percentile(self.sa_axis, [10, 90])
+            sensorimotor_mask = self.sa_axis <= sa_percentiles[0]  # Bottom 10%
+            association_mask = self.sa_axis >= sa_percentiles[1]   # Top 10%
+            
+            print("  Calculating SA differential speedup...")
+            print(f"    Sensorimotor regions (SA ≤ {sa_percentiles[0]:.0f}): {np.sum(sensorimotor_mask)} regions")
+            print(f"    Association regions (SA ≥ {sa_percentiles[1]:.0f}): {np.sum(association_mask)} regions")
+            
+            for condition in self.task_conditions:
+                task_data = self.data_dict[condition]
+                
+                sa_differential_speedups = []
+                association_speedups = []
+                sensorimotor_speedups = []
+                sa_speedup_correlations = []
+                overall_speedups = []
+                
+                for subj in range(self.n_subjects):
+                    # Calculate INT change (task - baseline)
+                    # Negative change = speedup (INTs became faster)
+                    int_change = task_data[subj, :] - baseline_data[subj, :]
+                    
+                    # Mean speedup in each region type
+                    association_speedup = np.mean(int_change[association_mask])
+                    sensorimotor_speedup = np.mean(int_change[sensorimotor_mask])
+                    
+                    # Main measure: Differential speedup
+                    # More negative = greater speedup in association regions
+                    sa_differential_speedup = association_speedup - sensorimotor_speedup
+                    
+                    # Alternative measure: Correlation with SA axis
+                    # More negative = greater speedup in association regions
+                    sa_speedup_correlation, _ = pearsonr(self.sa_axis, int_change)
+                    
+                    # Overall speedup
+                    overall_speedup = np.mean(int_change)
+                    
+                    sa_differential_speedups.append(sa_differential_speedup)
+                    association_speedups.append(association_speedup)
+                    sensorimotor_speedups.append(sensorimotor_speedup)
+                    sa_speedup_correlations.append(sa_speedup_correlation)
+                    overall_speedups.append(overall_speedup)
+                
+                measures_dict[f'{condition}_sa_differential_speedup'] = np.array(sa_differential_speedups)
+                measures_dict[f'{condition}_sa_speedup_correlation'] = np.array(sa_speedup_correlations)
+                
+                if return_extra:
+                    measures_dict[f'{condition}_association_speedup'] = np.array(association_speedups)
+                    measures_dict[f'{condition}_sensorimotor_speedup'] = np.array(sensorimotor_speedups)
+                    measures_dict[f'{condition}_overall_speedup'] = np.array(overall_speedups)
+            
+            return measures_dict
+    
     def calculate_individual_rank_changes(self, return_extra=False):
         """
         For each subject and condition: How much does their relative standing in the group change?
@@ -429,12 +499,13 @@ class SubjectLevelINTsMeasures:
         measures_dict = {'Subject': self.subject_ids}
         
         # Calculate all measure types
-        measures_dict.update(self.calculate_individual_mean_level_changes())
-        measures_dict.update(self.calculate_individual_spatial_variability_changes())
-        measures_dict.update(self.calculate_individual_sa_coupling_changes())
+        measures_dict.update(self.calculate_individual_mean_level_changes(return_extra=False))
+        measures_dict.update(self.calculate_individual_spatial_variability_changes(return_extra=False))
+        measures_dict.update(self.calculate_individual_sa_coupling_changes(return_extra=False))
         measures_dict.update(self.calculate_individual_pattern_stability(return_extra=True))
-        # measures_dict.update(self.calculate_individual_rank_changes())
-        # measures_dict.update(self.calculate_individual_extremeness_changes())
+        measures_dict.update(self.calculate_individual_sa_differential_speedup(return_extra=True))
+        # measures_dict.update(self.calculate_individual_rank_changes(return_extra=False))
+        # measures_dict.update(self.calculate_individual_extremeness_changes(return_extra=False))
         
         # Create DataFrame
         df_measures = pd.DataFrame(measures_dict)
