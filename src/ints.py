@@ -352,7 +352,7 @@ class SubjectLevelINTsMeasures:
                 if return_extra:
                     measures_dict[f'{condition}_association_speedup'] = np.array(association_speedups)
                     measures_dict[f'{condition}_sensorimotor_speedup'] = np.array(sensorimotor_speedups)
-                    measures_dict[f'{condition}_overall_speedup'] = np.array(overall_speedups)
+                    # measures_dict[f'{condition}_overall_speedup'] = np.array(overall_speedups)
             
             return measures_dict
     
@@ -502,8 +502,8 @@ class SubjectLevelINTsMeasures:
         measures_dict.update(self.calculate_individual_mean_level_changes(return_extra=False))
         measures_dict.update(self.calculate_individual_spatial_variability_changes(return_extra=False))
         measures_dict.update(self.calculate_individual_sa_coupling_changes(return_extra=False))
-        measures_dict.update(self.calculate_individual_pattern_stability(return_extra=True))
         measures_dict.update(self.calculate_individual_sa_differential_speedup(return_extra=True))
+        # measures_dict.update(self.calculate_individual_pattern_stability(return_extra=False))
         # measures_dict.update(self.calculate_individual_rank_changes(return_extra=False))
         # measures_dict.update(self.calculate_individual_extremeness_changes(return_extra=False))
         
@@ -628,7 +628,7 @@ class SubjectLevelINTsMeasures:
         
         # All correlations
         sns.heatmap(correlation_results, cmap='RdBu_r', center=0, 
-                   annot=False, fmt='.2f', ax=ax1, 
+                   annot=True, fmt='.2f', ax=ax1, 
                    cbar_kws={'label': 'Correlation Coefficient'})
         ax1.set_title(f'{title}\n(All Correlations)', fontsize=12, fontweight='bold')
         ax1.set_xlabel('Behavioral Measures', fontsize=10)
@@ -768,10 +768,10 @@ def run_ints_behavioral_analysis(data_dict, sa_axis, df_behavior,
     if plot_results and len(significant_results.dropna(how='all', axis=1)) > 0:
         fig = analyzer.plot_behavioral_correlations(
             correlation_results, significant_results,
-            title="Subject-levell INTs measures - HCP behavioral correlations"
+            title="Subject-level INTs measures - HCP behavioral correlations"
         )
     
-    return analyzer, df_measures, correlation_results, significant_results, top_correlations
+    return analyzer, df_measures, correlation_results, significant_results, top_correlations, fig
 
 
 def compute_autocorrelation_function(data):
