@@ -85,8 +85,16 @@ class GroupLevelAnalysis:
             region_mean = region_mean.mean()
             region_var = region_var.mean()
             sa_corr = sa_corr.mean()
+            
+        subject_var = []
+        for region in range(self.n_regions):
+            vals = data[data['region'] == region]['value']
+            subject_var.append(np.var(vals))
+
+        subject_var = np.array(subject_var)
+        sa_corr_var = sp.stats.spearmanr(self.sa_axis, subject_var)[0]
         
-        return region_mean, region_var, sa_corr
+        return region_mean, region_var, sa_corr, sa_corr_var
     
         
     def analyze_condition_changes(self, baseline=None):
@@ -100,25 +108,27 @@ class GroupLevelAnalysis:
         print("Analyzing condition changes relative to {0}...".format(baseline))
         
         baseline_data = self.df[self.df['condition'] == baseline]
-        baseline_region_mean, baseline_region_var, baseline_sa_corr = self._analyze_condition_changes_helper(baseline_data)
+        baseline_region_mean, baseline_region_var, baseline_sa_corr, baseline_sa_corr_var = self._analyze_condition_changes_helper(baseline_data)
 
         results = {}
         for condition in self.condition_names:
-            conditon_data = self.df[self.df['condition'] == condition]
-            conditon_region_mean, conditon_region_var, conditon_sa_corr = self._analyze_condition_changes_helper(conditon_data)
-            region_mean_ratio = conditon_region_mean / baseline_region_mean
-            region_var_ratio = conditon_region_var / baseline_region_var
-            sa_corr_delta = conditon_sa_corr - baseline_sa_corr
+            condition_data = self.df[self.df['condition'] == condition]
+            condition_region_mean, condition_region_var, condition_sa_corr, condition_sa_corr_var = self._analyze_condition_changes_helper(condition_data)
+            region_mean_ratio = condition_region_mean / baseline_region_mean
+            region_var_ratio = condition_region_var / baseline_region_var
+            sa_corr_delta = condition_sa_corr - baseline_sa_corr
+            sa_corr_var_delta = condition_sa_corr_var - baseline_sa_corr_var
             
             # Subject variance ratio (condition/baseline)
             baseline_subj_var = np.var(baseline_data.groupby('subject')['value'].mean())
-            conditon_subj_var = np.var(conditon_data.groupby('subject')['value'].mean())
-            subject_var_ratio = conditon_subj_var / baseline_subj_var
+            condition_subj_var = np.var(condition_data.groupby('subject')['value'].mean())
+            subject_var_ratio = condition_subj_var / baseline_subj_var
             
             results[condition] = {
                 'region_mean_ratio': region_mean_ratio,
                 'region_var_ratio': region_var_ratio,
                 'sa_corr_delta': sa_corr_delta,
+                'sa_corr_var_delta': sa_corr_var_delta,
                 'subject_var_ratio': subject_var_ratio
             }
         
@@ -156,10 +166,10 @@ class GroupLevelAnalysis:
                 print(condition)
                 condition_data = self.df[self.df['condition'] == condition]
                 for region in region_ids:
-                    region_data = condition_data[condition_data['region'] == region]
+                    region_data = condition_data[condition_data['region'] == region]['value']
                     
                     # Between-subjects variance in this region
-                    between_subjects_var = np.var(region_data['value'])
+                    between_subjects_var = np.var(region_data)
                     
                     results.loc[condition, region] = between_subjects_var
         
@@ -346,13 +356,12 @@ class SubjectLevelINTsMeasures:
                     sa_speedup_correlations.append(sa_speedup_correlation)
                     overall_speedups.append(overall_speedup)
                 
-                measures_dict[f'{condition}_sa_differential_speedup'] = np.array(sa_differential_speedups)
                 measures_dict[f'{condition}_sa_speedup_correlation'] = np.array(sa_speedup_correlations)
-                
+                measures_dict[f'{condition}_sa_differential_speedup'] = np.array(sa_differential_speedups)
                 if return_extra:
                     measures_dict[f'{condition}_association_speedup'] = np.array(association_speedups)
                     measures_dict[f'{condition}_sensorimotor_speedup'] = np.array(sensorimotor_speedups)
-                    # measures_dict[f'{condition}_overall_speedup'] = np.array(overall_speedups)
+                    measures_dict[f'{condition}_overall_speedup'] = np.array(overall_speedups)
             
             return measures_dict
     
@@ -499,10 +508,10 @@ class SubjectLevelINTsMeasures:
         measures_dict = {'Subject': self.subject_ids}
         
         # Calculate all measure types
-        measures_dict.update(self.calculate_individual_mean_level_changes(return_extra=False))
-        measures_dict.update(self.calculate_individual_spatial_variability_changes(return_extra=False))
-        measures_dict.update(self.calculate_individual_sa_coupling_changes(return_extra=False))
         measures_dict.update(self.calculate_individual_sa_differential_speedup(return_extra=True))
+        # measures_dict.update(self.calculate_individual_mean_level_changes(return_extra=False))
+        # measures_dict.update(self.calculate_individual_sa_coupling_changes(return_extra=False))
+        measures_dict.update(self.calculate_individual_spatial_variability_changes(return_extra=False))
         # measures_dict.update(self.calculate_individual_pattern_stability(return_extra=False))
         # measures_dict.update(self.calculate_individual_rank_changes(return_extra=False))
         # measures_dict.update(self.calculate_individual_extremeness_changes(return_extra=False))
