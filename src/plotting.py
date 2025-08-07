@@ -511,7 +511,7 @@ def plot_correlation(x, y, x_label=None, y_label=None, title=None,
                     stats_position='upper left', font_size=8,
                     grid=True, grid_alpha=0.3, dpi=300,
                     outlier_threshold=None, highlight_outliers=False, 
-                    save_path=None, return_stats=False):
+                    save_path=None, return_stats=False, ax=None):
     """
     Parameters:
     -----------
@@ -532,7 +532,7 @@ def plot_correlation(x, y, x_label=None, y_label=None, title=None,
     size : float, default 20
         Size of scatter points
     figsize : tuple, default (3, 3)
-        Figure size in inches
+        Figure size in inches (only used if ax=None)
     show_line : bool, default True
         Whether to show regression line
     show_confidence : bool, default True
@@ -551,13 +551,19 @@ def plot_correlation(x, y, x_label=None, y_label=None, title=None,
         Z-score threshold for outlier detection (e.g., 2.5)
     highlight_outliers : bool, default False
         Whether to highlight outliers in different color
+    save_path : str, optional
+        Path to save the figure (only used if ax=None)
     return_stats : bool, default False
         Whether to return correlation statistics
+    ax : matplotlib.axes.Axes, optional
+        Pre-existing axis to plot on. If None, creates new figure and axis.
         
     Returns:
     --------
-    fig, ax : matplotlib objects
+    fig, ax : matplotlib objects (if ax=None)
         Figure and axis objects
+    ax : matplotlib axis object (if ax was provided)
+        The provided axis object
     stats_dict : dict, optional
         Dictionary with correlation statistics (if return_stats=True)
     """
@@ -608,8 +614,12 @@ def plot_correlation(x, y, x_label=None, y_label=None, title=None,
         z_scores_y = np.abs(stats.zscore(y_clean))
         outlier_mask = (z_scores_x > outlier_threshold) | (z_scores_y > outlier_threshold)
     
-    # Create figure and axis
-    fig, ax = plt.subplots(figsize=figsize)
+    # Create figure and axis or use provided axis
+    created_new_figure = ax is None
+    if created_new_figure:
+        fig, ax = plt.subplots(figsize=figsize)
+    else:
+        fig = ax.get_figure()
     
     # Plot scatter points
     if highlight_outliers and np.any(outlier_mask):
@@ -725,14 +735,17 @@ def plot_correlation(x, y, x_label=None, y_label=None, title=None,
     if highlight_outliers and np.any(outlier_mask):
         ax.legend(fontsize=font_size-1, loc='best', framealpha=0.9)
     
-    plt.tight_layout()
-    
-    # Save figure if path provided
-    if save_path:
-        plt.savefig(save_path, dpi=dpi, bbox_inches='tight', 
-                   facecolor='white', edgecolor='none')
+    # Only apply tight_layout and save if we created a new figure
+    if created_new_figure:
+        plt.tight_layout()
+        
+        # Save figure if path provided
+        if save_path:
+            plt.savefig(save_path, dpi=dpi, bbox_inches='tight', 
+                       facecolor='white', edgecolor='none')
     
     # Prepare return values
+    stats_dict = None
     if return_stats:
         stats_dict = {
             'correlation': corr_coef,
@@ -742,6 +755,15 @@ def plot_correlation(x, y, x_label=None, y_label=None, title=None,
             'n_outliers': np.sum(outlier_mask) if outlier_threshold else 0,
             'outlier_indices': np.where(valid_mask)[0][outlier_mask] if outlier_threshold else []
         }
-        return fig, ax, stats_dict
     
-    return fig, ax
+    # Return appropriate values based on whether we created a new figure
+    if created_new_figure:
+        if return_stats:
+            return fig, ax, stats_dict
+        else:
+            return fig, ax
+    else:
+        if return_stats:
+            return ax, stats_dict
+        else:
+            return ax
