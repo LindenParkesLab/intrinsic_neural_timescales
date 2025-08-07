@@ -5,7 +5,7 @@ import pandas as pd
 import scipy as sp
 from scipy import stats
 
-def process_data(data_dict, combine_rest=False, combine_movies=False):
+def process_data(data_dict, combine_rest=False, combine_movies=False, which_data='HCP-YA'):
     data_dict_processed = dict()
     conditions = list(data_dict.keys())
     # print(conditions)
@@ -17,12 +17,13 @@ def process_data(data_dict, combine_rest=False, combine_movies=False):
             data_dict_processed['REST'] += data_dict[condition].copy()
         data_dict_processed['REST'] = np.divide(data_dict_processed['REST'], len(rest_list))
     else:
-        # process 7T rest
-        rest_7T_list = [s for s, s in enumerate(conditions) if 'REST' in s and '7T' in s]
-        data_dict_processed['REST_7T'] = np.zeros(data_dict[rest_7T_list[0]].shape)
-        for condition in rest_7T_list:
-            data_dict_processed['REST_7T'] += data_dict[condition].copy()
-        data_dict_processed['REST_7T'] = np.divide(data_dict_processed['REST_7T'], len(rest_7T_list))
+        if which_data == 'HCP-YA':
+            # process 7T rest
+            rest_7T_list = [s for s, s in enumerate(conditions) if 'REST' in s and '7T' in s]
+            data_dict_processed['REST_7T'] = np.zeros(data_dict[rest_7T_list[0]].shape)
+            for condition in rest_7T_list:
+                data_dict_processed['REST_7T'] += data_dict[condition].copy()
+            data_dict_processed['REST_7T'] = np.divide(data_dict_processed['REST_7T'], len(rest_7T_list))
         
         # process 3T rest
         rest_3T_list = [s for s, s in enumerate(conditions) if 'REST' in s and '7T' not in s]
@@ -46,16 +47,21 @@ def process_data(data_dict, combine_rest=False, combine_movies=False):
         pass
 
     # process tasks
-    task_list_lr = [s for s, s in enumerate(conditions) if 'tfMRI' in s and 'LR' in s and '7T' not in s]
-    task_list_rl = [s for s, s in enumerate(conditions) if 'tfMRI' in s and 'RL' in s and '7T' not in s]
-    for condition in task_list_lr:
-        condition_stem = '{0}_{1}'.format(condition.split('_')[0], condition.split('_')[1])
-        data_dict_processed[condition_stem] = data_dict[condition].copy()
-        condition_other = '{0}_{1}_RL'.format(condition.split('_')[0], condition.split('_')[1])
-        # print(condition, condition_stem, condition_other)
-        if condition_other in task_list_rl:
-            data_dict_processed[condition_stem] += data_dict[condition_other].copy()
-            data_dict_processed[condition_stem] = data_dict_processed[condition_stem] / 2
+    if which_data == 'HCP-YA':
+        task_list_lr = [s for s, s in enumerate(conditions) if 'tfMRI' in s and 'LR' in s and '7T' not in s]
+        task_list_rl = [s for s, s in enumerate(conditions) if 'tfMRI' in s and 'RL' in s and '7T' not in s]
+        for condition in task_list_lr:
+            condition_stem = '{0}_{1}'.format(condition.split('_')[0], condition.split('_')[1])
+            data_dict_processed[condition_stem] = data_dict[condition].copy()
+            condition_other = '{0}_{1}_RL'.format(condition.split('_')[0], condition.split('_')[1])
+            # print(condition, condition_stem, condition_other)
+            if condition_other in task_list_rl:
+                data_dict_processed[condition_stem] += data_dict[condition_other].copy()
+                data_dict_processed[condition_stem] = data_dict_processed[condition_stem] / 2
+    elif which_data == 'HCP-D':
+        task_list = [s for s, s in enumerate(conditions) if 'tfMRI' in s and 'PA' in s]
+        for condition in task_list:
+            data_dict_processed[condition] = data_dict[condition].copy()
 
     new_conditions = list(data_dict_processed.keys())
     print(new_conditions)
