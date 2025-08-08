@@ -816,27 +816,26 @@ def plot_correlation(x, y, x_label=None, y_label=None, title=None,
         stats_text += f"p = {p_value:.3e}\n"
         stats_text += f"n = {len(x_clean)}"
         
-        # Add model information if available
-        if best_model_info is not None:
+        # Add model information if available and auto_polynomial was used
+        if best_model_info is not None and auto_polynomial:
             degree_names = {1: 'Linear', 2: 'Quadratic', 3: 'Cubic', 4: 'Quartic', 
                            5: 'Quintic', 6: 'Sextic'}
             model_name = degree_names.get(best_model_info['degree'], f"Degree {best_model_info['degree']}")
             stats_text += f"\n{model_name} fit:"
-            # stats_text += f"\nR² = {best_model_info['r_squared']:.3f}"
-            if auto_polynomial:
-                metric_values = {
-                    'variance_explained': best_model_info['r_squared'],
-                    'rmse': best_model_info['rmse'],
-                    'mae': best_model_info['mae']
-                }
-                metric_labels = {
-                    'variance_explained': 'R²',
-                    'rmse': 'RMSE',
-                    'mae': 'MAE'
-                }
-                metric_value = metric_values.get(model_selection_metric, 0)
-                metric_label = metric_labels.get(model_selection_metric, model_selection_metric)
-                stats_text += f"\n{metric_label}: {metric_value:.3f}"
+            stats_text += f"\nR² = {best_model_info['r_squared']:.3f}"
+            metric_values = {
+                'variance_explained': best_model_info['r_squared'],
+                'rmse': best_model_info['rmse'],
+                'mae': best_model_info['mae']
+            }
+            metric_labels = {
+                'variance_explained': 'R²',
+                'rmse': 'RMSE',
+                'mae': 'MAE'
+            }
+            metric_value = metric_values.get(model_selection_metric, 0)
+            metric_label = metric_labels.get(model_selection_metric, model_selection_metric)
+            stats_text += f"\n{metric_label}: {metric_value:.3f}"
         
         if np.any(outlier_mask):
             stats_text += f"\nOutliers: {np.sum(outlier_mask)}"
