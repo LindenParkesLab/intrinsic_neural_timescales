@@ -511,8 +511,12 @@ def plot_correlation(x, y, x_label=None, y_label=None, title=None,
                     stats_position='upper left', font_size=8,
                     grid=True, grid_alpha=0.3, dpi=300,
                     outlier_threshold=None, highlight_outliers=False, 
-                    save_path=None, return_stats=False, ax=None):
+                    save_path=None, return_stats=False, ax=None,
+                    auto_polynomial=False, models_to_test=[1, 2, 3], 
+                    model_selection_metric='variance_explained'):
     """
+    Enhanced correlation plot with automatic polynomial model selection.
+    
     Parameters:
     -----------
     x, y : array-like, pandas.Series, or numpy.ndarray
@@ -557,6 +561,12 @@ def plot_correlation(x, y, x_label=None, y_label=None, title=None,
         Whether to return correlation statistics
     ax : matplotlib.axes.Axes, optional
         Pre-existing axis to plot on. If None, creates new figure and axis.
+    auto_polynomial : bool, default False
+        Whether to automatically select best polynomial fit
+    models_to_test : list, default [1, 2, 3]
+        List of polynomial degrees to test (e.g., [1, 2, 3] for linear, quadratic, cubic)
+    model_selection_metric : str, default 'variance_explained'
+        Metric for model selection: 'variance_explained', 'rmse', or 'mae'
         
     Returns:
     --------
@@ -637,40 +647,157 @@ def plot_correlation(x, y, x_label=None, y_label=None, title=None,
         ax.scatter(x_clean, y_clean, c=color, alpha=alpha, s=size, 
                   edgecolors='white', linewidth=0.5)
     
+    # Initialize model info for stats display
+    best_model_info = None
+    
     # Add regression line and confidence interval
     if show_line and len(x_clean) > 2:
-        # Calculate regression line
-        slope, intercept, r_value, p_value_reg, std_err = stats.linregress(x_clean, y_clean)
         
-        # Create line points
-        x_line = np.linspace(np.min(x_clean), np.max(x_clean), 100)
-        y_line = slope * x_line + intercept
-        
-        # Plot regression line
-        ax.plot(x_line, y_line, color=color, linewidth=2.5, alpha=0.8, 
-               linestyle='-', label='Regression line')
-        
-        # Add confidence interval
-        if show_confidence:
-            # Calculate confidence interval
-            def predict_interval(x_new, x_data, y_data, confidence=0.95):
-                n = len(x_data)
-                x_mean = np.mean(x_data)
-                sxx = np.sum((x_data - x_mean) ** 2)
-                sxy = np.sum((x_data - x_mean) * (y_data - np.mean(y_data)))
-                syy = np.sum((y_data - np.mean(y_data)) ** 2)
-                
-                s = np.sqrt((syy - sxy**2/sxx) / (n - 2))
-                t_val = stats.t.ppf((1 + confidence) / 2, n - 2)
-                
-                margin = t_val * s * np.sqrt(1/n + (x_new - x_mean)**2/sxx)
-                y_pred = slope * x_new + intercept
-                
-                return y_pred - margin, y_pred + margin
+        if auto_polynomial and len(x_clean) >= (max(models_to_test) + 1):  # Need more points than max degree
+            # Test specified polynomial degrees
+            model_results = {}
             
-            y_lower, y_upper = predict_interval(x_line, x_clean, y_clean)
-            ax.fill_between(x_line, y_lower, y_upper, color=color, alpha=0.15, 
-                           label='95% Confidence Interval')
+            for degree in models_to_test:
+                if len(x_clean) > degree:  # Need more points than parameters
+                    try:
+                        # Fit polynomial
+                        poly_coeffs = np.polyfit(x_clean, y_clean, degree)
+                        y_pred = np.polyval(poly_coeffs, x_clean)
+                        
+                        # Calculate model fit metrics
+                        residuals = y_clean - y_pred
+                        ss_res = np.sum(residuals ** 2)
+                        ss_tot = np.sum((y_clean - np.mean(y_clean)) ** 2)
+                        
+                        # Variance explained (R²)
+                        r_squared = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0
+                        
+                        # RMSE
+                        rmse = np.sqrt(np.mean(residuals ** 2))
+                        
+                        # MAE
+                        mae = np.mean(np.abs(residuals))
+                        
+                        model_results[degree] = {
+                            'coeffs': poly_coeffs,
+                            'r_squared': r_squared,
+                            'rmse': rmse,
+                            'mae': mae,
+                            'y_pred': y_pred
+                        }
+                    except (np.RankWarning, np.linalg.LinAlgError):
+                        # Skip this degree if fitting fails
+                        continue
+            
+            # Select best model based on chosen metric
+            if model_results:
+                if model_selection_metric == 'variance_explained':
+                    best_degree = max(model_results.keys(), 
+                                    key=lambda k: model_results[k]['r_squared'])
+                elif model_selection_metric == 'rmse':
+                    best_degree = min(model_results.keys(), 
+                                    key=lambda k: model_results[k]['rmse'])
+                elif model_selection_metric == 'mae':
+                    best_degree = min(model_results.keys(), 
+                                    key=lambda k: model_results[k]['mae'])
+                else:
+                    raise ValueError("model_selection_metric must be 'variance_explained', 'rmse', or 'mae'")
+                
+                best_model = model_results[best_degree]
+                best_model_info = {
+                    'degree': best_degree,
+                    'r_squared': best_model['r_squared'],
+                    'rmse': best_model['rmse'],
+                    'mae': best_model['mae'],
+                    'metric_used': model_selection_metric
+                }
+                
+                # Create smooth line for plotting
+                x_line = np.linspace(np.min(x_clean), np.max(x_clean), 100)
+                y_line = np.polyval(best_model['coeffs'], x_line)
+                
+                # Plot regression line
+                degree_names = {1: 'Linear', 2: 'Quadratic', 3: 'Cubic', 4: 'Quartic', 
+                               5: 'Quintic', 6: 'Sextic'}
+                model_name = degree_names.get(best_degree, f'Degree {best_degree}')
+                ax.plot(x_line, y_line, color=color, linewidth=2.5, alpha=0.8, 
+                       linestyle='-', 
+                       label=f'{model_name} fit (R²={best_model["r_squared"]:.3f})')
+                
+                # Add confidence interval for polynomial (approximation)
+                if show_confidence and best_degree == 1:  # Only for linear
+                    # Use the original linear regression confidence interval calculation
+                    slope, intercept, r_value, p_value_reg, std_err = stats.linregress(x_clean, y_clean)
+                    
+                    def predict_interval(x_new, x_data, y_data, confidence=0.95):
+                        n = len(x_data)
+                        x_mean = np.mean(x_data)
+                        sxx = np.sum((x_data - x_mean) ** 2)
+                        sxy = np.sum((x_data - x_mean) * (y_data - np.mean(y_data)))
+                        syy = np.sum((y_data - np.mean(y_data)) ** 2)
+                        
+                        s = np.sqrt((syy - sxy**2/sxx) / (n - 2))
+                        t_val = stats.t.ppf((1 + confidence) / 2, n - 2)
+                        
+                        margin = t_val * s * np.sqrt(1/n + (x_new - x_mean)**2/sxx)
+                        y_pred = slope * x_new + intercept
+                        
+                        return y_pred - margin, y_pred + margin
+                    
+                    y_lower, y_upper = predict_interval(x_line, x_clean, y_clean)
+                    ax.fill_between(x_line, y_lower, y_upper, color=color, alpha=0.15, 
+                                   label='95% Confidence Interval')
+            else:
+                # Fall back to linear regression if polynomial fitting fails
+                auto_polynomial = False
+        
+        if not auto_polynomial:
+            # Original linear regression
+            slope, intercept, r_value, p_value_reg, std_err = stats.linregress(x_clean, y_clean)
+            
+            # Create line points
+            x_line = np.linspace(np.min(x_clean), np.max(x_clean), 100)
+            y_line = slope * x_line + intercept
+            
+            # Plot regression line
+            ax.plot(x_line, y_line, color=color, linewidth=2.5, alpha=0.8, 
+                   linestyle='-', label='Linear regression')
+            
+            # Store linear model info
+            y_pred_linear = slope * x_clean + intercept
+            residuals_linear = y_clean - y_pred_linear
+            ss_res_linear = np.sum(residuals_linear ** 2)
+            ss_tot_linear = np.sum((y_clean - np.mean(y_clean)) ** 2)
+            r_squared_linear = 1 - (ss_res_linear / ss_tot_linear) if ss_tot_linear > 0 else 0
+            
+            best_model_info = {
+                'degree': 1,
+                'r_squared': r_squared_linear,
+                'rmse': np.sqrt(np.mean(residuals_linear ** 2)),
+                'mae': np.mean(np.abs(residuals_linear)),
+                'metric_used': 'linear_only'
+            }
+            
+            # Add confidence interval
+            if show_confidence:
+                def predict_interval(x_new, x_data, y_data, confidence=0.95):
+                    n = len(x_data)
+                    x_mean = np.mean(x_data)
+                    sxx = np.sum((x_data - x_mean) ** 2)
+                    sxy = np.sum((x_data - x_mean) * (y_data - np.mean(y_data)))
+                    syy = np.sum((y_data - np.mean(y_data)) ** 2)
+                    
+                    s = np.sqrt((syy - sxy**2/sxx) / (n - 2))
+                    t_val = stats.t.ppf((1 + confidence) / 2, n - 2)
+                    
+                    margin = t_val * s * np.sqrt(1/n + (x_new - x_mean)**2/sxx)
+                    y_pred = slope * x_new + intercept
+                    
+                    return y_pred - margin, y_pred + margin
+                
+                y_lower, y_upper = predict_interval(x_line, x_clean, y_clean)
+                ax.fill_between(x_line, y_lower, y_upper, color=color, alpha=0.15, 
+                               label='95% Confidence Interval')
     
     # Add statistics text box
     if show_stats:
@@ -688,6 +815,28 @@ def plot_correlation(x, y, x_label=None, y_label=None, title=None,
         stats_text = f"{method_name} r = {corr_coef:.3f}{sig_stars}\n"
         stats_text += f"p = {p_value:.3e}\n"
         stats_text += f"n = {len(x_clean)}"
+        
+        # Add model information if available
+        if best_model_info is not None:
+            degree_names = {1: 'Linear', 2: 'Quadratic', 3: 'Cubic', 4: 'Quartic', 
+                           5: 'Quintic', 6: 'Sextic'}
+            model_name = degree_names.get(best_model_info['degree'], f"Degree {best_model_info['degree']}")
+            stats_text += f"\n{model_name} fit:"
+            # stats_text += f"\nR² = {best_model_info['r_squared']:.3f}"
+            if auto_polynomial:
+                metric_values = {
+                    'variance_explained': best_model_info['r_squared'],
+                    'rmse': best_model_info['rmse'],
+                    'mae': best_model_info['mae']
+                }
+                metric_labels = {
+                    'variance_explained': 'R²',
+                    'rmse': 'RMSE',
+                    'mae': 'MAE'
+                }
+                metric_value = metric_values.get(model_selection_metric, 0)
+                metric_label = metric_labels.get(model_selection_metric, model_selection_metric)
+                stats_text += f"\n{metric_label}: {metric_value:.3f}"
         
         if np.any(outlier_mask):
             stats_text += f"\nOutliers: {np.sum(outlier_mask)}"
@@ -753,7 +902,8 @@ def plot_correlation(x, y, x_label=None, y_label=None, title=None,
             'n_samples': len(x_clean),
             'method': method_name,
             'n_outliers': np.sum(outlier_mask) if outlier_threshold else 0,
-            'outlier_indices': np.where(valid_mask)[0][outlier_mask] if outlier_threshold else []
+            'outlier_indices': np.where(valid_mask)[0][outlier_mask] if outlier_threshold else [],
+            'model_info': best_model_info
         }
     
     # Return appropriate values based on whether we created a new figure
