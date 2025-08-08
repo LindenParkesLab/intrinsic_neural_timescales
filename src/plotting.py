@@ -244,7 +244,8 @@ def plot_subject_level_violins(df, observation_indices, figsize=(15, 8),
                                violin_alpha=0.7, point_alpha=0.6, point_size=3,
                                show_points=True, point_jitter=0.02,
                                show_lines=False, line_alpha=0.3, line_width=0.5,
-                               show_violins=True, line_color_by='subject', ylim=None):
+                               show_violins=True, line_color_by='subject', ylim=None,
+                               fit_trends=False, trend_line_width=3, trend_alpha=0.9):
     """
     Create violin plots showing subject-level variation for selected regions.
     Each region index gets its own violin per condition.
@@ -281,10 +282,18 @@ def plot_subject_level_violins(df, observation_indices, figsize=(15, 8),
         or 'region' (same color as violins for each region)
     ylim : tuple or None, default None
         Y-axis limits as (ymin, ymax). If None, uses automatic limits
+    fit_trends : bool, default False
+        Whether to fit polynomial trends to distribution means within each condition
+    trend_line_width : float, default 3
+        Width of trend lines
+    trend_alpha : float, default 0.9
+        Transparency of trend lines
         
     Returns:
     --------
     fig, ax : matplotlib figure and axes objects
+    trend_results : dict, optional
+        Dictionary containing trend fitting results if fit_trends=True
     """
     
     # Make a copy to avoid modifying original data
@@ -363,6 +372,107 @@ def plot_subject_level_violins(df, observation_indices, figsize=(15, 8),
         sns.violinplot(data=df_long, x='Condition', y='Value', hue='Region',
                        ax=ax, alpha=violin_alpha, inner=None, 
                        palette=obs_colors)
+    
+    # Calculate means for trend fitting if requested
+    trend_results = {}
+    if fit_trends and len(observation_indices) >= 3:  # Need at least 3 points for trend fitting
+        print("Fitting polynomial trends to distribution means...")
+        
+        # Set up trend color (soft grey for all trends)
+        trend_color = "#3B3B3B"  # Soft grey
+        
+        # Calculate means for each condition and region
+        condition_means = {}
+        for condition in condition_cols:
+            region_means = []
+            for obs_idx in observation_indices:
+                condition_region_data = df_long[
+                    (df_long['Condition'] == condition) & 
+                    (df_long['obs_index'] == obs_idx)
+                ]['Value']
+                region_means.append(np.mean(condition_region_data))
+            condition_means[condition] = np.array(region_means)
+        
+        # Fit trends for each condition
+        for cond_idx, condition in enumerate(condition_cols):
+            means = condition_means[condition]
+            x_data = np.array(range(len(observation_indices)))  # Use position as x-axis
+            
+            # Fit polynomial trends of degrees 1, 2, and 3
+            # degrees = [1, 2, 3]
+            # degree_names = ['Linear', 'Quadratic', 'Cubic']
+            degrees = [1, 2]
+            degree_names = ['Linear', 'Quadratic']
+            r2_scores = []
+            fitted_polys = []
+            
+            for degree in degrees:
+                try:
+                    # Fit polynomial
+                    coeffs = np.polyfit(x_data, means, degree)
+                    poly_func = np.poly1d(coeffs)
+                    
+                    # Calculate R²
+                    y_pred = poly_func(x_data)
+                    ss_res = np.sum((means - y_pred) ** 2)
+                    ss_tot = np.sum((means - np.mean(means)) ** 2)
+                    r2 = 1 - (ss_res / ss_tot) if ss_tot != 0 else 0
+                    
+                    r2_scores.append(r2)
+                    fitted_polys.append(poly_func)
+                    
+                except np.linalg.LinAlgError:
+                    r2_scores.append(-np.inf)
+                    fitted_polys.append(None)
+            
+            # Select best fitting trend
+            best_idx = np.argmax(r2_scores)
+            best_degree = degrees[best_idx]
+            best_r2 = r2_scores[best_idx]
+            best_poly = fitted_polys[best_idx]
+            
+            # Store results
+            trend_results[condition] = {
+                'means': means,
+                'x_data': x_data,
+                'r2_scores': dict(zip(degree_names, r2_scores)),
+                'best_degree': best_degree,
+                'best_r2': best_r2,
+                'best_poly': best_poly,
+                'all_polys': dict(zip(degree_names, fitted_polys))
+            }
+            
+            # Plot best fitting trend
+            if best_poly is not None and best_r2 > 0:
+                # Calculate positions for trend line
+                n_conditions = len(condition_cols)
+                width = 0.8  # Default violin width in seaborn
+                spacing = width / n_obs
+                
+                # Create smooth x values for trend line
+                x_smooth = np.linspace(0, len(observation_indices) - 1, 100)
+                y_smooth = best_poly(x_smooth)
+                
+                # Convert to actual x positions on plot
+                x_plot_smooth = []
+                for x_val in x_smooth:
+                    # Interpolate position within the condition
+                    if n_obs == 1:
+                        x_plot_pos = cond_idx
+                    else:
+                        # Map x_val to actual violin positions
+                        obs_idx_float = x_val
+                        x_offset = (obs_idx_float - (n_obs - 1) / 2) * spacing
+                        x_plot_pos = cond_idx + x_offset
+                    x_plot_smooth.append(x_plot_pos)
+                
+                # Plot trend line
+                ax.plot(x_plot_smooth, y_smooth, 
+                       color=trend_color, linewidth=trend_line_width, 
+                       alpha=trend_alpha, linestyle='-', 
+                       zorder=10)
+            
+            print(f"  {condition}: Best fit = {degree_names[best_idx]} (R² = {best_r2:.3f})")
     
     # Add connecting lines for each subject if requested
     if show_lines:
@@ -452,27 +562,33 @@ def plot_subject_level_violins(df, observation_indices, figsize=(15, 8),
     ax.set_xticks(range(len(condition_cols)))
     ax.set_xticklabels(condition_cols, rotation=45, ha='right')
     
-    # Create title with region info
-    # obs_str = ', '.join(map(str, observation_indices))
-    # title = f'Subject-Level Variation by Region\nRegions: {obs_str} ({n_subjects} subjects)'
-    # ax.set_title(title, fontsize=12, fontweight='bold')
+    # Create legend
+    legend_handles = []
+    legend_labels = []
     
-    # Customize legend
+    # Add region legends if multiple regions
     if len(observation_indices) > 1:
         if show_violins:
             # Use legend from violin plots
             handles, labels = ax.get_legend_handles_labels()
-            ax.legend(handles, [f'Region {idx}' for idx in observation_indices], 
-                     title='Region Index', loc='upper right')
+            region_handles = [h for h, l in zip(handles, labels) if 'Region_' in l]
+            region_labels = [f'Index {idx+1}' for idx in observation_indices]
+            legend_handles.extend(region_handles)
+            legend_labels.extend(region_labels)
         else:
             # Create custom legend for points/lines when no violins
             from matplotlib.patches import Patch
-            legend_elements = [Patch(facecolor=obs_colors[i], label=f'Region {idx}') 
+            region_elements = [Patch(facecolor=obs_colors[i], label=f'Index {idx}') 
                               for i, idx in enumerate(observation_indices)]
-            ax.legend(handles=legend_elements, title='Region Index', loc='upper right')
-    else:
-        if show_violins and ax.get_legend():
-            ax.get_legend().remove()
+            legend_handles.extend(region_elements)
+            legend_labels.extend([f'Index {idx+1}' for idx in observation_indices])
+    
+    # Set legend if we have elements
+    if legend_handles:
+        ax.legend(handles=legend_handles, labels=legend_labels, 
+                 title='Group Index', 
+                 loc='upper right', bbox_to_anchor=(1, 1), 
+                 fontsize=9)
     
     # Add grid for better readability
     ax.grid(True, alpha=0.3, axis='y')
@@ -501,7 +617,10 @@ def plot_subject_level_violins(df, observation_indices, figsize=(15, 8),
     # Adjust layout
     plt.tight_layout()
     
-    return fig, ax
+    if fit_trends:
+        return fig, ax, trend_results
+    else:
+        return fig, ax
 
 
 def plot_correlation(x, y, x_label=None, y_label=None, title=None, 
@@ -822,7 +941,7 @@ def plot_correlation(x, y, x_label=None, y_label=None, title=None,
                            5: 'Quintic', 6: 'Sextic'}
             model_name = degree_names.get(best_model_info['degree'], f"Degree {best_model_info['degree']}")
             stats_text += f"\n{model_name} fit:"
-            stats_text += f"\nR² = {best_model_info['r_squared']:.3f}"
+            # stats_text += f"\nR² = {best_model_info['r_squared']:.3f}"
             metric_values = {
                 'variance_explained': best_model_info['r_squared'],
                 'rmse': best_model_info['rmse'],
@@ -835,7 +954,7 @@ def plot_correlation(x, y, x_label=None, y_label=None, title=None,
             }
             metric_value = metric_values.get(model_selection_metric, 0)
             metric_label = metric_labels.get(model_selection_metric, model_selection_metric)
-            stats_text += f"\n{metric_label}: {metric_value:.3f}"
+            stats_text += f"\n{metric_label} = {metric_value:.3f}"
         
         if np.any(outlier_mask):
             stats_text += f"\nOutliers: {np.sum(outlier_mask)}"
