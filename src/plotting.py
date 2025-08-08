@@ -862,7 +862,7 @@ def plot_correlation(x, y, x_label=None, y_label=None, title=None,
     ax.set_ylabel(y_label or 'Y Variable', fontsize=font_size)
     
     if title:
-        ax.set_title(title, fontsize=font_size, fontweight='bold', pad=20)
+        ax.set_title(title, fontsize=font_size, fontweight='bold', pad=10)
     
     # Grid
     if grid:
