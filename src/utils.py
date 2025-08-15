@@ -82,3 +82,20 @@ def sort_and_group_timescales(timescales, brain_map, ntile=10):
         counter += 1
         
     return timescales_sorted_dec
+
+def rename_task_columns_to_uppercase(df):
+    """
+    Alternative version using pandas string methods for column renaming.
+    """
+    words_to_convert = ['Emotion', 'Gambling', 'Language', 'Relational', 'Social']
+    
+    df_renamed = df.copy()
+    
+    # Apply replacements to column names
+    new_columns = df.columns.to_series()
+    for word in words_to_convert:
+        new_columns = new_columns.str.replace(word, word.upper(), regex=False)
+    
+    df_renamed.columns = new_columns
+    
+    return df_renamed
