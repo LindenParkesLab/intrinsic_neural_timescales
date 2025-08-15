@@ -243,20 +243,29 @@ class SubjectLevelINTsMeasures:
         for condition in self.task_conditions:
             task_data = self.data_dict[condition]
             
-            spatial_var_changes = []
             spatial_var_ratios = []
+            spatial_var_changes = []
+            spatial_range_ratios = []
+            spatial_range_changes = []
             
             for subj in range(self.n_subjects):
                 # Subject's spatial variability in baseline vs task
                 baseline_spatial_var = np.var(baseline_data[subj, :])
                 task_spatial_var = np.var(task_data[subj, :])
-                
-                spatial_var_changes.append(task_spatial_var - baseline_spatial_var)
                 spatial_var_ratios.append(task_spatial_var / baseline_spatial_var)
+                spatial_var_changes.append(task_spatial_var - baseline_spatial_var)
+                
+                # Subject's spatial range in baseline vs task
+                baseline_spatial_range = np.ptp(baseline_data[subj, :])
+                task_spatial_range = np.ptp(task_data[subj, :])
+                spatial_range_ratios.append(task_spatial_range / baseline_spatial_range)
+                spatial_range_changes.append(task_spatial_range - baseline_spatial_range)
             
             measures_dict[f'{condition}_spatial_var_ratio'] = np.array(spatial_var_ratios)
+            measures_dict[f'{condition}_spatial_range_ratio'] = np.array(spatial_range_ratios)
             if return_extra:
                 measures_dict[f'{condition}_spatial_var_change'] = np.array(spatial_var_changes)
+                measures_dict[f'{condition}_spatial_range_change'] = np.array(spatial_range_changes)
         
         return measures_dict
     
@@ -328,6 +337,7 @@ class SubjectLevelINTsMeasures:
                 association_speedups = []
                 sensorimotor_speedups = []
                 sa_speedup_correlations = []
+                sa_speedup_rank_correlations = []
                 overall_speedups = []
                 
                 for subj in range(self.n_subjects):
@@ -346,6 +356,7 @@ class SubjectLevelINTsMeasures:
                     # Alternative measure: Correlation with SA axis
                     # More negative = greater speedup in association regions
                     sa_speedup_correlation, _ = pearsonr(self.sa_axis, int_change)
+                    sa_speedup_rank_correlation, _ = spearmanr(self.sa_axis, int_change)
                     
                     # Overall speedup
                     overall_speedup = np.mean(int_change)
@@ -354,9 +365,11 @@ class SubjectLevelINTsMeasures:
                     association_speedups.append(association_speedup)
                     sensorimotor_speedups.append(sensorimotor_speedup)
                     sa_speedup_correlations.append(sa_speedup_correlation)
+                    sa_speedup_rank_correlations.append(sa_speedup_rank_correlation)
                     overall_speedups.append(overall_speedup)
                 
                 measures_dict[f'{condition}_sa_speedup_correlation'] = np.array(sa_speedup_correlations)
+                measures_dict[f'{condition}_sa_speedup_rank_correlation'] = np.array(sa_speedup_rank_correlations)
                 measures_dict[f'{condition}_sa_differential_speedup'] = np.array(sa_differential_speedups)
                 if return_extra:
                     measures_dict[f'{condition}_association_speedup'] = np.array(association_speedups)
@@ -364,7 +377,38 @@ class SubjectLevelINTsMeasures:
                     measures_dict[f'{condition}_overall_speedup'] = np.array(overall_speedups)
             
             return measures_dict
-    
+
+    def calculate_individual_sa_corr_differences(self, return_extra=False):
+            """
+            For each subject and condition: Calculate correlation between SA axis and INTs and subtract.
+            
+            Returns:
+            --------
+            measures_dict : dict
+                Keys: '{condition}_sa_differential_speedup', '{condition}_sa_speedup_correlation'
+                Values: arrays of shape (n_subjects,)
+            """
+            baseline_data = self.data_dict[self.baseline]
+            measures_dict = {}
+            
+            print("  Calculating SA corr differences...")
+
+            for condition in self.task_conditions:
+                task_data = self.data_dict[condition]
+                
+                sa_rank_correlation_deltas = []
+                
+                for subj in range(self.n_subjects):
+                    sa_rank_correlation_baseline, _ = spearmanr(self.sa_axis, baseline_data[subj, :])
+                    sa_rank_correlation_condition, _ = spearmanr(self.sa_axis, task_data[subj, :])
+                    sa_rank_correlation_delta = sa_rank_correlation_condition - sa_rank_correlation_baseline
+                    
+                    sa_rank_correlation_deltas.append(sa_rank_correlation_delta)
+                
+                measures_dict[f'{condition}_sa_rank_correlation_deltas'] = np.array(sa_rank_correlation_deltas)
+            
+            return measures_dict
+
     def calculate_individual_rank_changes(self, return_extra=False):
         """
         For each subject and condition: How much does their relative standing in the group change?
@@ -442,10 +486,15 @@ class SubjectLevelINTsMeasures:
         for condition in self.task_conditions:
             task_data = self.data_dict[condition]
             
+            rank_correlations = []
             pattern_correlations = []
             pattern_distances = []
             
             for subj in range(self.n_subjects):
+                # Rank between subject's baseline and task patterns
+                rank_corr, _ = spearmanr(baseline_data[subj, :], task_data[subj, :])
+                rank_correlations.append(rank_corr)
+
                 # Correlation between subject's baseline and task patterns
                 pattern_corr, _ = pearsonr(baseline_data[subj, :], task_data[subj, :])
                 pattern_correlations.append(pattern_corr)
@@ -454,8 +503,9 @@ class SubjectLevelINTsMeasures:
                 pattern_dist = np.linalg.norm(task_data[subj, :] - baseline_data[subj, :])
                 pattern_distances.append(pattern_dist)
             
-            measures_dict[f'{condition}_pattern_correlation'] = np.array(pattern_correlations)
+            measures_dict[f'{condition}_rank_correlation'] = np.array(rank_correlations)
             if return_extra:
+                measures_dict[f'{condition}_pattern_correlation'] = np.array(pattern_correlations)
                 measures_dict[f'{condition}_pattern_distance'] = np.array(pattern_distances)
         
         return measures_dict
@@ -512,7 +562,8 @@ class SubjectLevelINTsMeasures:
         # measures_dict.update(self.calculate_individual_mean_level_changes(return_extra=False))
         # measures_dict.update(self.calculate_individual_sa_coupling_changes(return_extra=False))
         measures_dict.update(self.calculate_individual_spatial_variability_changes(return_extra=False))
-        # measures_dict.update(self.calculate_individual_pattern_stability(return_extra=False))
+        measures_dict.update(self.calculate_individual_pattern_stability(return_extra=True))
+        measures_dict.update(self.calculate_individual_sa_corr_differences(return_extra=False))
         # measures_dict.update(self.calculate_individual_rank_changes(return_extra=False))
         # measures_dict.update(self.calculate_individual_extremeness_changes(return_extra=False))
         
