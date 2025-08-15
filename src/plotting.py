@@ -624,7 +624,7 @@ def plot_subject_level_violins(df, observation_indices, figsize=(15, 8),
 
 
 def plot_correlation(x, y, x_label=None, y_label=None, title=None, 
-                    method='pearson', color='#2E86AB', alpha=0.6, 
+                    method='pearson', color="#3B3B3B", alpha=0.6, 
                     size=20, figsize=(3, 3), show_line=True, 
                     show_confidence=True, show_stats=True,
                     stats_position='upper left', font_size=8,
@@ -632,9 +632,10 @@ def plot_correlation(x, y, x_label=None, y_label=None, title=None,
                     outlier_threshold=None, highlight_outliers=False, 
                     save_path=None, return_stats=False, ax=None,
                     auto_polynomial=False, models_to_test=[1, 2, 3], 
-                    model_selection_metric='variance_explained'):
+                    model_selection_metric='variance_explained',
+                    data_group=None, data_group_cmap='tab10'):
     """
-    Enhanced correlation plot with automatic polynomial model selection.
+    Enhanced correlation plot with automatic polynomial model selection and data group coloring.
     
     Parameters:
     -----------
@@ -648,8 +649,8 @@ def plot_correlation(x, y, x_label=None, y_label=None, title=None,
         Plot title
     method : str, default 'pearson'
         Correlation method ('pearson', 'spearman')
-    color : str, default '#2E86AB'
-        Color for scatter points and regression line
+    color : str, default '#3B3B3B'
+        Color for scatter points and regression line (used when data_group=None)
     alpha : float, default 0.6
         Transparency of scatter points
     size : float, default 20
@@ -686,6 +687,11 @@ def plot_correlation(x, y, x_label=None, y_label=None, title=None,
         List of polynomial degrees to test (e.g., [1, 2, 3] for linear, quadratic, cubic)
     model_selection_metric : str, default 'variance_explained'
         Metric for model selection: 'variance_explained', 'rmse', or 'mae'
+    data_group : array-like, optional
+        Vector of integer values or string labels designating which group each data point belongs to.
+        Must have same length as x and y. If provided, points will be colored by group.
+    data_group_cmap : str, default 'tab10'
+        Colormap to use for data group coloring. Good options: 'tab10', 'tab20', 'Set3', 'viridis'
         
     Returns:
     --------
@@ -718,10 +724,19 @@ def plot_correlation(x, y, x_label=None, y_label=None, title=None,
     x = np.array(x, dtype=float)
     y = np.array(y, dtype=float)
     
+    # Handle data_group input
+    if data_group is not None:
+        data_group = np.array(data_group)  # Don't force dtype - allow strings or integers
+        if len(data_group) != len(x):
+            raise ValueError(f"data_group length ({len(data_group)}) must match x and y length ({len(x)})")
+    
     # Remove NaN values
     valid_mask = ~(np.isnan(x) | np.isnan(y))
     x_clean = x[valid_mask]
     y_clean = y[valid_mask]
+    
+    if data_group is not None:
+        data_group_clean = data_group[valid_mask]
     
     if len(x_clean) < 3:
         raise ValueError("Need at least 3 valid data points for correlation")
@@ -751,20 +766,117 @@ def plot_correlation(x, y, x_label=None, y_label=None, title=None,
         fig = ax.get_figure()
     
     # Plot scatter points
-    if highlight_outliers and np.any(outlier_mask):
-        # Plot normal points
-        normal_mask = ~outlier_mask
-        ax.scatter(x_clean[normal_mask], y_clean[normal_mask], 
-                  c=color, alpha=alpha, s=size, edgecolors='white', 
-                  linewidth=0.5, label='Data points')
+    if data_group is not None:
+        # Color by data groups (handles both strings and integers)
+        unique_groups = np.unique(data_group_clean)
+        n_groups = len(unique_groups)
         
-        # Plot outliers
-        ax.scatter(x_clean[outlier_mask], y_clean[outlier_mask], 
-                  c='red', alpha=alpha+0.2, s=size*1.2, edgecolors='darkred', 
-                  linewidth=1, marker='^', label='Outliers')
+        # Get colormap
+        cmap = plt.cm.get_cmap(data_group_cmap)
+        
+        # Create colors for each group
+        if n_groups <= 10 and data_group_cmap == 'tab10':
+            # Use discrete colors for tab10
+            colors = [cmap(i) for i in range(n_groups)]
+        elif n_groups <= 20 and data_group_cmap == 'tab20':
+            # Use discrete colors for tab20
+            colors = [cmap(i) for i in range(n_groups)]
+        else:
+            # Use continuous colormap
+            colors = [cmap(i / max(1, n_groups - 1)) for i in range(n_groups)]
+        
+        # Create mapping from group labels to colors
+        group_colors = {group: colors[i] for i, group in enumerate(unique_groups)}
+        
+        # Plot points for each data group
+        for group in unique_groups:
+            group_mask = data_group_clean == group
+            
+            if highlight_outliers and np.any(outlier_mask):
+                # Separate normal and outlier points within this group
+                normal_mask = group_mask & (~outlier_mask)
+                outlier_mask_group = group_mask & outlier_mask
+                
+                # Plot normal points for this group
+                if np.any(normal_mask):
+                    ax.scatter(x_clean[normal_mask], y_clean[normal_mask], 
+                              c=[group_colors[group]], alpha=alpha, s=size, 
+                              edgecolors='white', linewidth=0.5, 
+                              label=f'{group}')
+                
+                # Plot outliers for this group with different marker
+                if np.any(outlier_mask_group):
+                    ax.scatter(x_clean[outlier_mask_group], y_clean[outlier_mask_group], 
+                              c=[group_colors[group]], alpha=alpha+0.2, s=size*1.2, 
+                              edgecolors='darkred', linewidth=1, marker='^',
+                              label=f'{group} (outliers)')
+            else:
+                # Plot all points for this group normally
+                ax.scatter(x_clean[group_mask], y_clean[group_mask], 
+                          c=[group_colors[group]], alpha=alpha, s=size, 
+                          edgecolors='white', linewidth=0.5, 
+                          label=f'{group}')
+        
+        # Add colorbar for data groups
+        if n_groups > 1:  # Only add colorbar if more than one group
+            # For string labels, we need to create a discrete colorbar
+            if isinstance(unique_groups[0], (str, np.str_)):
+                # Create discrete colorbar for string labels
+                # Import required matplotlib components for colorbar handling
+                from matplotlib.colors import BoundaryNorm, ListedColormap
+                
+                # Create a listed colormap from the colors we're using
+                listed_cmap = ListedColormap(colors[:n_groups])
+                bounds = np.arange(n_groups + 1) - 0.5
+                norm = BoundaryNorm(bounds, listed_cmap.N)
+                
+                sm = plt.cm.ScalarMappable(cmap=listed_cmap, norm=norm)
+                sm.set_array([])
+                cbar = plt.colorbar(sm, ax=ax, shrink=0.8, aspect=20, pad=0.05)
+                cbar.set_label('Data Group', fontsize=font_size-2)
+                
+                # Set colorbar ticks to show string labels
+                cbar.set_ticks(np.arange(n_groups))
+                if n_groups <= 10:
+                    cbar.set_ticklabels(unique_groups)
+                else:
+                    # For many groups, show fewer labels
+                    tick_indices = np.linspace(0, n_groups-1, min(5, n_groups), dtype=int)
+                    cbar.set_ticks(tick_indices)
+                    cbar.set_ticklabels([unique_groups[i] for i in tick_indices])
+            else:
+                # Original numeric colorbar
+                sm = plt.cm.ScalarMappable(cmap=cmap, 
+                                          norm=plt.Normalize(vmin=min(unique_groups), 
+                                                           vmax=max(unique_groups)))
+                sm.set_array([])
+                cbar = plt.colorbar(sm, ax=ax, shrink=0.8, aspect=20, pad=0.05)
+                cbar.set_label('Data Group', fontsize=font_size-2)
+                
+                # Set colorbar ticks to show group numbers
+                if n_groups <= 10:
+                    cbar.set_ticks(unique_groups)
+                else:
+                    # For many groups, show fewer ticks
+                    tick_groups = unique_groups[::max(1, len(unique_groups)//5)]
+                    cbar.set_ticks(tick_groups)
+    
     else:
-        ax.scatter(x_clean, y_clean, c=color, alpha=alpha, s=size, 
-                  edgecolors='white', linewidth=0.5)
+        # Original coloring logic when data_group is None
+        if highlight_outliers and np.any(outlier_mask):
+            # Plot normal points
+            normal_mask = ~outlier_mask
+            ax.scatter(x_clean[normal_mask], y_clean[normal_mask], 
+                      c=color, alpha=alpha, s=size, edgecolors='white', 
+                      linewidth=0.5, label='Data points')
+            
+            # Plot outliers
+            ax.scatter(x_clean[outlier_mask], y_clean[outlier_mask], 
+                      c='red', alpha=alpha+0.2, s=size*1.2, edgecolors='darkred', 
+                      linewidth=1, marker='^', label='Outliers')
+        else:
+            ax.scatter(x_clean, y_clean, c=color, alpha=alpha, s=size, 
+                      edgecolors='white', linewidth=0.5)
     
     # Initialize model info for stats display
     best_model_info = None
@@ -839,7 +951,10 @@ def plot_correlation(x, y, x_label=None, y_label=None, title=None,
                 degree_names = {1: 'Linear', 2: 'Quadratic', 3: 'Cubic', 4: 'Quartic', 
                                5: 'Quintic', 6: 'Sextic'}
                 model_name = degree_names.get(best_degree, f'Degree {best_degree}')
-                ax.plot(x_line, y_line, color=color, linewidth=2.5, alpha=0.8, 
+                
+                # Use the original color for regression line
+                line_color = color if data_group is None else '#3B3B3B'
+                ax.plot(x_line, y_line, color=line_color, linewidth=2.5, alpha=0.8, 
                        linestyle='-', 
                        label=f'{model_name} fit (R²={best_model["r_squared"]:.3f})')
                 
@@ -864,7 +979,7 @@ def plot_correlation(x, y, x_label=None, y_label=None, title=None,
                         return y_pred - margin, y_pred + margin
                     
                     y_lower, y_upper = predict_interval(x_line, x_clean, y_clean)
-                    ax.fill_between(x_line, y_lower, y_upper, color=color, alpha=0.15, 
+                    ax.fill_between(x_line, y_lower, y_upper, color=line_color, alpha=0.15, 
                                    label='95% Confidence Interval')
             else:
                 # Fall back to linear regression if polynomial fitting fails
@@ -879,7 +994,8 @@ def plot_correlation(x, y, x_label=None, y_label=None, title=None,
             y_line = slope * x_line + intercept
             
             # Plot regression line
-            ax.plot(x_line, y_line, color=color, linewidth=2.5, alpha=0.8, 
+            line_color = color if data_group is None else '#3B3B3B'
+            ax.plot(x_line, y_line, color=line_color, linewidth=2.5, alpha=0.8, 
                    linestyle='-', label='Linear regression')
             
             # Store linear model info
@@ -915,7 +1031,7 @@ def plot_correlation(x, y, x_label=None, y_label=None, title=None,
                     return y_pred - margin, y_pred + margin
                 
                 y_lower, y_upper = predict_interval(x_line, x_clean, y_clean)
-                ax.fill_between(x_line, y_lower, y_upper, color=color, alpha=0.15, 
+                ax.fill_between(x_line, y_lower, y_upper, color=line_color, alpha=0.15, 
                                label='95% Confidence Interval')
     
     # Add statistics text box
@@ -932,8 +1048,19 @@ def plot_correlation(x, y, x_label=None, y_label=None, title=None,
         
         # Create statistics text
         stats_text = f"{method_name} r = {corr_coef:.3f}{sig_stars}\n"
-        stats_text += f"p = {p_value:.3e}\n"
-        stats_text += f"n = {len(x_clean)}"
+        stats_text += f"p = {p_value:.3e}"
+        # stats_text += f"n = {len(x_clean)}"
+        
+        # Add data group info if provided
+        if data_group is not None:
+            unique_groups = np.unique(data_group_clean)
+            # stats_text += f"\nGroups: {len(unique_groups)}"
+            # Show actual group labels if they're short enough
+            if len(unique_groups) <= 5:
+                if isinstance(unique_groups[0], (str, np.str_)):
+                    group_labels = ", ".join([str(g) for g in unique_groups])
+                    if len(group_labels) <= 20:  # Only show if not too long
+                        stats_text += f"\n({group_labels})"
         
         # Add model information if available and auto_polynomial was used
         if best_model_info is not None and auto_polynomial:
@@ -941,7 +1068,6 @@ def plot_correlation(x, y, x_label=None, y_label=None, title=None,
                            5: 'Quintic', 6: 'Sextic'}
             model_name = degree_names.get(best_model_info['degree'], f"Degree {best_model_info['degree']}")
             stats_text += f"\n{model_name} fit:"
-            # stats_text += f"\nR² = {best_model_info['r_squared']:.3f}"
             metric_values = {
                 'variance_explained': best_model_info['r_squared'],
                 'rmse': best_model_info['rmse'],
@@ -974,14 +1100,14 @@ def plot_correlation(x, y, x_label=None, y_label=None, title=None,
         ax.text(text_x, text_y, stats_text, transform=ax.transAxes,
                bbox=dict(boxstyle="round,pad=0.3", facecolor='white', 
                         edgecolor='gray', alpha=0.8),
-               fontsize=font_size-1, ha=ha, va=va, family='monospace')
+               fontsize=font_size-2, ha=ha, va=va, family='monospace')
     
     # Customize appearance
     ax.set_xlabel(x_label or 'X Variable', fontsize=font_size)
     ax.set_ylabel(y_label or 'Y Variable', fontsize=font_size)
     
     if title:
-        ax.set_title(title, fontsize=font_size, fontweight='bold', pad=10)
+        ax.set_title(title, fontsize=font_size+2, fontweight='bold', pad=10)
     
     # Grid
     if grid:
@@ -998,9 +1124,15 @@ def plot_correlation(x, y, x_label=None, y_label=None, title=None,
     ax.tick_params(axis='both', which='major', labelsize=font_size,
                   length=6, width=1.2, colors='black')
     
-    # Legend if outliers are highlighted
-    if highlight_outliers and np.any(outlier_mask):
-        ax.legend(fontsize=font_size-1, loc='best', framealpha=0.9)
+    # Legend if data_group are provided or outliers are highlighted
+    # if (data_group is not None and len(np.unique(data_group_clean)) <= 10) or \
+    #    (highlight_outliers and np.any(outlier_mask)):
+    #     # Position legend outside plot area when using data groups to avoid overlap with colorbar
+    #     if data_group is not None and len(np.unique(data_group_clean)) > 1:
+    #         ax.legend(fontsize=font_size-2, framealpha=0.9, 
+    #                  bbox_to_anchor=(1.15, 1), loc='upper left')
+    #     else:
+    #         ax.legend(fontsize=font_size-2, loc='best', framealpha=0.9)
     
     # Only apply tight_layout and save if we created a new figure
     if created_new_figure:
@@ -1021,7 +1153,12 @@ def plot_correlation(x, y, x_label=None, y_label=None, title=None,
             'method': method_name,
             'n_outliers': np.sum(outlier_mask) if outlier_threshold else 0,
             'outlier_indices': np.where(valid_mask)[0][outlier_mask] if outlier_threshold else [],
-            'model_info': best_model_info
+            'model_info': best_model_info,
+            'data_group_info': {
+                'n_groups': len(np.unique(data_group_clean)) if data_group is not None else None,
+                'unique_groups': np.unique(data_group_clean).tolist() if data_group is not None else None,
+                'group_type': 'string' if data_group is not None and isinstance(np.unique(data_group_clean)[0], (str, np.str_)) else 'numeric'
+            } if data_group is not None else None
         }
     
     # Return appropriate values based on whether we created a new figure
