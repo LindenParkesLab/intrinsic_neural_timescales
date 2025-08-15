@@ -99,3 +99,218 @@ def rename_task_columns_to_uppercase(df):
     df_renamed.columns = new_columns
     
     return df_renamed
+
+def load_data_for_analysis(which_data='HCP-YA', atlas='Schaefer4007', 
+                           indir='/home/lindenmp/research_projects/intrinsic_neural_timescales/data',
+                           outdir=None, include_movies=True):
+    """
+    Load common fMRI data needed for both timescales analysis notebooks.
+    
+    This function loads all the common data structures used in both 
+    results_fmri_timescales.ipynb and results_fmri_timescales_behavior.ipynb:
+    - SA axis data
+    - Subject IDs
+    - Behavioral data 
+    - Rest timescales
+    - Task timescales
+    - Movie timescales (if available)
+    - Parcellation data
+    - Yeo systems information
+    
+    Parameters:
+    -----------
+    which_data : str, default 'HCP-YA'
+        Dataset to load ('HCP-YA' or 'HCP-D')
+    atlas : str, default 'Schaefer4007'
+        Atlas to use ('Schaefer4007', 'Schaefer2007', 'Schaefer1007')
+    indir : str
+        Input directory containing the raw data files
+    outdir : str, optional
+        Output directory. If None, constructed from which_data
+    include_movies : bool, default True
+        Whether to load movie timescales (only for HCP-YA)
+        
+    Returns:
+    --------
+    data_dict : dict
+        Dictionary containing all loaded data with keys:
+        - 'sa_axis': SA axis values
+        - 'subject_ids': Array of subject IDs
+        - 'n_subs': Number of subjects
+        - 'df_behavior': Behavioral dataframe with renamed columns
+        - 'rest_timescales': Dict of rest timescales
+        - 'task_timescales': Dict of task timescales  
+        - 'movie_timescales': Dict of movie timescales (if available)
+        - 'parc': Parcellation dataframe
+        - 'yeo_systems': List of Yeo system labels
+        - 'config': Configuration dict with TR values, scan names, etc.
+    """
+    
+    if outdir is None:
+        outdir = f'/home/lindenmp/research_projects/intrinsic_neural_timescales/results/{which_data}'
+    
+    # Set up configuration based on dataset and atlas
+    config = {}
+    
+    # Atlas configuration
+    if atlas == 'Schaefer4007':
+        config['n_parcels'] = 400
+        parc_file = os.path.join(indir, 'Schaefer2018_400Parcels_7Networks_order_FSLMNI152_1mm.Centroid_RAS.csv')
+    elif atlas == 'Schaefer2007':
+        config['n_parcels'] = 200
+        parc_file = os.path.join(indir, 'Schaefer2018_200Parcels_7Networks_order_FSLMNI152_1mm.Centroid_RAS.csv')
+    elif atlas == 'Schaefer1007':
+        config['n_parcels'] = 100
+        parc_file = os.path.join(indir, 'Schaefer2018_100Parcels_7Networks_order_FSLMNI152_1mm.Centroid_RAS.csv')
+    else:
+        raise ValueError(f"Unknown atlas: {atlas}")
+    
+    # Dataset-specific configuration
+    if which_data == 'HCP-YA':
+        config['tr_3T'] = 0.720
+        config['tr_7T'] = 1.0
+        if include_movies:
+            config['rest_scans'] = ['rfMRI_REST1_7T_PA', 'rfMRI_REST2_7T_AP', 'rfMRI_REST3_7T_PA', 'rfMRI_REST4_7T_AP', 
+                                    'rfMRI_REST1_LR', 'rfMRI_REST2_LR', 'rfMRI_REST1_RL', 'rfMRI_REST2_RL']
+            config['movies'] = ['tfMRI_MOVIE1_7T_AP', 'tfMRI_MOVIE2_7T_PA', 'tfMRI_MOVIE3_7T_PA', 'tfMRI_MOVIE4_7T_AP']
+        else:
+            config['rest_scans'] = ['rfMRI_REST1_LR', 'rfMRI_REST2_LR', 'rfMRI_REST1_RL', 'rfMRI_REST2_RL']
+            config['movies'] = []
+        config['tasks'] = ['tfMRI_WM_LR', 'tfMRI_EMOTION_LR', 'tfMRI_GAMBLING_LR', 'tfMRI_LANGUAGE_LR', 
+                          'tfMRI_RELATIONAL_LR', 'tfMRI_SOCIAL_LR', 'tfMRI_WM_RL', 'tfMRI_EMOTION_RL', 
+                          'tfMRI_GAMBLING_RL', 'tfMRI_LANGUAGE_RL', 'tfMRI_RELATIONAL_RL', 'tfMRI_SOCIAL_RL']
+    elif which_data == 'HCP-D':
+        config['tr_3T'] = 0.800
+        config['rest_scans'] = ['rfMRI_REST1_AP', 'rfMRI_REST1_PA', 'rfMRI_REST2_AP', 'rfMRI_REST2_PA']
+        config['tasks'] = ['tfMRI_CARIT_PA']
+        config['movies'] = []
+    else:
+        raise ValueError(f"Unknown dataset: {which_data}")
+    
+    print(f"Loading common fMRI data for {which_data} with {atlas} atlas...")
+    
+    # Load SA axis
+    sa_axis_file = os.path.join(indir, f'schaefer{config["n_parcels"]}-7_sa-axis.npy')
+    sa_axis = np.load(sa_axis_file)
+    sa_axis = sp.stats.rankdata(sa_axis)
+    sa_axis_sort_idx = np.argsort(sa_axis)
+    
+    print(f"Loaded SA axis with shape: {sa_axis.shape}")
+    
+    # Load subject IDs and handle HCP-YA 3T/7T matching
+    if which_data == 'HCP-YA' and include_movies:
+        subject_ids = np.loadtxt(os.path.join(indir, f'{which_data}_{atlas}_subjids.txt'), dtype=str)
+        subject_ids_7t = np.loadtxt(os.path.join(indir, f'{which_data}-7T_{atlas}_subjids.txt'), dtype=str)
+
+        # Find subjects that exist in both 3T and 7T datasets
+        found_indices_3t = []
+        for index, item in enumerate(subject_ids):
+            if item in subject_ids_7t:
+                found_indices_3t.append(index)
+                
+        found_indices_7t = []
+        for index, item in enumerate(subject_ids_7t):
+            if item in subject_ids:
+                found_indices_7t.append(index)
+                
+        subject_ids = subject_ids[found_indices_3t]
+        n_subs = len(found_indices_3t)
+        
+        print(f"Found {len(found_indices_3t)} subjects with both 3T and 7T data")
+        config['found_indices_3t'] = found_indices_3t
+        config['found_indices_7t'] = found_indices_7t
+    else:
+        subject_ids = np.loadtxt(os.path.join(outdir, f'{which_data}_{atlas}_subjids.txt'), dtype=str)
+        n_subs = len(subject_ids)
+        print(f"Loaded {n_subs} subjects")
+    
+    # Load behavioral data
+    if which_data == 'HCP-YA':
+        df_behavior = pd.read_csv('/mnt/storage_ssd_raid/research_data/HCP_YA/unrestricted_lindenmp_9_26_2022_16_52_14.csv', index_col=0)
+        df_behavior = df_behavior.loc[subject_ids.astype(int)]
+        df_behavior_restricted = pd.read_csv('/mnt/storage_ssd_raid/research_data/HCP_YA/RESTRICTED_lindenmp_9_26_2022_16_42_3.csv', index_col=0)
+        df_behavior_restricted = df_behavior_restricted.loc[subject_ids.astype(int)]
+        df_behavior['age'] = df_behavior_restricted['Age_in_Yrs']
+        df_behavior['sex'] = df_behavior['Gender'] == 'M'
+        df_behavior['sex'] = df_behavior['sex'].astype(int)
+        df_behavior = rename_task_columns_to_uppercase(df_behavior)
+        print(f"Loaded behavioral data with shape: {df_behavior.shape}")
+    else:
+        df_behavior = None
+        print("Behavioral data loading not implemented for HCP-D")
+    
+    # Load rest timescales
+    rest_timescales = dict()
+    for which_scan in config['rest_scans']:
+        print(f"Loading {which_scan}...")
+        if which_data == 'HCP-YA' and include_movies:
+            try:
+                timescales = np.load(os.path.join(outdir, f'{which_data.replace("_", "")}_{atlas}_{which_scan.replace("_", "")}_timescales_acflag.npy')) * config['tr_3T']
+                timescales = timescales[found_indices_3t]
+            except:
+                timescales = np.load(os.path.join(outdir, f'{which_data.replace("_", "")}-7T_{atlas}_{which_scan.replace("_", "")}_timescales_acflag.npy')) * config['tr_7T']
+                timescales = timescales[found_indices_7t]
+        else:
+            timescales = np.load(os.path.join(outdir, f'{which_data.replace("_", "")}_{atlas}_{which_scan.replace("_", "")}_timescales_acflag.npy')) * config['tr_3T']
+        
+        print(f"  Shape: {timescales.shape}")
+        rest_timescales[which_scan] = timescales
+    
+    # Load task timescales
+    task_timescales = dict()
+    for which_scan in config['tasks']:
+        print(f"Loading {which_scan}...")
+        timescales = np.load(os.path.join(outdir, f'{which_data.replace("_", "")}_{atlas}_{which_scan.replace("_", "")}_timescales_acflag.npy')) * config['tr_3T']
+        if which_data == 'HCP-YA' and include_movies:
+            timescales = timescales[found_indices_3t]
+        print(f"  Shape: {timescales.shape}")
+        task_timescales[which_scan] = timescales
+
+    # Load movie timescales (HCP-YA only)
+    movie_timescales = dict()
+    if which_data == 'HCP-YA' and include_movies:
+        for which_scan in config['movies']:
+            print(f"Loading {which_scan}...")
+            timescales = np.load(os.path.join(outdir, f'{which_data.replace("_", "")}-7T_{atlas}_{which_scan.replace("_", "")}_timescales_acflag.npy')) * config['tr_7T']
+            timescales = timescales[found_indices_7t]
+            print(f"  Shape: {timescales.shape}")
+            movie_timescales[which_scan] = timescales
+    
+    # Load parcellation data
+    parc = pd.read_csv(parc_file, header=0, names=['ROI_Label', 'ROI_Name', 'R', 'A', 'S'])
+    
+    # Extract Yeo systems
+    yeo_systems = parc['ROI_Name']
+    yeo_systems = yeo_systems.str.replace('7Networks_LH_', '')
+    yeo_systems = yeo_systems.str.replace('7Networks_RH_', '')
+    yeo_systems = [i.split('_')[0] for i in yeo_systems]
+    yeo_systems = [i.split(' ')[1] for i in yeo_systems]
+    
+    print(f"Extracted {len(set(yeo_systems))} unique Yeo systems: {set(yeo_systems)}")
+    
+    # Create return dictionary
+    data_dict = {
+        'sa_axis': sa_axis,
+        'sa_axis_sort_idx': sa_axis_sort_idx,
+        'subject_ids': subject_ids,
+        'n_subs': n_subs,
+        'df_behavior': df_behavior,
+        'rest_timescales': rest_timescales,
+        'task_timescales': task_timescales,
+        'movie_timescales': movie_timescales,
+        'parc': parc,
+        'yeo_systems': yeo_systems,
+        'config': config
+    }
+    
+    print(f"\nSuccessfully loaded common fMRI data:")
+    print(f"  - SA axis: {sa_axis.shape}")
+    print(f"  - Subjects: {n_subs}")
+    print(f"  - Rest conditions: {len(rest_timescales)}")
+    print(f"  - Task conditions: {len(task_timescales)}")
+    print(f"  - Movie conditions: {len(movie_timescales)}")
+    print(f"  - Brain regions: {config['n_parcels']}")
+    if df_behavior is not None:
+        print(f"  - Behavioral measures: {df_behavior.shape[1]}")
+    
+    return data_dict
