@@ -135,6 +135,7 @@ def load_data_for_analysis(which_data='HCP-YA', atlas='Schaefer4007',
     data_dict : dict
         Dictionary containing all loaded data with keys:
         - 'sa_axis': SA axis values
+        - 'sf_axis': SF axis values
         - 'subject_ids': Array of subject IDs
         - 'n_subs': Number of subjects
         - 'df_behavior': Behavioral dataframe with renamed columns
@@ -194,8 +195,14 @@ def load_data_for_analysis(which_data='HCP-YA', atlas='Schaefer4007',
     sa_axis = np.load(sa_axis_file)
     sa_axis = sp.stats.rankdata(sa_axis)
     sa_axis_sort_idx = np.argsort(sa_axis)
-    
     print(f"Loaded SA axis with shape: {sa_axis.shape}")
+    
+    # Load SF axis
+    sf_axis_file = os.path.join(indir, f'schaefer{config["n_parcels"]}-7_cyto.npy')
+    sf_axis = np.load(sf_axis_file) * -1  # Invert SF axis
+    sf_axis = sp.stats.rankdata(sf_axis)
+    sf_axis_sort_idx = np.argsort(sf_axis)
+    print(f"Loaded SF axis with shape: {sf_axis.shape}")
     
     # Load subject IDs and handle HCP-YA 3T/7T matching
     if which_data == 'HCP-YA' and include_movies:
@@ -292,6 +299,8 @@ def load_data_for_analysis(which_data='HCP-YA', atlas='Schaefer4007',
     data_dict = {
         'sa_axis': sa_axis,
         'sa_axis_sort_idx': sa_axis_sort_idx,
+        'sf_axis': sf_axis,
+        'sf_axis_sort_idx': sf_axis_sort_idx,
         'subject_ids': subject_ids,
         'n_subs': n_subs,
         'df_behavior': df_behavior,
@@ -305,6 +314,7 @@ def load_data_for_analysis(which_data='HCP-YA', atlas='Schaefer4007',
     
     print(f"\nSuccessfully loaded common fMRI data:")
     print(f"  - SA axis: {sa_axis.shape}")
+    print(f"  - SF axis: {sf_axis.shape}")
     print(f"  - Subjects: {n_subs}")
     print(f"  - Rest conditions: {len(rest_timescales)}")
     print(f"  - Task conditions: {len(task_timescales)}")
