@@ -4,11 +4,22 @@ import pandas as pd
 import seaborn as sns
 from scipy import stats
 from scipy.stats import pearsonr, spearmanr
+
+import seaborn as sns
 import matplotlib.pyplot as plt
+from matplotlib.colors import Normalize
+from matplotlib.cm import ScalarMappable
+plt.ion()
+
+import nibabel as nib
+from nilearn import datasets
+from nilearn import plotting
+from nilearn.image import new_img_like
+from nilearn.surface import load_surf_data, vol_to_surf
 
 def plot_autocorrelation_analysis(autocorr_raw, autocorr_resid, zero_crossings_raw, zero_crossings_resid, 
-                                  design_matrix, events, tr, 
-                                  n_example_voxels=5, figsize=(10, 5)):
+                                  design_matrix, events, tr,
+                                  n_example_voxels=5, figsize=(10, 5), save_path=None, dpi=300):
     """
     Plot autocorrelation analysis results and block design.
     
@@ -118,6 +129,13 @@ def plot_autocorrelation_analysis(autocorr_raw, autocorr_resid, zero_crossings_r
     ax4.grid(True, alpha=0.3)
     
     plt.tight_layout()
+    
+    # Save figure if path provided
+    if save_path:
+        plt.savefig(save_path, dpi=dpi, bbox_inches='tight', 
+                    facecolor='white', edgecolor='none')
+        print(f"Figure saved to: {save_path}")
+
     return fig
 
 
@@ -1172,3 +1190,231 @@ def plot_correlation(x, y, x_label=None, y_label=None, title=None,
             return ax, stats_dict
         else:
             return ax
+        
+
+def plot_brain_surface_data(data_vector, parcellation='schaefer_400', surface='fsaverage5',
+                           cmap='viridis', vmin=None, vmax=None, threshold=None,
+                           title='Brain Surface Data', figsize=(6, 4), 
+                           colorbar=True, symmetric_cbar=False, save_path=None, 
+                           dpi=300, alpha=0.8, darkness=0.7, show_stats=False):
+    """
+    Plot brain data on cortical surface with lateral and medial views for both hemispheres.
+    
+    Parameters:
+    -----------
+    data_vector : array-like
+        1D numpy array containing brain data values. Length should match the number of parcels
+        in the specified parcellation (e.g., 400 for Schaefer 400-parcel atlas).
+    parcellation : str, default 'schaefer_400'
+        Parcellation scheme to use. Options: 'schaefer_400', 'schaefer_200', 'schaefer_100'
+    surface : str, default 'fsaverage5'
+        Brain surface to use. Options: 'fsaverage5', 'fsaverage'
+    cmap : str, default 'viridis'
+        Colormap for data visualization
+    vmin, vmax : float, optional
+        Min/max values for color scaling. If None, uses data range.
+    threshold : float, optional
+        Threshold below which values are not displayed
+    title : str, default 'Brain Surface Data'
+        Main title for the figure
+    figsize : tuple, default (6, 4)
+        Figure size (width, height) in inches
+    colorbar : bool, default True
+        Whether to show colorbar
+    symmetric_cbar : bool, default False
+        Whether to center colorbar at zero
+    save_path : str, optional
+        Path to save the figure
+    dpi : int, default 300
+        DPI for saved figure
+    alpha : float, default 0.8
+        Transparency of the surface data overlay
+    darkness : float, default 0.7
+        Darkness of the brain surface (0=light, 1=dark)
+    show_stats : bool, default False
+        Whether to show data statistics text box
+        
+    Returns:
+    --------
+    fig : matplotlib.figure.Figure
+        The created figure object
+    axes : list
+        List of matplotlib axes objects for each subplot
+        
+    Examples:
+    ---------
+    # Generate example data for 400-parcel Schaefer atlas
+    example_data = np.random.randn(400)
+    fig, axes = plot_brain_surface_data(example_data, title='Random Brain Data')
+    
+    # Plot with custom parameters
+    fig, axes = plot_brain_surface_data(
+        data_vector=my_brain_data,
+        parcellation='schaefer_400',
+        cmap='RdBu_r',
+        symmetric_cbar=True,
+        threshold=0.1,
+        title='Task-related Brain Activity',
+        show_stats=True  # Show statistics box
+    )
+    """
+    
+    # Validate input data
+    data_vector = np.array(data_vector)
+    if data_vector.ndim != 1:
+        raise ValueError("data_vector must be 1-dimensional")
+    
+    # Load appropriate parcellation atlas
+    if parcellation == 'schaefer_400':
+        atlas = datasets.fetch_atlas_schaefer_2018(n_rois=400, yeo_networks=7, resolution_mm=1)
+        expected_length = 400
+    elif parcellation == 'schaefer_200':
+        atlas = datasets.fetch_atlas_schaefer_2018(n_rois=200, yeo_networks=7, resolution_mm=1)
+        expected_length = 200
+    elif parcellation == 'schaefer_100':
+        atlas = datasets.fetch_atlas_schaefer_2018(n_rois=100, yeo_networks=7, resolution_mm=1)
+        expected_length = 100
+    else:
+        raise ValueError(f"Unsupported parcellation: {parcellation}")
+    
+    # Validate data length
+    if len(data_vector) != expected_length:
+        raise ValueError(f"Data vector length ({len(data_vector)}) doesn't match expected parcellation size ({expected_length})")
+    
+    # Load brain surface
+    if surface == 'fsaverage5':
+        surf_mesh = datasets.fetch_surf_fsaverage(mesh='fsaverage5')
+    elif surface == 'fsaverage':
+        surf_mesh = datasets.fetch_surf_fsaverage(mesh='fsaverage')
+    else:
+        raise ValueError(f"Unsupported surface: {surface}")
+    
+    
+    # Load the atlas image
+    atlas_img = nib.load(atlas['maps'])
+    atlas_data = atlas_img.get_fdata()
+    
+    # Create data image by mapping parcel values to atlas regions
+    data_img_data = np.zeros_like(atlas_data)
+    for i, value in enumerate(data_vector):
+        data_img_data[atlas_data == (i + 1)] = value  # Atlas labels start from 1
+    
+    # Create nibabel image
+    data_img = new_img_like(atlas_img, data_img_data)
+    
+    # Project volumetric data to surface for each hemisphere
+    # Use nearest neighbor interpolation to preserve discrete parcellation boundaries
+    # Set radius and n_samples to minimum values for precise mapping
+    surf_data_left = vol_to_surf(data_img, surf_mesh['pial_left'], 
+                                 interpolation='nearest', radius=0.1, n_samples=1)
+    surf_data_right = vol_to_surf(data_img, surf_mesh['pial_right'], 
+                                  interpolation='nearest', radius=0.1, n_samples=1)
+    
+    # Set up color scaling
+    if vmin is None:
+        vmin = np.min(data_vector)
+    if vmax is None:
+        vmax = np.max(data_vector)
+    
+    if symmetric_cbar:
+        abs_max = max(abs(vmin), abs(vmax))
+        vmin, vmax = -abs_max, abs_max
+    
+    # Create main figure
+    fig = plt.figure(figsize=figsize)
+    
+    # Define views and data
+    views_data = [
+        ('left', 'lateral', 'Left Lateral', surf_data_left, surf_mesh['pial_left']),
+        ('left', 'medial', 'Left Medial', surf_data_left, surf_mesh['pial_left']), 
+        ('right', 'lateral', 'Right Lateral', surf_data_right, surf_mesh['pial_right']),
+        ('right', 'medial', 'Right Medial', surf_data_right, surf_mesh['pial_right'])
+    ]
+    
+    axes = []
+    
+    # Plot each view
+    for idx, (hemi, view, view_title, surf_data, surf_mesh_hemi) in enumerate(views_data):
+        # Create subplot with 3D projection
+        ax = fig.add_subplot(2, 2, idx+1, projection='3d')
+        axes.append(ax)
+        
+        try:
+            # Create surface plot using plot_surf_stat_map
+            plotting.plot_surf_stat_map(
+                surf_mesh=surf_mesh_hemi,
+                stat_map=surf_data,
+                hemi=hemi,
+                view=view,
+                bg_map=surf_mesh[f'sulc_{hemi}'],
+                bg_on_data=True,
+                alpha=alpha,
+                darkness=darkness,
+                vmin=vmin,
+                vmax=vmax,
+                cmap=cmap,
+                threshold=threshold,
+                colorbar=False,  # We'll add a single colorbar later
+                axes=ax,
+                figure=fig
+            )
+            
+            # Set subplot title
+            # ax.set_title(view_title, fontsize=12, fontweight='bold', pad=10)
+            
+        except Exception as e:
+            print(f"Warning: Could not plot {view_title}: {str(e)}")
+            # Clear the 3D axis and create a simple error display
+            ax.clear()
+            ax.text(0.5, 0.5, 0.5, f'Error plotting\n{view_title}', 
+                   ha='center', va='center', fontsize=10, transform=ax.transData)
+            ax.set_xlim(0, 1)
+            ax.set_ylim(0, 1) 
+            ax.set_zlim(0, 1)
+            ax.set_xticks([])
+            ax.set_yticks([])
+            ax.set_zticks([])
+            # ax.set_title(view_title, fontsize=12, fontweight='bold', pad=10)
+    
+    # Add main title
+    fig.suptitle(title, fontsize=14, fontweight='bold', y=0.98)
+    
+    # Add colorbar
+    if colorbar:
+
+        
+        norm = Normalize(vmin=vmin, vmax=vmax)
+        sm = ScalarMappable(norm=norm, cmap=cmap)
+        sm.set_array([])
+        
+        # Position colorbar
+        cbar_ax = fig.add_axes([0.87, 0.15, 0.025, 0.7])
+        cbar = fig.colorbar(sm, cax=cbar_ax)
+        cbar.set_label('Data Values', fontsize=10, fontweight='bold')
+        cbar.ax.tick_params(labelsize=9)
+    
+    # Adjust layout to minimize white space - very aggressive spacing
+    plt.tight_layout(pad=0.0, h_pad=-0.5, w_pad=-0.5)
+    if colorbar:
+        plt.subplots_adjust(right=0.9, hspace=-0.2, wspace=-0.25)
+    else:
+        plt.subplots_adjust(hspace=-0.2, wspace=-0.25)
+    
+    # Add data statistics as text (optional)
+    if show_stats:
+        stats_text = f"Data Range: [{np.min(data_vector):.3f}, {np.max(data_vector):.3f}]\n"
+        stats_text += f"Mean: {np.mean(data_vector):.3f}, Std: {np.std(data_vector):.3f}\n"
+        stats_text += f"Parcellation: {parcellation.replace('_', ' ').title()}\n"
+        stats_text += f"Surface: {surface}"
+        
+        fig.text(0.02, 0.02, stats_text, fontsize=8, 
+                 bbox=dict(boxstyle="round,pad=0.3", facecolor='lightblue', alpha=0.7),
+                 verticalalignment='bottom')
+    
+    # Save figure if path provided
+    if save_path:
+        plt.savefig(save_path, dpi=dpi, bbox_inches='tight', 
+                   facecolor='white', edgecolor='none')
+        print(f"Figure saved to: {save_path}")
+    
+    return fig, axes
