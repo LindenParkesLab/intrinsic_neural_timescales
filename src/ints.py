@@ -844,6 +844,7 @@ def compute_autocorrelation_function(data):
     Returns:
     - autocorr: autocorrelation function(s)
     - zero_crossings: first zero-crossing indices
+    - auc_before_zero: area under curve before zero crossing
     """
     
     if data.ndim == 1:
@@ -851,6 +852,7 @@ def compute_autocorrelation_function(data):
     
     autocorr_list = []
     zero_crossings = []
+    auc_before_zero = []
     
     for voxel_ts in data:
         if np.std(voxel_ts) > 0:  # Avoid division by zero
@@ -867,16 +869,30 @@ def compute_autocorrelation_function(data):
             # Find first zero-crossing
             negative_indices = np.where(acf < 0)[0]
             if len(negative_indices) > 0:
-                zero_crossings.append(negative_indices[0])
+                zero_cross_idx = negative_indices[0]
+                zero_crossings.append(zero_cross_idx)
+                
+                # Calculate AUC before zero crossing using trapezoidal rule
+                # Only integrate from lag 0 to zero crossing
+                lags_before_zero = np.arange(zero_cross_idx + 1)
+                acf_before_zero = acf[:zero_cross_idx + 1]
+                auc = np.trapz(acf_before_zero, lags_before_zero)
+                auc_before_zero.append(auc)
             else:
-                zero_crossings.append(len(acf) - 1)  # No zero crossing found
+                # No zero crossing found - use entire ACF
+                zero_crossings.append(len(acf) - 1)
+                lags = np.arange(len(acf))
+                auc = np.trapz(acf, lags)
+                auc_before_zero.append(auc)
         else:
             # Handle constant time series
             n_timepoints = len(voxel_ts)
             autocorr_list.append(np.ones(n_timepoints))
             zero_crossings.append(n_timepoints - 1)
+            # For constant series, AUC is just the number of timepoints (all 1s)
+            auc_before_zero.append(float(n_timepoints - 1))
     
-    return np.array(autocorr_list), np.array(zero_crossings)
+    return np.array(autocorr_list), np.array(zero_crossings), np.array(auc_before_zero)
 
 
 def compute_timescales(timeseries, which_version='acf', return_mean=True, tr=np.nan):
@@ -1008,9 +1024,9 @@ def fit_glm(fmri_data, design_matrix):
         return fmri_data.copy(), np.zeros_like(fmri_data), np.zeros((fmri_data.shape[0], design_matrix.shape[1]))
 
 
-def compute_autocorrelation_with_hrf(fmri_data, events, tr, mask=None, hrf_model='glover', drift_model='cosine'):
+def compute_task_autocorr_analysis(fmri_data, events, tr, mask=None, hrf_model='glover', drift_model='cosine'):
     """
-    Compute autocorrelation of fMRI data using nilearn for block design analysis.
+    Perform task-related autocorrelation analysis with area under curve calculations.
     
     Parameters:
     - fmri_data: 4D numpy array (x,y,z,time) or 2D array (voxels,time)
@@ -1023,7 +1039,10 @@ def compute_autocorrelation_with_hrf(fmri_data, events, tr, mask=None, hrf_model
     Returns:
     - autocorr_raw: autocorrelation before task removal (n_voxels x n_lags)
     - autocorr_resid: autocorrelation after task removal (n_voxels x n_lags)  
-    - zero_crossings: first zero-crossing indices (n_voxels,)
+    - zero_crossings_raw: first zero-crossing indices before task removal (n_voxels,)
+    - zero_crossings_resid: first zero-crossing indices after task removal (n_voxels,)
+    - auc_raw: AUC before zero crossing - before task removal (n_voxels,)
+    - auc_resid: AUC before zero crossing - after task removal (n_voxels,)
     - residuals: residual time series after GLM (n_voxels x n_timepoints)
     - design_matrix: nilearn DesignMatrix object
     """
@@ -1045,8 +1064,8 @@ def compute_autocorrelation_with_hrf(fmri_data, events, tr, mask=None, hrf_model
     else:
         raise ValueError("fMRI data must be 2D (voxels x time) or 4D (x,y,z,time)")
 
-    # Compute raw autocorrelation (before task removal)
-    autocorr_raw, zero_crossings_raw = compute_autocorrelation_function(fmri_data_2d)
+    # Compute raw autocorrelation (before task removal) - now with AUC
+    autocorr_raw, zero_crossings_raw, auc_raw = compute_autocorrelation_function(fmri_data_2d)
 
     # Create design matrix using nilearn
     design_matrix = create_design_matrix_nilearn(events, n_timepoints, tr, hrf_model=hrf_model, drift_model=drift_model)
@@ -1054,9 +1073,19 @@ def compute_autocorrelation_with_hrf(fmri_data, events, tr, mask=None, hrf_model
     # Fit GLM using nilearn approach
     residuals, predicted, betas = fit_glm(fmri_data_2d, design_matrix)
     
-    # Compute autocorrelation on residuals
-    autocorr_resid, zero_crossings_resid = compute_autocorrelation_function(residuals)
+    # Compute autocorrelation on residuals - now with AUC
+    autocorr_resid, zero_crossings_resid, auc_resid = compute_autocorrelation_function(residuals)
+    
+    results = {
+        'autocorr_raw': autocorr_raw,
+        'autocorr_resid': autocorr_resid,
+        'zero_crossings_raw': zero_crossings_raw,
+        'zero_crossings_resid': zero_crossings_resid,
+        'auc_raw': auc_raw,
+        'auc_resid': auc_resid,
+        'residuals': residuals,
+        'design_matrix': design_matrix,
+    }
 
-    return autocorr_raw, zero_crossings_raw, autocorr_resid, zero_crossings_resid, residuals, design_matrix
-
+    return results
 
