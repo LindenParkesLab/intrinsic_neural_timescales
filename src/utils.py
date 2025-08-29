@@ -248,17 +248,19 @@ def load_data_for_analysis(which_data='HCP-YA', atlas='Schaefer4007',
     
     # Load rest timescales
     rest_timescales = dict()
+    file_suffix = 'timescales_acf-lag.npy'
+    # file_suffix = 'timescales_acf-auc.npy'
     for which_scan in config['rest_scans']:
         print(f"Loading {which_scan}...")
         if which_data == 'HCP-YA' and include_movies:
             try:
-                timescales = np.load(os.path.join(outdir, f'{which_data.replace("_", "")}_{atlas}_{which_scan.replace("_", "")}_timescales_acflag.npy')) * config['tr_3T']
+                timescales = np.load(os.path.join(outdir, f'{which_data.replace("_", "")}_{atlas}_{which_scan.replace("_", "")}_{file_suffix}')) * config['tr_3T']
                 timescales = timescales[found_indices_3t]
             except:
-                timescales = np.load(os.path.join(outdir, f'{which_data.replace("_", "")}-7T_{atlas}_{which_scan.replace("_", "")}_timescales_acflag.npy')) * config['tr_7T']
+                timescales = np.load(os.path.join(outdir, f'{which_data.replace("_", "")}-7T_{atlas}_{which_scan.replace("_", "")}_{file_suffix}')) * config['tr_7T']
                 timescales = timescales[found_indices_7t]
         else:
-            timescales = np.load(os.path.join(outdir, f'{which_data.replace("_", "")}_{atlas}_{which_scan.replace("_", "")}_timescales_acflag.npy')) * config['tr_3T']
+            timescales = np.load(os.path.join(outdir, f'{which_data.replace("_", "")}_{atlas}_{which_scan.replace("_", "")}_{file_suffix}')) * config['tr_3T']
         
         print(f"  Shape: {timescales.shape}")
         rest_timescales[which_scan] = timescales
@@ -267,7 +269,7 @@ def load_data_for_analysis(which_data='HCP-YA', atlas='Schaefer4007',
     task_timescales = dict()
     for which_scan in config['tasks']:
         print(f"Loading {which_scan}...")
-        timescales = np.load(os.path.join(outdir, f'{which_data.replace("_", "")}_{atlas}_{which_scan.replace("_", "")}_timescales_acflag.npy')) * config['tr_3T']
+        timescales = np.load(os.path.join(outdir, f'{which_data.replace("_", "")}_{atlas}_{which_scan.replace("_", "")}_{file_suffix}')) * config['tr_3T']
         if which_data == 'HCP-YA' and include_movies:
             timescales = timescales[found_indices_3t]
         print(f"  Shape: {timescales.shape}")
@@ -278,10 +280,14 @@ def load_data_for_analysis(which_data='HCP-YA', atlas='Schaefer4007',
     if which_data == 'HCP-YA' and include_movies:
         for which_scan in config['movies']:
             print(f"Loading {which_scan}...")
-            timescales = np.load(os.path.join(outdir, f'{which_data.replace("_", "")}-7T_{atlas}_{which_scan.replace("_", "")}_timescales_acflag.npy')) * config['tr_7T']
+            timescales = np.load(os.path.join(outdir, f'{which_data.replace("_", "")}-7T_{atlas}_{which_scan.replace("_", "")}_{file_suffix}')) * config['tr_7T']
             timescales = timescales[found_indices_7t]
             print(f"  Shape: {timescales.shape}")
             movie_timescales[which_scan] = timescales
+            
+    # Load myelin map
+    myelin_file = os.path.join(indir, f'{which_data.replace("_", "")}_{atlas}_myelin.npy')
+    myelin_maps = np.load(myelin_file)
     
     # Load parcellation data
     parc = pd.read_csv(parc_file, header=0, names=['ROI_Label', 'ROI_Name', 'R', 'A', 'S'])
@@ -307,6 +313,7 @@ def load_data_for_analysis(which_data='HCP-YA', atlas='Schaefer4007',
         'rest_timescales': rest_timescales,
         'task_timescales': task_timescales,
         'movie_timescales': movie_timescales,
+        'myelin_maps': myelin_maps,
         'parc': parc,
         'yeo_systems': yeo_systems,
         'config': config
