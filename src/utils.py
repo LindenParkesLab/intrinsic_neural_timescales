@@ -102,18 +102,18 @@ def rename_task_columns_to_uppercase(df):
 
 def load_data_for_analysis(which_data='HCP-YA', atlas='Schaefer4007', 
                            indir='/home/lindenmp/research_projects/intrinsic_neural_timescales/data',
-                           outdir=None, include_movies=True):
+                           outdir=None, include_movies=True, include_meg=False):
     """
-    Load common fMRI data needed for both timescales analysis notebooks.
+    Load common fMRI and MEG data needed for timescales analysis notebooks.
     
-    This function loads all the common data structures used in both 
-    results_fmri_timescales.ipynb and results_fmri_timescales_behavior.ipynb:
+    This function loads all the common data structures used in timescales analysis:
     - SA axis data
     - Subject IDs
     - Behavioral data 
     - Rest timescales
     - Task timescales
     - Movie timescales (if available)
+    - MEG timescales (if requested)
     - Parcellation data
     - Yeo systems information
     
@@ -129,6 +129,8 @@ def load_data_for_analysis(which_data='HCP-YA', atlas='Schaefer4007',
         Output directory. If None, constructed from which_data
     include_movies : bool, default True
         Whether to load movie timescales (only for HCP-YA)
+    include_meg : bool, default False
+        Whether to load MEG timescales (only for HCP-YA)
         
     Returns:
     --------
@@ -142,6 +144,7 @@ def load_data_for_analysis(which_data='HCP-YA', atlas='Schaefer4007',
         - 'rest_timescales': Dict of rest timescales
         - 'task_timescales': Dict of task timescales  
         - 'movie_timescales': Dict of movie timescales (if available)
+        - 'meg_timescales': Dict of MEG timescales (if requested)
         - 'parc': Parcellation dataframe
         - 'yeo_systems': List of Yeo system labels
         - 'config': Configuration dict with TR values, scan names, etc.
@@ -170,6 +173,9 @@ def load_data_for_analysis(which_data='HCP-YA', atlas='Schaefer4007',
     if which_data == 'HCP-YA':
         config['tr_3T'] = 0.720
         config['tr_7T'] = 1.0
+        meg_sampling_rate = 508.63
+        config['tr_meg'] = 1 / meg_sampling_rate
+        
         if include_movies:
             config['rest_scans'] = ['rfMRI_REST1_7T_PA', 'rfMRI_REST2_7T_AP', 'rfMRI_REST3_7T_PA', 'rfMRI_REST4_7T_AP', 
                                     'rfMRI_REST1_LR', 'rfMRI_REST2_LR', 'rfMRI_REST1_RL', 'rfMRI_REST2_RL']
@@ -180,11 +186,17 @@ def load_data_for_analysis(which_data='HCP-YA', atlas='Schaefer4007',
         config['tasks'] = ['tfMRI_WM_LR', 'tfMRI_EMOTION_LR', 'tfMRI_GAMBLING_LR', 'tfMRI_LANGUAGE_LR', 
                           'tfMRI_RELATIONAL_LR', 'tfMRI_SOCIAL_LR', 'tfMRI_WM_RL', 'tfMRI_EMOTION_RL', 
                           'tfMRI_GAMBLING_RL', 'tfMRI_LANGUAGE_RL', 'tfMRI_RELATIONAL_RL', 'tfMRI_SOCIAL_RL']
+        
+        if include_meg:
+            config['meg_scans'] = ['3-Restin', '6-Wrkmem']
     elif which_data == 'HCP-D':
         config['tr_3T'] = 0.800
         config['rest_scans'] = ['rfMRI_REST1_AP', 'rfMRI_REST1_PA', 'rfMRI_REST2_AP', 'rfMRI_REST2_PA']
         config['tasks'] = ['tfMRI_CARIT_PA']
         config['movies'] = []
+        if include_meg:
+            print("Warning: MEG data not available for HCP-D")
+            include_meg = False
     else:
         raise ValueError(f"Unknown dataset: {which_data}")
     
@@ -204,28 +216,41 @@ def load_data_for_analysis(which_data='HCP-YA', atlas='Schaefer4007',
     sf_axis_sort_idx = np.argsort(sf_axis)
     print(f"Loaded SF axis with shape: {sf_axis.shape}")
     
-    # Load subject IDs and handle HCP-YA 3T/7T matching
-    if which_data == 'HCP-YA' and include_movies:
-        subject_ids = np.loadtxt(os.path.join(indir, f'{which_data}_{atlas}_subjids.txt'), dtype=str)
-        subject_ids_7t = np.loadtxt(os.path.join(indir, f'{which_data}-7T_{atlas}_subjids.txt'), dtype=str)
-
-        # Find subjects that exist in both 3T and 7T datasets
-        found_indices_3t = []
-        for index, item in enumerate(subject_ids):
-            if item in subject_ids_7t:
-                found_indices_3t.append(index)
-                
-        found_indices_7t = []
-        for index, item in enumerate(subject_ids_7t):
-            if item in subject_ids:
-                found_indices_7t.append(index)
-                
-        subject_ids = subject_ids[found_indices_3t]
-        n_subs = len(found_indices_3t)
+    # Load subject IDs and handle cross-modality matching
+    if which_data == 'HCP-YA' and (include_movies or include_meg):
+        # Load all subject ID sets
+        subject_ids_3t = np.loadtxt(os.path.join(outdir, f'{which_data}_{atlas}_subjids.txt'), dtype=str)
         
-        print(f"Found {len(found_indices_3t)} subjects with both 3T and 7T data")
-        config['found_indices_3t'] = found_indices_3t
-        config['found_indices_7t'] = found_indices_7t
+        subject_sets = [set(subject_ids_3t)]
+        subject_labels = ['3T']
+        
+        if include_movies:
+            subject_ids_7t = np.loadtxt(os.path.join(indir, f'{which_data}-7T_{atlas}_subjids.txt'), dtype=str)
+            subject_sets.append(set(subject_ids_7t))
+            subject_labels.append('7T')
+        
+        if include_meg:
+            subject_ids_meg = np.loadtxt(os.path.join(outdir, f'{which_data}-MEG_{atlas}_subjids.txt'), dtype=str)
+            subject_sets.append(set(subject_ids_meg))
+            subject_labels.append('MEG')
+        
+        # Find intersection of all modalities
+        common_subjects = set.intersection(*subject_sets)
+        subject_ids = np.array(list(common_subjects))
+        
+        # Create indices for each modality
+        found_indices_3t = [i for i, subj in enumerate(subject_ids_3t) if subj in common_subjects]
+        
+        if include_movies:
+            found_indices_7t = [i for i, subj in enumerate(subject_ids_7t) if subj in common_subjects]
+        
+        if include_meg and subject_ids_meg is not None:
+            found_indices_meg = [i for i, subj in enumerate(subject_ids_meg) if subj in common_subjects]
+        
+        n_subs = len(subject_ids)
+        modality_str = ' + '.join(subject_labels)
+        print(f"Found {n_subs} subjects with {modality_str} data")
+        
     else:
         subject_ids = np.loadtxt(os.path.join(outdir, f'{which_data}_{atlas}_subjids.txt'), dtype=str)
         n_subs = len(subject_ids)
@@ -246,10 +271,9 @@ def load_data_for_analysis(which_data='HCP-YA', atlas='Schaefer4007',
         df_behavior = None
         print("Behavioral data loading not implemented for HCP-D")
     
+    file_suffix = 'timescales_acf-lag.npy'
     # Load rest timescales
     rest_timescales = dict()
-    file_suffix = 'timescales_acf-lag.npy'
-    # file_suffix = 'timescales_acf-auc.npy'
     for which_scan in config['rest_scans']:
         print(f"Loading {which_scan}...")
         if which_data == 'HCP-YA' and include_movies:
@@ -284,11 +308,18 @@ def load_data_for_analysis(which_data='HCP-YA', atlas='Schaefer4007',
             timescales = timescales[found_indices_7t]
             print(f"  Shape: {timescales.shape}")
             movie_timescales[which_scan] = timescales
-            
-    # Load myelin map
-    myelin_file = os.path.join(indir, f'{which_data.replace("_", "")}_{atlas}_myelin.npy')
-    myelin_maps = np.load(myelin_file)
     
+    # Load MEG timescales (HCP-YA only)
+    meg_timescales = dict()
+    if which_data == 'HCP-YA' and include_meg:
+        for which_scan in config['meg_scans']:
+            print(f"Loading MEG {which_scan}...")
+            timescales = np.load(os.path.join(outdir, f'{which_data}-MEG_{atlas}_{which_scan}_{file_suffix}')) * config['tr_meg']
+            # Apply subject filtering if we have MEG indices
+            timescales = timescales[found_indices_meg]
+            print(f"  Shape: {timescales.shape}")
+            meg_timescales[which_scan] = timescales
+
     # Load parcellation data
     parc = pd.read_csv(parc_file, header=0, names=['ROI_Label', 'ROI_Name', 'R', 'A', 'S'])
     
@@ -313,19 +344,22 @@ def load_data_for_analysis(which_data='HCP-YA', atlas='Schaefer4007',
         'rest_timescales': rest_timescales,
         'task_timescales': task_timescales,
         'movie_timescales': movie_timescales,
-        'myelin_maps': myelin_maps,
+        'meg_timescales': meg_timescales,
         'parc': parc,
         'yeo_systems': yeo_systems,
         'config': config
     }
     
-    print(f"\nSuccessfully loaded common fMRI data:")
+    print(f"\nSuccessfully loaded data:")
     print(f"  - SA axis: {sa_axis.shape}")
     print(f"  - SF axis: {sf_axis.shape}")
     print(f"  - Subjects: {n_subs}")
     print(f"  - Rest conditions: {len(rest_timescales)}")
     print(f"  - Task conditions: {len(task_timescales)}")
-    print(f"  - Movie conditions: {len(movie_timescales)}")
+    if include_movies:
+        print(f"  - Movie conditions: {len(movie_timescales)}")
+    if include_meg:
+        print(f"  - MEG conditions: {len(meg_timescales)}")
     print(f"  - Brain regions: {config['n_parcels']}")
     if df_behavior is not None:
         print(f"  - Behavioral measures: {df_behavior.shape[1]}")
