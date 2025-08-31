@@ -834,7 +834,7 @@ def run_ints_behavioral_analysis(data_dict, sa_axis, df_behavior,
     return analyzer, df_measures, correlation_results, significant_results, top_correlations, fig
 
 
-def compute_autocorrelation_function(data):
+def compute_autocorrelation_function(data, use_fft=False):
     """
     Compute autocorrelation function for time series data.
     
@@ -859,11 +859,24 @@ def compute_autocorrelation_function(data):
             # Standardize the time series
             standardized = (voxel_ts - np.mean(voxel_ts)) / np.std(voxel_ts)
             
-            # Compute full autocorrelation
-            acf = np.correlate(standardized, standardized, mode='full')
-            acf = acf[len(acf)//2:]  # Take only non-negative lags
-            acf = acf / acf[0]  # Normalize by lag-0 value
+            if use_fft:
+                n = len(standardized)
+                # Zero-pad to 2*n-1 for full autocorrelation
+                padded = np.zeros(2 * n - 1)
+                padded[:n] = standardized
+                
+                # FFT-based autocorrelation
+                fft_data = np.fft.fft(padded)
+                acf_full = np.fft.ifft(fft_data * np.conj(fft_data)).real
+                
+                # Take positive lags and normalize
+                acf = acf_full[:n]
+            else:
+                # Compute full autocorrelation
+                acf = np.correlate(standardized, standardized, mode='full')
+                acf = acf[len(acf)//2:]  # Take only non-negative lags
             
+            acf = acf / acf[0]  # Normalize by lag-0 value
             autocorr_list.append(acf)
             
             # Find first zero-crossing
@@ -1024,7 +1037,7 @@ def fit_glm(fmri_data, design_matrix):
         return fmri_data.copy(), np.zeros_like(fmri_data), np.zeros((fmri_data.shape[0], design_matrix.shape[1]))
 
 
-def compute_task_autocorr_analysis(fmri_data, events, tr, mask=None, hrf_model='glover', drift_model='cosine'):
+def compute_task_autocorr_analysis(fmri_data, events, tr, mask=None, hrf_model='glover', drift_model='cosine', use_fft=False):
     """
     Perform task-related autocorrelation analysis with area under curve calculations.
     
@@ -1065,7 +1078,7 @@ def compute_task_autocorr_analysis(fmri_data, events, tr, mask=None, hrf_model='
         raise ValueError("fMRI data must be 2D (voxels x time) or 4D (x,y,z,time)")
 
     # Compute raw autocorrelation (before task removal) - now with AUC
-    autocorr_raw, zero_crossings_raw, auc_raw = compute_autocorrelation_function(fmri_data_2d)
+    autocorr_raw, zero_crossings_raw, auc_raw = compute_autocorrelation_function(fmri_data_2d, use_fft=use_fft)
 
     # Create design matrix using nilearn
     design_matrix = create_design_matrix_nilearn(events, n_timepoints, tr, hrf_model=hrf_model, drift_model=drift_model)
@@ -1074,7 +1087,7 @@ def compute_task_autocorr_analysis(fmri_data, events, tr, mask=None, hrf_model='
     residuals, predicted, betas = fit_glm(fmri_data_2d, design_matrix)
     
     # Compute autocorrelation on residuals - now with AUC
-    autocorr_resid, zero_crossings_resid, auc_resid = compute_autocorrelation_function(residuals)
+    autocorr_resid, zero_crossings_resid, auc_resid = compute_autocorrelation_function(residuals, use_fft=use_fft)
     
     results = {
         'autocorr_raw': autocorr_raw,
