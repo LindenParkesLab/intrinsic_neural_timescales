@@ -10,6 +10,10 @@ from tqdm import tqdm
 from nilearn.glm.first_level import make_first_level_design_matrix, compute_regressor
 from nilearn.glm.first_level import FirstLevelModel
 
+import pyfftw
+pyfftw.interfaces.cache.enable()  # Cache FFT plans
+from pyfftw.interfaces.numpy_fft import rfft, irfft
+
 username = getpass.getuser()
 if username == 'lindenmp':
     sys.path.extend(['/home/lindenmp/research_projects/snaplab_tools'])
@@ -861,13 +865,14 @@ def compute_autocorrelation_function(data, use_fft=False):
             
             if use_fft:
                 n = len(standardized)
-                # Zero-pad to 2*n-1 for full autocorrelation
-                padded = np.zeros(2 * n - 1)
+                # Pad to next power of 2 for optimal FFT performance
+                fft_size = 2 ** (int(np.log2(2 * n - 1)) + 1)
+                padded = np.zeros(fft_size)
                 padded[:n] = standardized
                 
-                # FFT-based autocorrelation
-                fft_data = np.fft.fft(padded)
-                acf_full = np.fft.ifft(fft_data * np.conj(fft_data)).real
+                # Real FFT is ~2x faster for real inputs
+                fft_data = pyfftw.interfaces.numpy_fft.rfft(padded)
+                acf_full = pyfftw.interfaces.numpy_fft.irfft(fft_data * np.conj(fft_data))
                 
                 # Take positive lags and normalize
                 acf = acf_full[:n]
