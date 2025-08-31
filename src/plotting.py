@@ -132,9 +132,7 @@ def plot_autocorrelation_analysis(autocorr_raw, autocorr_resid, zero_crossings_r
     
     # Save figure if path provided
     if save_path:
-        plt.savefig(save_path, dpi=dpi, bbox_inches='tight', 
-                    facecolor='white', edgecolor='none')
-        print(f"Figure saved to: {save_path}")
+        plt.savefig(save_path, dpi=dpi, bbox_inches='tight', facecolor='white', edgecolor='none')
 
     return fig
 
