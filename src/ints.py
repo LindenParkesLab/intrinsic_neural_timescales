@@ -942,8 +942,14 @@ def compute_autocorrelation_function(data, use_fft=False, freq_window=None, samp
             half_crossings.append(n_timepoints - 1)
             # For constant series, AUC is just the number of timepoints (all 1s)
             auc_before_zero.append(float(n_timepoints - 1))
+            
+    timescales = {
+        'zero_crossings': np.array(zero_crossings),
+        'auc_before_zero': np.array(auc_before_zero),
+        'half_crossings': np.array(half_crossings)
+    }
 
-    return np.array(autocorr_list), np.array(zero_crossings), np.array(auc_before_zero), np.array(half_crossings)
+    return np.array(autocorr_list), timescales
 
 
 def _apply_bandpass_filter(time_series, sampling_rate, freq_window, filter_order):
