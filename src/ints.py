@@ -838,18 +838,40 @@ def run_ints_behavioral_analysis(data_dict, sa_axis, df_behavior,
     return analyzer, df_measures, correlation_results, significant_results, top_correlations, fig
 
 
-def compute_autocorrelation_function(data, use_fft=False):
+def compute_autocorrelation_function(data, use_fft=False, freq_window=None, sampling_rate=None, filter_order=4):
     """
-    Compute autocorrelation function for time series data.
+    Compute autocorrelation function for time series data with optional frequency filtering.
     
     Parameters:
-    - data: 2D array (voxels x timepoints) or 1D array (single time series)
-    
+    -----------
+    data : array-like
+        2D array (voxels x timepoints) or 1D array (single time series)
+    use_fft : bool, default=False
+        Whether to use FFT for computation
+    freq_window : tuple, optional
+        Frequency band (low_freq, high_freq) in Hz for filtering.
+        Requires sampling_rate to be specified.
+        Time-domain filtering is applied before ACF computation.
+    sampling_rate : float, optional
+        Sampling rate in Hz. Required when freq_window is specified.
+    filter_order : int, default=4
+        Order of Butterworth filter for frequency filtering
+        
     Returns:
-    - autocorr: autocorrelation function(s)
-    - zero_crossings: first zero-crossing indices
-    - auc_before_zero: area under curve before zero crossing
+    --------
+    autocorr : ndarray
+        Autocorrelation function(s)
+    zero_crossings : ndarray  
+        First zero-crossing indices
+    auc_before_zero : ndarray
+        Area under curve before zero crossing
+    half_crossings : ndarray  
+        First r=0.5 indices
     """
+    
+    # Validation
+    if freq_window is not None and sampling_rate is None:
+        raise ValueError("sampling_rate must be specified when using freq_window")
     
     if data.ndim == 1:
         data = data.reshape(1, -1)
@@ -857,11 +879,19 @@ def compute_autocorrelation_function(data, use_fft=False):
     autocorr_list = []
     zero_crossings = []
     auc_before_zero = []
+    half_crossings = []
     
     for voxel_ts in data:
         if np.std(voxel_ts) > 0:  # Avoid division by zero
-            # Standardize the time series
-            standardized = (voxel_ts - np.mean(voxel_ts)) / np.std(voxel_ts)
+            
+            # Apply frequency filtering BEFORE computing autocorrelation
+            if freq_window is not None:
+                filtered_ts = _apply_bandpass_filter(voxel_ts, sampling_rate, freq_window, filter_order)
+            else:
+                filtered_ts = voxel_ts.copy()
+            
+            # Standardize the (potentially filtered) time series
+            standardized = (filtered_ts - np.mean(filtered_ts)) / np.std(filtered_ts)
             
             if use_fft:
                 n = len(standardized)
@@ -870,7 +900,7 @@ def compute_autocorrelation_function(data, use_fft=False):
                 padded = np.zeros(fft_size)
                 padded[:n] = standardized
                 
-                # Real FFT is ~2x faster for real inputs
+                # Real FFT for autocorrelation
                 fft_data = pyfftw.interfaces.numpy_fft.rfft(padded)
                 acf_full = pyfftw.interfaces.numpy_fft.irfft(fft_data * np.conj(fft_data))
                 
@@ -902,15 +932,58 @@ def compute_autocorrelation_function(data, use_fft=False):
                 lags = np.arange(len(acf))
                 auc = np.trapz(acf, lags)
                 auc_before_zero.append(auc)
+
+            half_crossings.append(np.where(acf < 0.5)[0][0])
         else:
             # Handle constant time series
             n_timepoints = len(voxel_ts)
             autocorr_list.append(np.ones(n_timepoints))
             zero_crossings.append(n_timepoints - 1)
+            half_crossings.append(n_timepoints - 1)
             # For constant series, AUC is just the number of timepoints (all 1s)
             auc_before_zero.append(float(n_timepoints - 1))
+
+    return np.array(autocorr_list), np.array(zero_crossings), np.array(auc_before_zero), np.array(half_crossings)
+
+
+def _apply_bandpass_filter(time_series, sampling_rate, freq_window, filter_order):
+    """
+    Apply bandpass filter to time series using Butterworth filter.
     
-    return np.array(autocorr_list), np.array(zero_crossings), np.array(auc_before_zero)
+    Parameters:
+    -----------
+    time_series : ndarray
+        1D time series data
+    sampling_rate : float
+        Sampling rate in Hz
+    freq_window : tuple
+        (low_freq, high_freq) in Hz
+    filter_order : int
+        Order of Butterworth filter
+        
+    Returns:
+    --------
+    filtered_ts : ndarray
+        Filtered time series
+    """
+    low_freq, high_freq = freq_window
+    nyquist = sampling_rate / 2.0
+    
+    # Normalize frequencies to Nyquist frequency
+    low_norm = low_freq / nyquist
+    high_norm = high_freq / nyquist
+    
+    # Ensure frequencies are within valid range
+    low_norm = max(low_norm, 0.001)  # Avoid DC component issues
+    high_norm = min(high_norm, 0.999)  # Avoid Nyquist frequency issues
+    
+    # Design Butterworth bandpass filter
+    b, a = sp.signal.butter(filter_order, [low_norm, high_norm], btype='band')
+    
+    # Apply filter using filtfilt for zero-phase filtering
+    filtered_ts = sp.signal.filtfilt(b, a, time_series)
+    
+    return filtered_ts
 
 
 def compute_timescales(timeseries, which_version='acf', return_mean=True, tr=np.nan):
@@ -1042,29 +1115,38 @@ def fit_glm(fmri_data, design_matrix):
         return fmri_data.copy(), np.zeros_like(fmri_data), np.zeros((fmri_data.shape[0], design_matrix.shape[1]))
 
 
-def compute_task_autocorr_analysis(fmri_data, events, tr, mask=None, hrf_model='glover', drift_model='cosine', use_fft=False):
+def compute_task_autocorr_analysis(fmri_data, events, tr, mask=None, hrf_model='glover', 
+                                 drift_model='cosine', use_fft=False, freq_window=None):
     """
-    Perform task-related autocorrelation analysis with area under curve calculations.
+    Perform task-related autocorrelation analysis with optional frequency filtering.
     
     Parameters:
-    - fmri_data: 4D numpy array (x,y,z,time) or 2D array (voxels,time)
-    - events: pandas DataFrame with events (onset, duration, trial_type) or path to CSV
-    - tr: repetition time in seconds
-    - mask: binary mask for voxel selection (optional)
-    - hrf_model: HRF model for nilearn ('glover', 'spm', 'glover + derivative', etc.)
-    - drift_model: drift model for nilearn ('cosine', 'polynomial', None)
+    -----------
+    fmri_data : ndarray
+        4D numpy array (x,y,z,time) or 2D array (voxels,time)
+    events : DataFrame or str
+        pandas DataFrame with events (onset, duration, trial_type) or path to CSV
+    tr : float
+        repetition time in seconds
+    mask : ndarray, optional
+        binary mask for voxel selection
+    hrf_model : str
+        HRF model for nilearn ('glover', 'spm', 'glover + derivative', etc.)
+    drift_model : str
+        drift model for nilearn ('cosine', 'polynomial', None)
+    use_fft : bool
+        Whether to use FFT for autocorrelation computation
+    freq_window : tuple, optional
+        Frequency band (low_freq, high_freq) in Hz for filtering.
+        Only applied when use_fft=True.
     
     Returns:
-    - autocorr_raw: autocorrelation before task removal (n_voxels x n_lags)
-    - autocorr_resid: autocorrelation after task removal (n_voxels x n_lags)  
-    - zero_crossings_raw: first zero-crossing indices before task removal (n_voxels,)
-    - zero_crossings_resid: first zero-crossing indices after task removal (n_voxels,)
-    - auc_raw: AUC before zero crossing - before task removal (n_voxels,)
-    - auc_resid: AUC before zero crossing - after task removal (n_voxels,)
-    - residuals: residual time series after GLM (n_voxels x n_timepoints)
-    - design_matrix: nilearn DesignMatrix object
+    --------
+    results : dict
+        Dictionary containing autocorr_raw, autocorr_resid, zero_crossings_raw,
+        zero_crossings_resid, auc_raw, auc_resid, residuals, design_matrix
     """
-
+    
     # Handle input data shape
     if fmri_data.ndim == 4:
         original_shape = fmri_data.shape
@@ -1082,17 +1164,24 @@ def compute_task_autocorr_analysis(fmri_data, events, tr, mask=None, hrf_model='
     else:
         raise ValueError("fMRI data must be 2D (voxels x time) or 4D (x,y,z,time)")
 
-    # Compute raw autocorrelation (before task removal) - now with AUC
-    autocorr_raw, zero_crossings_raw, auc_raw = compute_autocorrelation_function(fmri_data_2d, use_fft=use_fft)
+    sampling_rate = 1.0 / tr  # Convert TR to sampling rate
+
+    # Compute raw autocorrelation (before task removal)
+    autocorr_raw, zero_crossings_raw, auc_raw, half_crossings_raw = compute_autocorrelation_function(
+        fmri_data_2d, use_fft=use_fft, freq_window=freq_window, sampling_rate=sampling_rate
+    )
 
     # Create design matrix using nilearn
-    design_matrix = create_design_matrix_nilearn(events, n_timepoints, tr, hrf_model=hrf_model, drift_model=drift_model)
+    design_matrix = create_design_matrix_nilearn(events, n_timepoints, tr,
+                                                 hrf_model=hrf_model, drift_model=drift_model)
     
     # Fit GLM using nilearn approach
     residuals, predicted, betas = fit_glm(fmri_data_2d, design_matrix)
     
-    # Compute autocorrelation on residuals - now with AUC
-    autocorr_resid, zero_crossings_resid, auc_resid = compute_autocorrelation_function(residuals, use_fft=use_fft)
+    # Compute autocorrelation on residuals
+    autocorr_resid, zero_crossings_resid, auc_resid, half_crossings_resid = compute_autocorrelation_function(
+        residuals, use_fft=use_fft, freq_window=freq_window, sampling_rate=sampling_rate
+    )
     
     results = {
         'autocorr_raw': autocorr_raw,
@@ -1101,6 +1190,8 @@ def compute_task_autocorr_analysis(fmri_data, events, tr, mask=None, hrf_model='
         'zero_crossings_resid': zero_crossings_resid,
         'auc_raw': auc_raw,
         'auc_resid': auc_resid,
+        'half_crossings_raw': half_crossings_raw,
+        'half_crossings_resid': half_crossings_resid,
         'residuals': residuals,
         'design_matrix': design_matrix,
     }
