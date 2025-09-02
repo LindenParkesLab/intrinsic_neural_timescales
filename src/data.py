@@ -1,10 +1,12 @@
 import os
 import numpy as np
+import scipy as sp
 import pandas as pd
 import nibabel as nib
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 from dataclasses import dataclass, field
+from sklearn.linear_model import LinearRegression
 
 # Enhanced ScanInfo dataclass that matches HCP conventions
 @dataclass
@@ -97,7 +99,7 @@ class DataLoader:
     SUBDIR_MAP = {
         'HCP-YA': {
             'MRI_3T': {'fmri': os.path.join(DERIVDATA_PATHS['HCP-YA'], 'fmri_parcellated'),},
-            'MRI_7T': {'fmri': os.path.join(DERIVDATA_PATHS['HCP-YA'], 'fmri_7T_parcellated'),},
+            'MRI_7T': {'fmri': os.path.join(DERIVDATA_PATHS['HCP-YA'], '7T_fmri_parcellated'),},
             'MEG': {'meg': os.path.join(DERIVDATA_PATHS['HCP-YA'], 'brainstorm', 'meg_parcellated'),}
         }
     }
@@ -157,7 +159,7 @@ class DataLoader:
         # Initialize data cache (will store loaded timeseries)
         self._data_cache = {}
         
-        print(f"Initialized Timescales for dataset: {dataset}")
+        print(f"Initialized DataLoader for dataset: {dataset}")
         print(f"Base directory: {self.base_dir}")
         print(f"Raw data directory: {self.rawdata_dir}")
         print(f"Derivatives data directory: {self.derivdata_dir}")
@@ -232,7 +234,9 @@ class DataLoader:
                         scan_number=session,
                         phase_encoding=pe
                     )
-                    self.scan_registry.append(scan)
+                    
+                    if scan not in self.scan_registry:
+                        self.scan_registry.append(scan)
                     registered.append(scan)
         return registered
     
@@ -272,7 +276,9 @@ class DataLoader:
                         task_name=task_name,
                         phase_encoding=pe
                     )
-                    self.scan_registry.append(scan)
+                    
+                    if scan not in self.scan_registry:
+                        self.scan_registry.append(scan)
                     registered.append(scan)
         return registered
     
@@ -308,7 +314,9 @@ class DataLoader:
                     scan_number=session,
                     phase_encoding=pe_pattern[session]
                 )
-                self.scan_registry.append(scan)
+                
+                if scan not in self.scan_registry:
+                    self.scan_registry.append(scan)
                 registered.append(scan)
         return registered
     
@@ -344,7 +352,9 @@ class DataLoader:
                     scan_number=movie_num,
                     phase_encoding=pe_pattern[movie_num]
                 )
-                self.scan_registry.append(scan)
+                
+                if scan not in self.scan_registry:
+                    self.scan_registry.append(scan)
                 registered.append(scan)
         return registered
     
@@ -380,7 +390,9 @@ class DataLoader:
                     meg_scan_number=run_num,
                     meg_task_name='Restin'
                 )
-                self.scan_registry.append(scan)
+                
+                if scan not in self.scan_registry:
+                    self.scan_registry.append(scan)
                 registered.append(scan)
             
             # Register WM runs
@@ -393,7 +405,9 @@ class DataLoader:
                     meg_scan_number=run_num,
                     meg_task_name='Wrkmem'
                 )
-                self.scan_registry.append(scan)
+
+                if scan not in self.scan_registry:
+                    self.scan_registry.append(scan)
                 registered.append(scan)
         
         return registered
@@ -439,6 +453,7 @@ class DataLoader:
         self,
         scan: HCPScanInfo,
         cache: bool = True,
+        nuisance_regression: bool = True,
         verbose: bool = False
     ) -> np.ndarray:
         """
@@ -450,7 +465,7 @@ class DataLoader:
             verbose: Print loading details
         
         Returns:
-            Timeseries array of shape (n_timepoints, n_parcels)
+            Timeseries array of shape (n_parcels, n_timepoints)
         """
         # Check cache
         cache_key = str(scan)
@@ -480,6 +495,24 @@ class DataLoader:
         # Convert to float32 for memory efficiency
         timeseries = timeseries.astype(np.float32)
         
+        # Run nuisance regression
+        if nuisance_regression:
+            global_signal = np.mean(timeseries, axis=1).reshape(-1, 1)
+            global_signal_diff = np.append(0, np.diff(global_signal, axis=0)).reshape(-1, 1)
+            nuis = np.concatenate((global_signal, global_signal_diff), axis=1)
+            nuis = np.concatenate((nuis, np.square(nuis)), axis=1)
+
+            regr = LinearRegression()
+            regr.fit(nuis, timeseries)
+            y_pred = regr.predict(nuis)
+            timeseries = timeseries - y_pred
+        
+        # z score
+        timeseries = sp.stats.zscore(timeseries, axis=0)
+        
+        # Transpose data to (n_parcels, n_timepoints)
+        timeseries = timeseries.T
+        
         if verbose:
             print(f"    Shape: {timeseries.shape}")
         
@@ -496,8 +529,8 @@ class DataLoader:
         conditions: Optional[List[str]] = None,
         atlas: Optional[str] = None,
         cache: bool = True,
-        verbose: bool = True,
-        max_failures: int = 10
+        nuisance_regression: bool = True,
+        verbose: bool = True
     ) -> Dict[str, np.ndarray]:
         """
         Load multiple scans with filtering.
@@ -509,7 +542,6 @@ class DataLoader:
             atlas: Filter to specific atlas
             cache: Whether to cache data
             verbose: Print progress
-            max_failures: Stop after this many failures
         
         Returns:
             Dictionary mapping scan identifiers to timeseries
@@ -538,15 +570,11 @@ class DataLoader:
         failed = []
         
         for i, scan in enumerate(scans_to_load):
-            if len(failed) >= max_failures:
-                print(f"Stopping after {max_failures} failures")
-                break
-                
             try:
                 if verbose and i % 10 == 0:
                     print(f"  [{i+1}/{len(scans_to_load)}] {scan.subject_id} {scan.get_task_string()}")
                 
-                loaded[str(scan)] = self.load_scan_timeseries(scan, cache=cache, verbose=False)
+                loaded[str(scan)] = self.load_scan_timeseries(scan, cache=cache, verbose=False, nuisance_regression=nuisance_regression)
                 
             except Exception as e:
                 failed.append((scan, str(e)))
