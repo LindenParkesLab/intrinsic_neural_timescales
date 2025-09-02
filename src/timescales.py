@@ -210,7 +210,11 @@ class Timescales(DataLoader):
         n_loaded = 0
         n_computed = 0
         n_failed = 0
-        
+        if freq_window is None:
+            output_type = 'autocorr'
+        else:
+            output_type = f'autocorr_freq-{freq_window[0]}hz-{freq_window[1]}hz'
+
         # Process each scan
         for scan_key in tqdm(self.scans, desc="Computing autocorrelation"):
             # Parse scan key using key-value format
@@ -225,7 +229,7 @@ class Timescales(DataLoader):
             if not force_recompute:
                 loaded_acf = self._load_subject_output(
                     subject_id=subject_id,
-                    output_type='autocorr',
+                    output_type=output_type,
                     scan_name=scan_name,
                     modality=modality_str,
                     atlas=atlas
@@ -254,7 +258,7 @@ class Timescales(DataLoader):
                     self._save_subject_output(
                         data=acf_result,
                         subject_id=subject_id,
-                        output_type='autocorr',
+                        output_type=output_type,
                         scan_name=scan_name,
                         modality=modality_str,
                         atlas=atlas,
@@ -274,7 +278,7 @@ class Timescales(DataLoader):
                 n_failed += 1
         
         # Store results
-        self.autocorr = autocorr_dict
+        self.autocorr_dict = autocorr_dict
         
         if verbose:
             print(f"\nAutocorrelation computation complete:")
@@ -283,6 +287,162 @@ class Timescales(DataLoader):
             if n_failed > 0:
                 print(f"  Failed: {n_failed}")
             print(f"  Total: {len(self.scans)}")
+
+    def compute_timescale_measures(
+        self,
+        method: str = 'zero_crossing',
+        force_recompute: bool = False,
+        save_outputs: bool = True,
+        verbose: bool = True
+    ) -> Dict[str, Any]:
+        """
+        Compute timescale measures from autocorrelation functions.
+        
+        Args:
+            method: Method to use ('zero_crossing', 'auc', 'decay_time')
+            force_recompute: Force recomputation even if saved
+            save_outputs: Save computed outputs
+            verbose: Print progress
+        
+        Returns:
+            Dictionary of timescale measures for each scan
+        """
+        if not hasattr(self, 'autocorr_dict') or self.autocorr_dict is None:
+            raise ValueError("Must compute autocorrelation first")
+        
+        timescales_dict = {}
+        n_loaded = 0
+        n_computed = 0
+        output_type = f'timescale_{method}'
+        
+        for scan_key in tqdm(self.scans, desc=f"Computing {method} timescales"):
+            # Parse scan key
+            kv_dict = self._parse_scan_key(scan_key)
+            
+            subject_id = kv_dict.get('sub', '')
+            modality_str = kv_dict.get('modality', '')
+            scan_name = kv_dict.get('scan', '')
+            atlas = kv_dict.get('atlas', '')
+            
+            # Check for existing output
+            if not force_recompute:
+                loaded_ts = self._load_subject_output(
+                    subject_id=subject_id,
+                    output_type=output_type,
+                    scan_name=scan_name,
+                    modality=modality_str,
+                    atlas=atlas
+                )
+                
+                if loaded_ts is not None:
+                    timescales_dict[scan_key] = loaded_ts
+                    n_loaded += 1
+                    continue
+            
+            # Compute timescale measure
+            if self.autocorr_dict.get(scan_key) is None:
+                timescales_dict[scan_key] = None
+                continue
+                
+            acf = self.autocorr_dict[scan_key]
+            
+            try:
+                if method == 'zero_crossing':
+                    # Find first zero crossing for each parcel
+                    timescale = self._compute_zero_crossing(acf)
+                elif method == 'auc_zero_crossing':
+                    # Area under curve
+                    timescale = self._compute_auc(acf, max_lag=None)
+                elif method == 'auc_100':
+                    # Area under curve
+                    timescale = self._compute_auc(acf, max_lag=100)
+                elif method == 'decay_time_1e':
+                    # Time to decay to 1/e
+                    threshold = 1 / np.e
+                    timescale = self._compute_decay_time(acf, threshold)
+                elif method == 'decay_time_half':
+                    # Time to decay to 1/e
+                    threshold = 0.5
+                    timescale = self._compute_decay_time(acf, threshold)
+                else:
+                    raise ValueError(f"Unknown method: {method}")
+                
+                timescales_dict[scan_key] = timescale
+                n_computed += 1
+                
+                # Save output
+                if save_outputs:
+                    self._save_subject_output(
+                        data=timescale,
+                        subject_id=subject_id,
+                        output_type=output_type,
+                        scan_name=scan_name,
+                        modality=modality_str,
+                        atlas=atlas,
+                        metadata={'method': method, 'tr': self.tr}
+                    )
+                    
+            except Exception as e:
+                print(f"Warning: Failed to compute {method} for {scan_key}: {e}")
+                timescales_dict[scan_key] = None
+
+        self.timescales_dict = timescales_dict
+        
+        if verbose:
+            print(f"\n{method} timescale computation complete:")
+            print(f"  Loaded from cache: {n_loaded}")
+            print(f"  Newly computed: {n_computed}")
+            print(f"  Total: {len(self.scans)}")
+
+    # ============== Timescale Computation Methods ==============
+    
+    def _compute_zero_crossing(self, acf: np.ndarray) -> np.ndarray:
+        """Find first zero crossing for each parcel."""
+        n_parcels = acf.shape[0]
+        zero_crossings = np.zeros(n_parcels)
+        
+        for i in range(n_parcels):
+            negative_indices = np.where(acf[i] < 0)[0]
+            if len(negative_indices) > 0:
+                zero_crossings[i] = negative_indices[0]
+            else:
+                zero_crossings[i] = np.nan
+        
+        return zero_crossings
+    
+    def _compute_auc(self, acf: np.ndarray, max_lag: int = None) -> np.ndarray:
+        """Compute area under curve up to some max lag (or zero crossing)."""
+        n_parcels = acf.shape[0]
+        auc = np.zeros(n_parcels)
+        
+        for i in range(n_parcels):
+            if max_lag is None:
+                max_lag_i = np.where(acf[i] < 0)[0][0]
+            else:
+                max_lag_i = max_lag
+
+            try:
+                auc[i] = np.trapz(acf[i, :max_lag_i], dx=self.tr)
+            except:
+                auc[i] = np.nan
+        
+        return auc
+    
+    def _compute_decay_time(self, acf: np.ndarray, threshold: float = 1.0 / np.e) -> np.ndarray:
+        """Find time when ACF decays to 1/e."""
+        n_parcels = acf.shape[0]
+        decay_times = np.zeros(n_parcels)
+        # threshold = 1.0 / np.e
+        
+        for i in range(n_parcels):
+            # Find where ACF drops below threshold
+            below_threshold = np.where(acf[i] < threshold)[0]
+            if len(below_threshold) > 0:
+                decay_times[i] = below_threshold[0] * self.tr
+            else:
+                decay_times[i] = np.nan
+        
+        return decay_times
 
 # ==================== Standalone Functions ====================
 
