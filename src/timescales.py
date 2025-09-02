@@ -44,7 +44,8 @@ class Timescales(DataLoader):
         scan_name: str,
         modality: str,
         atlas: str,
-        suffix: str = '.npy'
+        suffix: str = '.npy',
+        mode: str = 'load'
     ) -> Path:
         """
         Generate standardized filepath for subject-specific outputs using key-value naming.
@@ -62,7 +63,8 @@ class Timescales(DataLoader):
         """
         # Create output subdirectory structure
         output_subdir = self.output_dir / 'timescales_outputs' / self.dataset / output_type
-        output_subdir.mkdir(parents=True, exist_ok=True)
+        if mode == 'save':
+            output_subdir.mkdir(parents=True, exist_ok=True)
         
         # Build filename using key-value format
         filename = build_scan_string(
@@ -94,7 +96,8 @@ class Timescales(DataLoader):
             scan_name=scan_name,
             modality=modality,
             atlas=atlas,
-            suffix=suffix
+            suffix=suffix,
+            mode='save'
         )
         
         # Save data
@@ -129,7 +132,8 @@ class Timescales(DataLoader):
             scan_name=scan_name,
             modality=modality,
             atlas=atlas,
-            suffix=suffix
+            suffix=suffix,
+            mode='load'
         )
         
         # Check for .npz if .npy doesn't exist
@@ -170,7 +174,8 @@ class Timescales(DataLoader):
                 scan_name=scan_name,
                 modality=modality,
                 atlas=atlas,
-                suffix=suffix
+                suffix=suffix,
+                moad='load'
             )
             if filepath.exists():
                 return True
