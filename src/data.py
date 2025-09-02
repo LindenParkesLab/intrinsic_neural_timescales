@@ -15,7 +15,7 @@ class HCPScanInfo:
     subject_id: str
     condition: str  # 'rest', 'task', 'movie'
     atlas: str  # e.g., 'Schaefer4007'
-    modality: str  # 'MRI_3T', 'MRI_7T', 'MEG'
+    modality: str  # 'MRI3T', 'MRI7T', 'MEG'
     
     # Modality-specific fields
     # For 3T/7T fMRI:
@@ -30,7 +30,7 @@ class HCPScanInfo:
     def get_task_string(self) -> str:
         """Get the exact task string as it appears in HCP filenames."""
         
-        if self.modality == 'MRI_3T':
+        if self.modality == 'MRI3T':
             if self.condition == 'rest':
                 # 3T REST: rfMRIREST1LR, rfMRIREST2RL, etc.
                 return f"rfMRIREST{self.scan_number}{self.phase_encoding}"
@@ -38,7 +38,7 @@ class HCPScanInfo:
                 # 3T Task: tfMRIEMOTIONLR, tfMRIWMRL, etc. (no underscore!)
                 return f"tfMRI{self.task_name}{self.phase_encoding}"
                 
-        elif self.modality == 'MRI_7T':
+        elif self.modality == 'MRI7T':
             if self.condition == 'rest':
                 # 7T REST: rfMRIREST17TPA, rfMRIREST27TAP, etc.
                 return f"rfMRIREST{self.scan_number}7T{self.phase_encoding}"
@@ -53,9 +53,54 @@ class HCPScanInfo:
         raise ValueError(f"Cannot construct task string for {self}")
     
     def __str__(self):
+        """Return key-value formatted string representation."""
         task_str = self.get_task_string()
-        return f"{self.subject_id}_{self.modality}_{task_str}_{self.atlas}"
+        return f"sub-{self.subject_id}_modality-{self.modality}_scan-{task_str}_atlas-{self.atlas}"
 
+
+def parse_scan_string(scan_string: str) -> Dict[str, str]:
+    """
+    Parse a key-value formatted scan string into a dictionary.
+    
+    Args:
+        scan_string: String like "sub-100307_modality-MRI3T_scan-rfMRIREST1LR_atlas-Schaefer4007"
+    
+    Returns:
+        Dictionary with keys: sub, modality, scan, atlas, etc.
+    """
+    parts = scan_string.split('_')
+    kv_dict = {}
+    for part in parts:
+        if '-' in part:
+            key, value = part.split('-', 1)  # Split only on first hyphen
+            kv_dict[key] = value
+    return kv_dict
+
+
+def build_scan_string(**kwargs) -> str:
+    """
+    Build a scan string from key-value pairs.
+    
+    Args:
+        **kwargs: Key-value pairs (e.g., sub='100307', modality='MRI3T', etc.)
+    
+    Returns:
+        Formatted scan string
+    """
+    parts = []
+    # Ensure consistent ordering
+    key_order = ['sub', 'modality', 'scan', 'atlas', 'stat']
+    
+    for key in key_order:
+        if key in kwargs and kwargs[key] is not None:
+            parts.append(f"{key}-{kwargs[key]}")
+    
+    # Add any additional keys not in the standard order
+    for key, value in kwargs.items():
+        if key not in key_order and value is not None:
+            parts.append(f"{key}-{value}")
+    
+    return '_'.join(parts)
 
 class DataLoader:
     """
@@ -75,8 +120,8 @@ class DataLoader:
     
     # Default TR values for common modalities (in seconds)
     DEFAULT_TR = {
-        'MRI_3T': 0.72,
-        'MRI_7T': 1.0,
+        'MRI3T': 0.72,
+        'MRI7T': 1.0,
         'MEG': 1 / MEG_SAMPLING_RATE
     }
     
@@ -98,8 +143,8 @@ class DataLoader:
     # Subdirectory structure for different data types
     SUBDIR_MAP = {
         'HCP-YA': {
-            'MRI_3T': {'fmri': os.path.join(DERIVDATA_PATHS['HCP-YA'], 'fmri_parcellated'),},
-            'MRI_7T': {'fmri': os.path.join(DERIVDATA_PATHS['HCP-YA'], '7T_fmri_parcellated'),},
+            'MRI3T': {'fmri': os.path.join(DERIVDATA_PATHS['HCP-YA'], 'fmri_parcellated'),},
+            'MRI7T': {'fmri': os.path.join(DERIVDATA_PATHS['HCP-YA'], '7T_fmri_parcellated'),},
             'MEG': {'meg': os.path.join(DERIVDATA_PATHS['HCP-YA'], 'brainstorm', 'meg_parcellated'),}
         }
     }
@@ -230,7 +275,7 @@ class DataLoader:
                         subject_id=str(subject_id),
                         condition='rest',
                         atlas=atlas,
-                        modality='MRI_3T',
+                        modality='MRI3T',
                         scan_number=session,
                         phase_encoding=pe
                     )
@@ -272,7 +317,7 @@ class DataLoader:
                         subject_id=str(subject_id),
                         condition='task',
                         atlas=atlas,
-                        modality='MRI_3T',
+                        modality='MRI3T',
                         task_name=task_name,
                         phase_encoding=pe
                     )
@@ -310,7 +355,7 @@ class DataLoader:
                     subject_id=str(subject_id),
                     condition='rest',
                     atlas=atlas,
-                    modality='MRI_7T',
+                    modality='MRI7T',
                     scan_number=session,
                     phase_encoding=pe_pattern[session]
                 )
@@ -348,7 +393,7 @@ class DataLoader:
                     subject_id=str(subject_id),
                     condition='movie',
                     atlas=atlas,
-                    modality='MRI_7T',
+                    modality='MRI7T',
                     scan_number=movie_num,
                     phase_encoding=pe_pattern[movie_num]
                 )
@@ -425,10 +470,10 @@ class DataLoader:
             Path to the timeseries file (without checking existence)
         """
         # Base paths from configuration
-        if scan.modality == 'MRI_3T':
-            base_path = Path(self.SUBDIR_MAP[self.dataset]['MRI_3T']['fmri'])
-        elif scan.modality == 'MRI_7T':
-            base_path = Path(self.SUBDIR_MAP[self.dataset]['MRI_7T']['fmri'])
+        if scan.modality == 'MRI3T':
+            base_path = Path(self.SUBDIR_MAP[self.dataset]['MRI3T']['fmri'])
+        elif scan.modality == 'MRI7T':
+            base_path = Path(self.SUBDIR_MAP[self.dataset]['MRI7T']['fmri'])
         elif scan.modality == 'MEG':
             base_path = Path(self.SUBDIR_MAP[self.dataset]['MEG']['meg'])
         else:
@@ -611,18 +656,23 @@ class DataLoader:
         return info
     
     def list_registered_scans(self) -> pd.DataFrame:
-        """Return a DataFrame of all registered scans."""
+        """Return a DataFrame of all registered scans with key-value naming."""
         if not self.scan_registry:
             return pd.DataFrame()
         
         scan_data = []
         for scan in self.scan_registry:
+            # Parse the key-value string
+            scan_str = str(scan)
+            kv_dict = parse_scan_string(scan_str)
+            
             scan_data.append({
-                'subject_id': scan.subject_id,
+                'scan_string': scan_str,
+                'subject_id': kv_dict.get('sub', ''),
+                'modality': kv_dict.get('modality', ''),
+                'scan': kv_dict.get('scan', ''),
+                'atlas': kv_dict.get('atlas', ''),
                 'condition': scan.condition,
-                'modality': scan.modality,
-                'atlas': scan.atlas,
-                'task_string': scan.get_task_string(),
                 'tr': self.get_tr(scan.modality)
             })
         
