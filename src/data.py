@@ -501,7 +501,8 @@ class DataLoader:
         scan: HCPScanInfo,
         cache: bool = True,
         nuisance_regression: bool = True,
-        verbose: bool = False
+        verbose: bool = False,
+        dry_load: bool = False
     ) -> np.ndarray:
         """
         Load timeseries for a single HCP scan.
@@ -567,7 +568,10 @@ class DataLoader:
         if cache:
             self._data_cache[cache_key] = timeseries
         
-        return timeseries
+        if dry_load:
+            return None
+        else:
+            return timeseries
     
     def load_batch(
         self,
@@ -575,10 +579,11 @@ class DataLoader:
         modalities: Optional[List[str]] = None,
         conditions: Optional[List[str]] = None,
         atlas: Optional[str] = None,
-        cache: bool = True,
+        cache: bool = False,
         nuisance_regression: bool = True,
-        verbose: bool = True
-    ) -> Dict[str, np.ndarray]:
+        verbose: bool = True,
+        dry_load: bool = False
+    ) -> Dict[str, Optional[np.ndarray]]:
         """
         Load multiple scans with filtering.
         
@@ -588,10 +593,12 @@ class DataLoader:
             conditions: Filter to specific conditions
             atlas: Filter to specific atlas
             cache: Whether to cache data
+            nuisance_regression: Whether to apply nuisance regression
             verbose: Print progress
+            dry_load: If True, return scan keys with None values instead of loading data
         
         Returns:
-            Dictionary mapping scan identifiers to timeseries
+            Dictionary mapping scan identifiers to timeseries (or None if dry_load=True)
         """
         # Filter scans
         scans_to_load = []
@@ -610,9 +617,9 @@ class DataLoader:
             raise ValueError("No scans match the filters")
         
         if verbose:
-            print(f"Loading {len(scans_to_load)} scans...")
+            print(f"{'Dry loading' if dry_load else 'Loading'} {len(scans_to_load)} scans...")
         
-        # Load scans
+        # Load scans or return None for dry load
         loaded = {}
         failed = []
         
@@ -621,7 +628,13 @@ class DataLoader:
                 if verbose and i % 10 == 0:
                     print(f"  [{i+1}/{len(scans_to_load)}] {scan.subject_id} {scan.get_task_string()}")
                 
-                loaded[str(scan)] = self.load_scan_timeseries(scan, cache=cache, verbose=False, nuisance_regression=nuisance_regression)
+                loaded[str(scan)] = self.load_scan_timeseries(
+                    scan, 
+                    cache=cache, 
+                    verbose=False, 
+                    nuisance_regression=nuisance_regression,
+                    dry_load=dry_load
+                )
                 
             except Exception as e:
                 failed.append((scan, str(e)))
