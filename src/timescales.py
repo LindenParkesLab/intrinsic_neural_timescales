@@ -303,6 +303,7 @@ class Timescales(DataLoader):
         method: str = 'zero_crossing',
         force_recompute: bool = False,
         save_outputs: bool = True,
+        prefix: str = None,
         verbose: bool = True
     ) -> Dict[str, Any]:
         """
@@ -324,6 +325,8 @@ class Timescales(DataLoader):
         n_loaded = 0
         n_computed = 0
         output_type = f'timescale_{method}'
+        if prefix:
+            output_type = f'{prefix}_{output_type}'
         
         for scan_key in tqdm(self.scans, desc=f"Computing {method} timescales"):
             # Parse scan key
