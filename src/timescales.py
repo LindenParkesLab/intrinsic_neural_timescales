@@ -1,13 +1,11 @@
-import os
+import os, glob, pickle, pyfftw
 import numpy as np
 import scipy as sp
 import pandas as pd
-import pickle
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union, Any
 from tqdm import tqdm
-
-import pyfftw
+from nilearn.glm.first_level import make_first_level_design_matrix
 pyfftw.interfaces.cache.enable()  # Cache FFT plans
 from pyfftw.interfaces.numpy_fft import rfft, irfft
 
@@ -36,7 +34,6 @@ class Timescales(DataLoader):
         print(f"\tOutput directory: {self.output_dir}")
 
     # ============== Save/Load Infrastructure with Key-Value Naming ==============
-    
     def _get_output_filepath(
         self,
         subject_id: str,
@@ -193,9 +190,7 @@ class Timescales(DataLoader):
         """
         return parse_scan_string(scan_key)
 
-
     # ============== Computation Methods ==============
-    
     def compute_autocorrelation_function(
         self,
         use_fft: bool = False,
@@ -203,6 +198,7 @@ class Timescales(DataLoader):
         filter_order: int = 4,
         force_recompute: bool = False,
         save_outputs: bool = True,
+        use_residuals: bool = False,
         verbose: bool = True
     ):
         """
@@ -219,6 +215,8 @@ class Timescales(DataLoader):
             output_type = 'autocorr'
         else:
             output_type = f'autocorr_freq-{freq_window[0]}hz-{freq_window[1]}hz'
+        if use_residuals:
+            output_type = 'residuals_' + output_type
 
         # Process each scan
         for scan_key in tqdm(self.scans, desc="Computing autocorrelation"):
@@ -226,7 +224,8 @@ class Timescales(DataLoader):
             kv_dict = self._parse_scan_key(scan_key)
             
             subject_id = kv_dict.get('sub', '')
-            modality_str = kv_dict.get('modality', '')
+            modality = kv_dict.get('modality', '')
+            condition = kv_dict.get('condition', '')
             scan_name = kv_dict.get('scan', '')
             atlas = kv_dict.get('atlas', '')
             
@@ -236,7 +235,7 @@ class Timescales(DataLoader):
                     subject_id=subject_id,
                     output_type=output_type,
                     scan_name=scan_name,
-                    modality=modality_str,
+                    modality=modality,
                     atlas=atlas
                 )
                 
@@ -247,8 +246,14 @@ class Timescales(DataLoader):
             
             # Compute autocorrelation
             try:
+                if use_residuals and condition == 'task':
+                    # print('Using residuals...')
+                    timeseries_scan = self.timeseries_residuals[scan_key]
+                else:
+                    timeseries_scan = self.timeseries_data[scan_key]
+
                 acf_result = compute_acf(
-                    self.timeseries_data[scan_key],
+                    timeseries_scan,
                     use_fft=use_fft,
                     freq_window=freq_window,
                     tr=self.tr,
@@ -265,7 +270,7 @@ class Timescales(DataLoader):
                         subject_id=subject_id,
                         output_type=output_type,
                         scan_name=scan_name,
-                        modality=modality_str,
+                        modality=modality,
                         atlas=atlas,
                         metadata={
                             'use_fft': use_fft,
@@ -325,22 +330,22 @@ class Timescales(DataLoader):
             kv_dict = self._parse_scan_key(scan_key)
             
             subject_id = kv_dict.get('sub', '')
-            modality_str = kv_dict.get('modality', '')
+            modality = kv_dict.get('modality', '')
             scan_name = kv_dict.get('scan', '')
             atlas = kv_dict.get('atlas', '')
             
             # Check for existing output
             if not force_recompute:
-                loaded_ts = self._load_subject_output(
+                loaded_timescales = self._load_subject_output(
                     subject_id=subject_id,
                     output_type=output_type,
                     scan_name=scan_name,
-                    modality=modality_str,
+                    modality=modality,
                     atlas=atlas
                 )
                 
-                if loaded_ts is not None:
-                    timescales_dict[scan_key] = loaded_ts
+                if loaded_timescales is not None:
+                    timescales_dict[scan_key] = loaded_timescales
                     n_loaded += 1
                     continue
             
@@ -382,7 +387,7 @@ class Timescales(DataLoader):
                         subject_id=subject_id,
                         output_type=output_type,
                         scan_name=scan_name,
-                        modality=modality_str,
+                        modality=modality,
                         atlas=atlas,
                         metadata={'method': method, 'tr': self.tr}
                     )
@@ -400,7 +405,6 @@ class Timescales(DataLoader):
             print(f"  Total: {len(self.scans)}")
 
     # ============== Timescale Computation Methods ==============
-    
     def _compute_zero_crossing(self, acf: np.ndarray) -> np.ndarray:
         """Find first zero crossing for each parcel."""
         n_parcels = acf.shape[0]
@@ -449,8 +453,58 @@ class Timescales(DataLoader):
         
         return decay_times
 
-# ==================== Standalone Functions ====================
+    # ==================== Deconfounding Functions ====================
+    def regress_task_structure(self):
+        if self.modality == 'MEG':
+            hrf_model = None
+            drift_model = None
+        else:
+            pass # need to add fMRI functionality
+        
+        timeseries_residuals = dict().fromkeys(self.timeseries_data)
+        
+        for scan_key in tqdm(self.scans, desc=f"Regressing task structure out of timeseries"):
+            # Parse scan key
+            kv_dict = self._parse_scan_key(scan_key)
+            condition = kv_dict.get('condition', '')
 
+            if condition == 'task':
+                timeseries = self.timeseries_data[scan_key]
+                n_timepoints = timeseries.shape[1]
+                
+                # Create design matrix using nilearn
+                task_events = self._get_task_events(scan_key)
+                design_matrix = create_design_matrix_nilearn(
+                    task_events, n_timepoints, self.tr,
+                    hrf_model=hrf_model, drift_model=drift_model
+                    )
+                
+                # Fit GLM using nilearn approach
+                residuals, predicted, betas = fit_glm(timeseries, design_matrix)
+                timeseries_residuals[scan_key] = residuals
+            else:
+                timeseries_residuals[scan_key] = None
+
+        self.timeseries_residuals = timeseries_residuals
+    
+    def _get_task_events(self, scan_key):
+        # Parse scan key
+        kv_dict = self._parse_scan_key(scan_key)
+        
+        subject_id = kv_dict.get('sub', '')
+        scan_name = kv_dict.get('scan', '')
+        
+        if self.modality == 'MEG':
+            subdir_str = f'{scan_name[:1]}-{scan_name[1:]}'
+            task_events_file_path = glob.glob(os.path.join(self.rawdata_dir, subject_id, 'unprocessed', 'MEG', subdir_str, 'EPRIME', f'{subject_id}_*_{scan_name[1:]}_*.xlsx'))[0]
+            task_events = extract_meg_trials(task_events_file_path=task_events_file_path, verbose=False)
+            events = task_events[['onset', 'duration', 'trial_type']]
+            
+            return events
+        else:
+            return None
+
+# ==================== Standalone Functions ====================
 def compute_acf(
         data,
         use_fft: bool = False,
@@ -528,7 +582,6 @@ def compute_acf(
             
     return np.array(autocorr_list)
 
-
 def apply_bandpass_filter(
     timeseries,
     sampling_rate: float,
@@ -572,3 +625,181 @@ def apply_bandpass_filter(
     timeseries_filtered = sp.signal.filtfilt(b, a, timeseries)
     
     return timeseries_filtered
+
+def create_design_matrix_nilearn(
+    events,
+    n_timepoints,
+    tr,
+    hrf_model='glover',
+    drift_model='cosine',
+    high_pass=0.01,
+    add_regs=None
+    ):
+    """
+    Create design matrix using nilearn's implementation.
+    
+    Parameters:
+    - events: pandas DataFrame with events (onset, duration, trial_type)
+    - n_timepoints: number of timepoints
+    - tr: repetition time in seconds
+    - hrf_model: HRF model ('glover', 'spm', 'glover + derivative', etc.)
+    - drift_model: drift model ('polynomial', 'cosine', None)
+    - high_pass: high-pass filter cutoff in Hz
+    - add_regs: additional regressors (optional)
+    
+    Returns:
+    - design_matrix: nilearn DesignMatrix object
+    """
+    
+    # Create frame times
+    frame_times = np.arange(n_timepoints) * tr
+    
+    # Use nilearn to create design matrix
+    design_matrix = make_first_level_design_matrix(
+        frame_times=frame_times,
+        events=events,
+        hrf_model=hrf_model,
+        drift_model=drift_model,
+        high_pass=high_pass,
+        add_regs=add_regs
+    )
+    
+    return design_matrix
+
+def extract_meg_trials(
+    task_events_file_path, 
+    onset_column='Stim.OnsetTime',  
+    duration_ms=2000,
+    verbose=True
+    ):
+    """
+    Extract trial onsets and durations from MEG working memory task Excel file.
+    
+    Parameters:
+    -----------
+    task_events_file_path : str
+        Path to the MEG working memory Excel file (e.g., '100307_MEG_Wrkmem_run1.xlsx')
+    onset_column : str, default 'Stim.OnsetTime'
+        Column to use for trial onset timing. Options:
+        - 'Stim.OnsetTime': When stimulus appears (recommended)
+        - 'CueTarget.OnsetTime': When cue/target appears (sparse data)
+        - 'SyncSlide.OnsetTime': Synchronization events
+        - 'GetReady.OnsetTime': Get ready cue onset
+    duration_ms : float, default 2000
+        Duration of each trial in milliseconds
+    
+    Returns:
+    --------
+    events_df : pd.DataFrame
+        DataFrame with columns ['onset', 'duration', 'trial_type', 'block_number'] in seconds
+        where trial_type is '0back'/'2back' and block_number is the block index
+        suitable for use with nilearn GLM functions
+    """
+    
+    # Read Excel file
+    try:
+        data = pd.read_excel(task_events_file_path, sheet_name=0)
+    except Exception as e:
+        raise ValueError(f"Could not read Excel file: {e}")
+    
+    # Check if onset column exists and has sufficient data
+    if onset_column not in data.columns:
+        available_cols = [col for col in data.columns if 'OnsetTime' in col]
+        raise ValueError(f"Column '{onset_column}' not found. Available timing columns: {available_cols}")
+    
+    timing_data_count = data[onset_column].notna().sum()
+    if verbose:
+        print(f"Timing column '{onset_column}' has {timing_data_count}/{len(data)} non-null values")
+    
+    # Remove rows where onset time is missing or where BlockType is missing (non-task trials)
+    valid_trials = data[onset_column].notna() & data['BlockType'].notna()
+    data_clean = data[valid_trials].copy()
+    
+    if len(data_clean) == 0:
+        raise ValueError(f"No valid trials found with both {onset_column} and BlockType data")
+    
+    if verbose:
+        print(f"Found {len(data_clean)} valid trials (removed {len(data) - len(data_clean)} non-task trials)")
+    
+    # Extract onsets and convert from milliseconds to seconds
+    onsets = data_clean[onset_column].values
+    onsets = onsets / 1000.0  # Convert ms to seconds
+    
+    # Set durations (convert from ms to seconds)
+    duration_sec = duration_ms / 1000.0
+    durations = np.full(len(onsets), duration_sec)
+    
+    # Determine trial types (0back/2back from BlockType) and block numbers
+    trial_types = determine_trial_types_fixed(data_clean)
+    block_numbers = extract_block_numbers(data_clean)
+    
+    # Create events DataFrame
+    events_df = pd.DataFrame({
+        'onset': onsets,
+        'duration': durations,
+        'trial_type': trial_types,
+        'block_number': block_numbers
+    })
+    
+    # Sort by onset time
+    events_df = events_df.sort_values('onset').reset_index(drop=True)
+    
+    # Print summary
+    if verbose:
+        print(f"\nTrial extraction summary:")
+        print(f"- Total trials: {len(events_df)}")
+        print(f"- Trial duration: {duration_sec:.3f} seconds")
+        print(f"- Onset range: {events_df['onset'].min():.1f} to {events_df['onset'].max():.1f} seconds")
+        print(f"- Trial types: {events_df['trial_type'].value_counts().to_dict()}")
+        print(f"- Block numbers: {sorted(events_df['block_number'].unique())}")
+    
+    return events_df
+
+def determine_trial_types_fixed(data):
+    """Extract trial types (0back/2back) from BlockType column."""
+    
+    block_types = data['BlockType'].values
+    trial_types = []
+    for block_type in block_types:
+        if pd.isna(block_type):
+            trial_types.append('unknown')
+        elif '0-Back' in str(block_type) or '0Back' in str(block_type):
+            trial_types.append('0back')
+        elif '2-Back' in str(block_type) or '2Back' in str(block_type):
+            trial_types.append('2back')
+        else:
+            trial_types.append('unknown')
+    return trial_types
+
+def extract_block_numbers(data):
+    """Extract block numbers from BlockNumber column."""
+    
+    block_numbers = data['BlockNumber'].values
+    return [int(num) if not pd.isna(num) else -1 for num in block_numbers]
+
+def fit_glm(data, design_matrix):
+    """
+    Fit GLM.
+    
+    Parameters:
+    - data: 2D array (n_parcels, n_timepoints)
+    - design_matrix: nilearn DesignMatrix object
+    
+    Returns:
+    - residuals: residual time series after GLM fitting
+    - predicted: predicted time series
+    - betas: regression coefficients
+    """
+    
+    # Convert design matrix to numpy array
+    X = design_matrix.values
+    
+    # Fit GLM using least squares
+    betas, residuals_sum, rank, s = np.linalg.lstsq(X, data.T, rcond=None)
+    
+    # Compute predicted and residual signals
+    predicted = np.dot(X, betas).T
+    residuals = data - predicted
+    
+    return residuals, predicted, betas.T
+        
