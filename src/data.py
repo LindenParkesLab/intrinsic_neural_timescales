@@ -13,7 +13,7 @@ from sklearn.linear_model import LinearRegression
 class HCPScanInfo:
     """Container for HCP scan metadata matching exact naming conventions."""
     subject_id: str
-    condition: str  # 'rest', 'task', 'movie'
+    condition: str  # 'rest', 'task'
     atlas: str  # e.g., 'Schaefer4007'
     modality: str  # 'MRI3T', 'MRI7T', 'MEG'
     
@@ -42,20 +42,20 @@ class HCPScanInfo:
             if self.condition == 'rest':
                 # 7T REST: rfMRIREST17TPA, rfMRIREST27TAP, etc.
                 return f"rfMRIREST{self.scan_number}7T{self.phase_encoding}"
-            elif self.condition == 'movie':
+            elif self.condition == 'task':
                 # 7T Movie: tfMRIMOVIE17TAP, tfMRIMOVIE27TPA, etc.
                 return f"tfMRIMOVIE{self.scan_number}7T{self.phase_encoding}"
                 
         elif self.modality == 'MEG':
             # MEG: 3-Restin, 6-Wrkmem, etc.
-            return f"{self.meg_scan_number}-{self.meg_task_name}"
+            return f"{self.meg_scan_number}{self.meg_task_name}"
         
         raise ValueError(f"Cannot construct task string for {self}")
     
     def __str__(self):
         """Return key-value formatted string representation."""
         task_str = self.get_task_string()
-        return f"sub-{self.subject_id}_modality-{self.modality}_scan-{task_str}_atlas-{self.atlas}"
+        return f"sub-{self.subject_id}_modality-{self.modality}_condition-{self.condition}_scan-{task_str}_atlas-{self.atlas}"
 
 
 def parse_scan_string(scan_string: str) -> Dict[str, str]:
@@ -145,7 +145,7 @@ class DataLoader:
         'HCP-YA': {
             'MRI3T': {'fmri': os.path.join(DERIVDATA_PATHS['HCP-YA'], 'fmri_parcellated'),},
             'MRI7T': {'fmri': os.path.join(DERIVDATA_PATHS['HCP-YA'], '7T_fmri_parcellated'),},
-            'MEG': {'meg': os.path.join(DERIVDATA_PATHS['HCP-YA'], 'brainstorm', 'meg_parcellated'),}
+            'MEG': {'meg': os.path.join(DERIVDATA_PATHS['HCP-YA'], 'meg_parcellated'),}
         }
     }
     
@@ -391,7 +391,7 @@ class DataLoader:
             for movie_num in movies:
                 scan = HCPScanInfo(
                     subject_id=str(subject_id),
-                    condition='movie',
+                    condition='task',
                     atlas=atlas,
                     modality='MRI7T',
                     scan_number=movie_num,
@@ -407,8 +407,8 @@ class DataLoader:
         self,
         subject_ids: List[str],
         atlas: str = 'Schaefer4007',
-        rest_runs: List[int] = [3, 4, 5],
-        wm_runs: List[int] = [6, 7]
+        rest_runs: List[int] = None, # [3, 4, 5],
+        wm_runs: List[int] = None # [6, 7]
     ) -> List[HCPScanInfo]:
         """
         Register MEG scans for given subjects.
@@ -426,34 +426,36 @@ class DataLoader:
         
         for subject_id in subject_ids:
             # Register REST runs
-            for run_num in rest_runs:
-                scan = HCPScanInfo(
-                    subject_id=str(subject_id),
-                    condition='rest',
-                    atlas=atlas,
-                    modality='MEG',
-                    meg_scan_number=run_num,
-                    meg_task_name='Restin'
-                )
-                
-                if scan not in self.scan_registry:
-                    self.scan_registry.append(scan)
-                registered.append(scan)
+            if rest_runs is not None:
+                for run_num in rest_runs:
+                    scan = HCPScanInfo(
+                        subject_id=str(subject_id),
+                        condition='rest',
+                        atlas=atlas,
+                        modality='MEG',
+                        meg_scan_number=run_num,
+                        meg_task_name='Restin'
+                    )
+                    
+                    if scan not in self.scan_registry:
+                        self.scan_registry.append(scan)
+                    registered.append(scan)
             
             # Register WM runs
-            for run_num in wm_runs:
-                scan = HCPScanInfo(
-                    subject_id=str(subject_id),
-                    condition='task',
-                    atlas=atlas,
-                    modality='MEG',
-                    meg_scan_number=run_num,
-                    meg_task_name='Wrkmem'
-                )
+            if wm_runs is not None:
+                for run_num in wm_runs:
+                    scan = HCPScanInfo(
+                        subject_id=str(subject_id),
+                        condition='task',
+                        atlas=atlas,
+                        modality='MEG',
+                        meg_scan_number=run_num,
+                        meg_task_name='Wrkmem'
+                    )
 
-                if scan not in self.scan_registry:
-                    self.scan_registry.append(scan)
-                registered.append(scan)
+                    if scan not in self.scan_registry:
+                        self.scan_registry.append(scan)
+                    registered.append(scan)
         
         return registered
     
