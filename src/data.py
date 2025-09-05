@@ -459,6 +459,59 @@ class DataLoader:
         
         return registered
     
+    def validate_scan_registry(self, verbose: bool = True) -> Dict[str, List]:
+        """
+        Check which scans in the registry exist and automatically remove non-existent ones.
+        
+        Args:
+            verbose: Print detailed information
+            
+        Returns:
+            Dictionary with 'existing' and 'missing' scan lists
+        """
+        if not self.scan_registry:
+            if verbose:
+                print("Scan registry is empty.")
+            return {'existing': [], 'missing': [], 'removed': []}
+        
+        if verbose:
+            print(f"Validating {len(self.scan_registry)} scans in registry...")
+        
+        existing_scans = []
+        missing_scans = []
+        
+        # Check each scan in the registry
+        for scan in self.scan_registry:
+            try:
+                filepath = self.get_scan_filepath(scan)
+                if filepath.exists():
+                    existing_scans.append(scan)
+                else:
+                    missing_scans.append((scan, filepath))
+                    if verbose:
+                        print(f"  Missing: {scan} -> {filepath}")
+            except Exception as e:
+                missing_scans.append((scan, f"Error: {e}"))
+                if verbose:
+                    print(f"  Error checking {scan}: {e}")
+        
+        # Automatically remove all missing scans
+        for scan, _ in missing_scans:
+            self.scan_registry.remove(scan)
+        
+        # Summary
+        if verbose:
+            print(f"\nValidation Summary:")
+            print(f"  Initially: {len(self.scan_registry) + len(missing_scans)} scans")
+            print(f"  Existing: {len(existing_scans)}")
+            print(f"  Removed:  {len(missing_scans)}")
+            print(f"  Final registry: {len(self.scan_registry)} scans")
+        
+        return {
+            'existing': existing_scans,
+            'missing': missing_scans
+        }
+
     # ==================== Loading Methods ====================
     
     def get_scan_filepath(self, scan: HCPScanInfo) -> Path:
@@ -692,6 +745,12 @@ class DataLoader:
             })
         
         return pd.DataFrame(scan_data)
+    
+    def export_scan_registry(self, file_name: str = 'scan_registry.csv'):
+        """Export scan registry as a DataFrame."""
+
+        scan_registry = self.list_registered_scans()
+        scan_registry.to_csv(os.path.join(self.output_dir, file_name))
     
     def summary(self):
         """Print a summary of the current state."""
