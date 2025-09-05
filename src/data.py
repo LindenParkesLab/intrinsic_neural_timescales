@@ -226,6 +226,7 @@ class DataLoader:
                 df_behavior['age'] = df_behavior['Age_in_Yrs']
                 df_behavior['sex'] = df_behavior['Gender'] == 'M'
                 df_behavior['sex'] = df_behavior['sex'].astype(int)
+                df_behavior.index = df_behavior.index.astype(str)
                 df_behavior.index.name = 'subject_id'
                 
                 # Apply replacements to column names
@@ -751,7 +752,14 @@ class DataLoader:
 
         scan_registry = self.list_registered_scans()
         scan_registry.to_csv(os.path.join(self.output_dir, file_name))
-    
+
+    def load_scan_registry(self, file_name: str = 'scan_registry.csv'):
+        """ Load a pre-save scan registry"""
+        try:
+            self.scan_registry = pd.read_csv(os.path.join(self.output_dir, file_name), index_col=0)
+        except:
+            print(f'{file_name} not found!')
+
     def summary(self):
         """Print a summary of the current state."""
         print(f"\n{'='*50}")

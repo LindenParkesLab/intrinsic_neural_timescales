@@ -25,15 +25,17 @@ class Timescales(DataLoader):
         self.modality = modality
         self.tr = self.get_tr(modality=modality)
         self.timeseries_data = timeseries_data
-        self.scans = list(timeseries_data.keys())
+        if timeseries_data is not None:
+            self.scans = list(timeseries_data.keys())
         
         print(f"\n\tInitialized Timescales for dataset: {dataset}")
         print(f"\tModality: {self.modality}")
         print(f"\tTR: {self.tr}")
-        print(f"\tNumber of scans: {len(self.scans)}")
+        if timeseries_data is not None:
+            print(f"\tNumber of scans: {len(self.scans)}")
         print(f"\tOutput directory: {self.output_dir}")
 
-    # ============== Save/Load Infrastructure with Key-Value Naming ==============
+    # ============== Save/Load Infrastructure ==============
     def _get_output_filepath(
         self,
         subject_id: str,
@@ -506,6 +508,63 @@ class Timescales(DataLoader):
             return events
         else:
             return None
+
+    # ==================== Analysis Functions ====================        
+    def match_registry_to_behavior(self):
+        if not hasattr(self, 'scan_registry') or self.scan_registry is None:
+            self.scan_registry = self.list_registered_scans()
+
+        df_behavior_matched = pd.DataFrame(columns=self.df_behavior.columns)
+        df_behavior_matched.index.name = 'subject_id'
+        
+        for subject_id in self.scan_registry['subject_id'].unique():
+            subject_id = str(subject_id)
+            if subject_id in self.df_behavior.index and subject_id not in df_behavior_matched.index:
+                df_behavior_matched.loc[subject_id] = self.df_behavior.loc[subject_id]
+            elif subject_id in self.df_behavior.index and subject_id in df_behavior_matched.index:
+                pass
+            
+        self.df_behavior_matched = df_behavior_matched
+        
+    def get_precomputed_outputs(
+        self,
+        output_type: str = 'zero_crossing'
+    ) -> Dict[str, Any]:
+        """
+        Get pre-computed measures.
+        
+        Args:
+            method: Method to use ('zero_crossing', 'auc', 'decay_time')
+        
+        Returns:
+            Dictionary of measures for each scan
+        """
+        if not hasattr(self, 'scan_registry') or self.scan_registry is None:
+            self.scan_registry = self.list_registered_scans()
+
+        data_dict = {}
+        
+        for scan_key in tqdm(self.scan_registry['scan_string'], desc=f"Loading {output_type}"):
+            # Parse scan key
+            kv_dict = self._parse_scan_key(scan_key)
+            
+            subject_id = kv_dict.get('sub', '')
+            modality = kv_dict.get('modality', '')
+            scan_name = kv_dict.get('scan', '')
+            atlas = kv_dict.get('atlas', '')
+            
+            # Check for existing output
+            loaded_data = self._load_subject_output(
+                subject_id=subject_id,
+                output_type=output_type,
+                scan_name=scan_name,
+                modality=modality,
+                atlas=atlas
+            )
+            
+            data_dict[scan_key] = loaded_data
+            
+        self.data_dict = data_dict
 
 # ==================== Standalone Functions ====================
 def compute_acf(
