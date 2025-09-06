@@ -17,10 +17,11 @@ class Timescales(DataLoader):
         dataset: str,
         timeseries_data: dict,
         modality: str,
-        load_behavior: bool = True
+        load_behavior: bool = True,
+        verbose: bool = True
     ):
         # Call the parent class's constructor
-        super().__init__(dataset=dataset, load_behavior=load_behavior)
+        super().__init__(dataset=dataset, load_behavior=load_behavior, verbose=verbose)
         
         self.modality = modality
         self.tr = self.get_tr(modality=modality)
@@ -28,12 +29,13 @@ class Timescales(DataLoader):
         if timeseries_data is not None:
             self.scans = list(timeseries_data.keys())
         
-        print(f"\n\tInitialized Timescales for dataset: {dataset}")
-        print(f"\tModality: {self.modality}")
-        print(f"\tTR: {self.tr}")
-        if timeseries_data is not None:
-            print(f"\tNumber of scans: {len(self.scans)}")
-        print(f"\tOutput directory: {self.output_dir}")
+        if verbose:
+            print(f"\n\tInitialized Timescales for dataset: {dataset}")
+            print(f"\tModality: {self.modality}")
+            print(f"\tTR: {self.tr}")
+            if timeseries_data is not None:
+                print(f"\tNumber of scans: {len(self.scans)}")
+            print(f"\tOutput directory: {self.output_dir}")
 
     # ============== Save/Load Infrastructure ==============
     def _get_output_filepath(
@@ -305,7 +307,7 @@ class Timescales(DataLoader):
         method: str = 'zero_crossing',
         force_recompute: bool = False,
         save_outputs: bool = True,
-        prefix: str = None,
+        suffix: str = None,
         verbose: bool = True
     ) -> Dict[str, Any]:
         """
@@ -327,8 +329,8 @@ class Timescales(DataLoader):
         n_loaded = 0
         n_computed = 0
         output_type = f'timescale_{method}'
-        if prefix:
-            output_type = f'{prefix}_{output_type}'
+        if suffix:
+            output_type = f'{output_type}_{suffix}'
         
         for scan_key in tqdm(self.scans, desc=f"Computing {method} timescales"):
             # Parse scan key

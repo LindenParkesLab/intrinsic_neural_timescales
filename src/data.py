@@ -154,7 +154,8 @@ class DataLoader:
         dataset: str,
         base_dir: Optional[str] = None,
         output_dir: Optional[str] = None,
-        load_behavior: bool = True
+        load_behavior: bool = True,
+        verbose: bool = True
     ):
         """
         Initialize the Timescales class for a specific dataset.
@@ -185,7 +186,7 @@ class DataLoader:
         if output_dir is not None:
             self.output_dir = Path(output_dir).expanduser()
         else:
-            self.output_dir = Path('~/intrinsic_neural_timescales').expanduser()
+            self.output_dir = Path('/mnt/storage_ssd_raid/research_projects/intrinsic_neural_timescales')
         
         # Create output directory if it doesn't exist
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -204,13 +205,14 @@ class DataLoader:
         # Initialize data cache (will store loaded timeseries)
         self._data_cache = {}
         
-        print(f"Initialized DataLoader for dataset: {dataset}")
-        print(f"Base directory: {self.base_dir}")
-        print(f"Raw data directory: {self.rawdata_dir}")
-        print(f"Derivatives data directory: {self.derivdata_dir}")
-        print(f"Output directory: {self.output_dir}")
-        if self.df_behavior is not None:
-            print(f"Loaded behavioral data: {len(self.df_behavior)} subjects")
+        if verbose:
+            print(f"Initialized DataLoader for dataset: {dataset}")
+            print(f"Base directory: {self.base_dir}")
+            print(f"Raw data directory: {self.rawdata_dir}")
+            print(f"Derivatives data directory: {self.derivdata_dir}")
+            print(f"Output directory: {self.output_dir}")
+            if self.df_behavior is not None:
+                print(f"Loaded behavioral data: {len(self.df_behavior)} subjects")
     
     def _load_behavioral_data(self):
         """Load the behavioral CSV file for this dataset."""
@@ -248,7 +250,6 @@ class DataLoader:
         return self.modality_params[modality]
 
     # ==================== Registration Methods ====================
-    
     def register_3t_rest_scans(
         self,
         subject_ids: List[str],
@@ -514,7 +515,6 @@ class DataLoader:
         }
 
     # ==================== Loading Methods ====================
-    
     def get_scan_filepath(self, scan: HCPScanInfo) -> Path:
         """
         Get the exact filepath for an HCP scan.
@@ -706,7 +706,6 @@ class DataLoader:
         return loaded
     
     # ==================== Utility Methods ====================
-    
     def clear_cache(self):
         """Clear the data cache to free memory."""
         self._data_cache.clear()
