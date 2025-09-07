@@ -363,7 +363,7 @@ class Timescales(DataLoader):
             try:
                 if method == 'zero_crossing':
                     # Find first zero crossing for each parcel
-                    timescale = self._compute_zero_crossing(acf)
+                    timescale = self._compute_zero_crossing(acf) * tr
                 elif method == 'auc_zero_crossing':
                     # Area under curve
                     timescale = self._compute_auc(acf, tr, max_lag=None)
