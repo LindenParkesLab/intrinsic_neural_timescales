@@ -1,4 +1,4 @@
-import os
+import os, glob
 import numpy as np
 import scipy as sp
 import pandas as pd
@@ -16,6 +16,7 @@ class HCPScanInfo:
     condition: str  # 'rest', 'task'
     atlas: str  # e.g., 'Schaefer4007'
     modality: str  # 'MRI3T', 'MRI7T', 'MEG'
+    tr: float
     
     # Modality-specific fields
     # For 3T/7T fMRI:
@@ -55,52 +56,7 @@ class HCPScanInfo:
     def __str__(self):
         """Return key-value formatted string representation."""
         task_str = self.get_task_string()
-        return f"sub-{self.subject_id}_modality-{self.modality}_condition-{self.condition}_scan-{task_str}_atlas-{self.atlas}"
-
-
-def parse_scan_string(scan_string: str) -> Dict[str, str]:
-    """
-    Parse a key-value formatted scan string into a dictionary.
-    
-    Args:
-        scan_string: String like "sub-100307_modality-MRI3T_scan-rfMRIREST1LR_atlas-Schaefer4007"
-    
-    Returns:
-        Dictionary with keys: sub, modality, scan, atlas, etc.
-    """
-    parts = scan_string.split('_')
-    kv_dict = {}
-    for part in parts:
-        if '-' in part:
-            key, value = part.split('-', 1)  # Split only on first hyphen
-            kv_dict[key] = value
-    return kv_dict
-
-
-def build_scan_string(**kwargs) -> str:
-    """
-    Build a scan string from key-value pairs.
-    
-    Args:
-        **kwargs: Key-value pairs (e.g., sub='100307', modality='MRI3T', etc.)
-    
-    Returns:
-        Formatted scan string
-    """
-    parts = []
-    # Ensure consistent ordering
-    key_order = ['sub', 'modality', 'scan', 'atlas', 'stat']
-    
-    for key in key_order:
-        if key in kwargs and kwargs[key] is not None:
-            parts.append(f"{key}-{kwargs[key]}")
-    
-    # Add any additional keys not in the standard order
-    for key, value in kwargs.items():
-        if key not in key_order and value is not None:
-            parts.append(f"{key}-{value}")
-    
-    return '_'.join(parts)
+        return f"sub-{self.subject_id}_modality-{self.modality}_tr-{self.tr}_condition-{self.condition}_scan-{task_str}_atlas-{self.atlas}"
 
 class DataLoader:
     """
@@ -200,7 +156,7 @@ class DataLoader:
         # Load behavioral data if requested
         self.df_behavior = None
         if load_behavior:
-            self._load_behavioral_data()
+            self.load_behavioral_data()
         
         # Initialize data cache (will store loaded timeseries)
         self._data_cache = {}
@@ -213,36 +169,7 @@ class DataLoader:
             print(f"Output directory: {self.output_dir}")
             if self.df_behavior is not None:
                 print(f"Loaded behavioral data: {len(self.df_behavior)} subjects")
-    
-    def _load_behavioral_data(self):
-        """Load the behavioral CSV file for this dataset."""
-
-        try:
-            if self.dataset == 'HCP-YA':
-                behavior_path_unrestricted = self.base_dir / 'unrestricted_lindenmp_9_26_2022_16_52_14.csv'
-                behavior_path_restricted = self.base_dir / 'RESTRICTED_lindenmp_9_26_2022_16_42_3.csv'
-
-                df_behavior_unrestricted = pd.read_csv(behavior_path_unrestricted, index_col=0)
-                df_behavior_restricted = pd.read_csv(behavior_path_restricted, index_col=0)
-                df_behavior = pd.merge(df_behavior_unrestricted, df_behavior_restricted, left_index=True, right_index=True)
-                df_behavior['age'] = df_behavior['Age_in_Yrs']
-                df_behavior['sex'] = df_behavior['Gender'] == 'M'
-                df_behavior['sex'] = df_behavior['sex'].astype(int)
-                df_behavior.index = df_behavior.index.astype(str)
-                df_behavior.index.name = 'subject_id'
                 
-                # Apply replacements to column names
-                words_to_convert = ['Emotion', 'Gambling', 'Language', 'Relational', 'Social']
-                new_columns = df_behavior.columns.to_series()
-                for word in words_to_convert:
-                    new_columns = new_columns.str.replace(word, word.upper(), regex=False)
-                df_behavior.columns = new_columns
-            else:
-                pass
-            self.df_behavior = df_behavior
-        except:
-            print(f"Warning: Could not find df_behavior.csv at expected locations")
-
     def get_tr(self, modality: str) -> float:
         """Get the TR for a given modality."""
         if modality not in self.modality_params:
@@ -269,6 +196,8 @@ class DataLoader:
         Returns:
             List of registered HCPScanInfo objects
         """
+        modality = 'MRI3T'
+        tr = self.get_tr(modality)
         registered = []
         for subject_id in subject_ids:
             for session in sessions:
@@ -277,9 +206,10 @@ class DataLoader:
                         subject_id=str(subject_id),
                         condition='rest',
                         atlas=atlas,
-                        modality='MRI3T',
+                        modality=modality,
                         scan_number=session,
-                        phase_encoding=pe
+                        phase_encoding=pe,
+                        tr=tr
                     )
                     
                     if scan not in self.scan_registry:
@@ -308,9 +238,11 @@ class DataLoader:
         """
         if task_names is None:
             # All HCP-YA 3T tasks
-            task_names = ['EMOTION', 'GAMBLING', 'LANGUAGE', 'MOTOR', 
-                         'RELATIONAL', 'SOCIAL', 'WM']
+            task_names = ['WM', 'EMOTION', 'GAMBLING',
+                          'LANGUAGE', 'RELATIONAL', 'SOCIAL']
         
+        modality = 'MRI3T'
+        tr = self.get_tr(modality)
         registered = []
         for subject_id in subject_ids:
             for task_name in task_names:
@@ -321,7 +253,8 @@ class DataLoader:
                         atlas=atlas,
                         modality='MRI3T',
                         task_name=task_name,
-                        phase_encoding=pe
+                        phase_encoding=pe,
+                        tr=tr
                     )
                     
                     if scan not in self.scan_registry:
@@ -350,6 +283,8 @@ class DataLoader:
         # 7T REST phase encoding pattern: 1=PA, 2=AP, 3=PA, 4=AP
         pe_pattern = {1: 'PA', 2: 'AP', 3: 'PA', 4: 'AP'}
         
+        modality = 'MRI7T'
+        tr = self.get_tr(modality)
         registered = []
         for subject_id in subject_ids:
             for session in sessions:
@@ -357,9 +292,10 @@ class DataLoader:
                     subject_id=str(subject_id),
                     condition='rest',
                     atlas=atlas,
-                    modality='MRI7T',
+                    modality=modality,
                     scan_number=session,
-                    phase_encoding=pe_pattern[session]
+                    phase_encoding=pe_pattern[session],
+                    tr=tr
                 )
                 
                 if scan not in self.scan_registry:
@@ -388,6 +324,8 @@ class DataLoader:
         # 7T movie phase encoding pattern: 1=AP, 2=PA, 3=PA, 4=AP
         pe_pattern = {1: 'AP', 2: 'PA', 3: 'PA', 4: 'AP'}
         
+        modality = 'MRI7T'
+        tr = self.get_tr(modality)
         registered = []
         for subject_id in subject_ids:
             for movie_num in movies:
@@ -395,9 +333,10 @@ class DataLoader:
                     subject_id=str(subject_id),
                     condition='task',
                     atlas=atlas,
-                    modality='MRI7T',
+                    modality=modality,
                     scan_number=movie_num,
-                    phase_encoding=pe_pattern[movie_num]
+                    phase_encoding=pe_pattern[movie_num],
+                    tr=tr
                 )
                 
                 if scan not in self.scan_registry:
@@ -424,6 +363,8 @@ class DataLoader:
         Returns:
             List of registered HCPScanInfo objects
         """
+        modality = 'MEG'
+        tr = self.get_tr(modality)
         registered = []
         
         for subject_id in subject_ids:
@@ -434,9 +375,10 @@ class DataLoader:
                         subject_id=str(subject_id),
                         condition='rest',
                         atlas=atlas,
-                        modality='MEG',
+                        modality=modality,
                         meg_scan_number=run_num,
-                        meg_task_name='Restin'
+                        meg_task_name='Restin',
+                        tr=tr
                     )
                     
                     if scan not in self.scan_registry:
@@ -450,9 +392,10 @@ class DataLoader:
                         subject_id=str(subject_id),
                         condition='task',
                         atlas=atlas,
-                        modality='MEG',
+                        modality=modality,
                         meg_scan_number=run_num,
-                        meg_task_name='Wrkmem'
+                        meg_task_name='Wrkmem',
+                        tr=tr
                     )
 
                     if scan not in self.scan_registry:
@@ -486,7 +429,11 @@ class DataLoader:
         for scan in self.scan_registry:
             try:
                 filepath = self.get_scan_filepath(scan)
-                if filepath.exists():
+                task_events = self.get_task_events(str(scan))
+                
+                if filepath.exists() and scan.condition == 'task' and task_events is not None:
+                    existing_scans.append(scan)
+                elif filepath.exists() and scan.condition == 'rest' and task_events is None:
                     existing_scans.append(scan)
                 else:
                     missing_scans.append((scan, filepath))
@@ -515,6 +462,83 @@ class DataLoader:
         }
 
     # ==================== Loading Methods ====================
+    def load_behavioral_data(self):
+        """Load the behavioral CSV file for this dataset."""
+
+        try:
+            if self.dataset == 'HCP-YA':
+                behavior_path_unrestricted = self.base_dir / 'unrestricted_lindenmp_9_26_2022_16_52_14.csv'
+                behavior_path_restricted = self.base_dir / 'RESTRICTED_lindenmp_9_26_2022_16_42_3.csv'
+
+                df_behavior_unrestricted = pd.read_csv(behavior_path_unrestricted, index_col=0)
+                df_behavior_restricted = pd.read_csv(behavior_path_restricted, index_col=0)
+                df_behavior = pd.merge(df_behavior_unrestricted, df_behavior_restricted, left_index=True, right_index=True)
+                df_behavior['age'] = df_behavior['Age_in_Yrs']
+                df_behavior['sex'] = df_behavior['Gender'] == 'M'
+                df_behavior['sex'] = df_behavior['sex'].astype(int)
+                df_behavior.index = df_behavior.index.astype(str)
+                df_behavior.index.name = 'subject_id'
+                
+                # Apply replacements to column names
+                words_to_convert = ['Emotion', 'Gambling', 'Language', 'Relational', 'Social']
+                new_columns = df_behavior.columns.to_series()
+                for word in words_to_convert:
+                    new_columns = new_columns.str.replace(word, word.upper(), regex=False)
+                df_behavior.columns = new_columns
+            else:
+                pass
+            self.df_behavior = df_behavior
+        except:
+            print(f"Warning: Could not find df_behavior.csv at expected locations")
+
+    def get_task_events(self, scan_key):
+        # Parse scan key
+        kv_dict = parse_scan_string(scan_key)
+        
+        subject_id = kv_dict.get('sub', '')
+        scan_name = kv_dict.get('scan', '')
+        modality = kv_dict.get('modality', '')
+        
+        try:
+            if modality == 'MEG':
+                subdir_str = f'{scan_name[:1]}-{scan_name[1:]}'
+                task_events_file_path = glob.glob(os.path.join(self.rawdata_dir, subject_id, 'unprocessed', 'MEG', subdir_str, 'EPRIME', f'{subject_id}_*_{scan_name[1:]}_*.xlsx'))[0]
+                events = get_task_events_meg(task_events_file_path=task_events_file_path, verbose=False)
+                task_events = events[['onset', 'duration', 'trial_type']]
+            elif modality == 'MRI3T':
+                results_dir = os.path.join(self.rawdata_dir, subject_id, 'MNINonLinear', 'Results')
+                contents = os.listdir(results_dir)
+                contents_joined = [''.join(content.split('_')) for content in contents]
+                idx = contents_joined.index(scan_name)
+                ev_dir = os.path.join(results_dir, contents[idx], 'EVs')
+                task_events = get_task_events_fmri(ev_dir)
+            elif modality == 'MRI7T':
+                movie_metadata_dir = os.path.join(self.output_dir, 'data', 'movie_data')
+                
+                if 'MOVIE1' in scan_name:
+                    timing_file = '7T_MOVIE1_CC1_v2_Video_Timing.csv'
+                elif 'MOVIE2' in scan_name:
+                    timing_file = '7T_MOVIE2_HO1_v2_Video_Timing.csv'
+                elif 'MOVIE3' in scan_name:
+                    timing_file = '7T_MOVIE3_CC2_v2_Video_Timing.csv'
+                elif 'MOVIE4' in scan_name:
+                    timing_file = '7T_MOVIE4_HO2_v2_Video_Timing.csv'
+                
+                block_design_file = os.path.join(movie_metadata_dir, timing_file)
+                block_design_data = pd.read_csv(block_design_file)
+                block_design_data = block_design_data.loc[block_design_data['movie.block'] != 0.0]
+
+                # Create task_events DataFrame for nilearn (task blocks only by default)
+                task_events = pd.DataFrame({
+                    'onset': block_design_data['block_start_time'],
+                    'duration': block_design_data['block_duration'], 
+                    'trial_type': 'movie'
+                }).dropna().sort_values('onset').reset_index(drop=True)
+        
+            return task_events
+        except:
+            return None
+    
     def get_scan_filepath(self, scan: HCPScanInfo) -> Path:
         """
         Get the exact filepath for an HCP scan.
@@ -786,3 +810,190 @@ class DataLoader:
     def __repr__(self):
         return (f"Timescales(dataset='{self.dataset}', "
                 f"n_registered_scans={len(self.scan_registry)})")
+        
+# ==================== Standalone Functions ====================
+def parse_scan_string(scan_string: str) -> Dict[str, str]:
+    """
+    Parse a key-value formatted scan string into a dictionary.
+    
+    Args:
+        scan_string: String like "sub-100307_modality-MRI3T_scan-rfMRIREST1LR_atlas-Schaefer4007"
+    
+    Returns:
+        Dictionary with keys: sub, modality, scan, atlas, etc.
+    """
+    parts = scan_string.split('_')
+    kv_dict = {}
+    for part in parts:
+        if '-' in part:
+            key, value = part.split('-', 1)  # Split only on first hyphen
+            kv_dict[key] = value
+            
+    if 'tr' in kv_dict:
+        kv_dict['tr'] = float(kv_dict['tr'])
+        
+    return kv_dict
+
+def build_scan_string(**kwargs) -> str:
+    """
+    Build a scan string from key-value pairs.
+    
+    Args:
+        **kwargs: Key-value pairs (e.g., sub='100307', modality='MRI3T', etc.)
+    
+    Returns:
+        Formatted scan string
+    """
+    parts = []
+    # Ensure consistent ordering
+    key_order = ['sub', 'modality', 'scan', 'atlas', 'stat']
+    
+    for key in key_order:
+        if key in kwargs and kwargs[key] is not None:
+            parts.append(f"{key}-{kwargs[key]}")
+    
+    # Add any additional keys not in the standard order
+    for key, value in kwargs.items():
+        if key not in key_order and value is not None:
+            parts.append(f"{key}-{value}")
+    
+    return '_'.join(parts)
+
+def get_task_events_fmri(ev_dir):
+    task_events = pd.DataFrame(columns=['onset', 'duration', 'trial_type'])
+
+    conditions = os.listdir(ev_dir)
+    for condition in conditions:
+        task_events_tmp = pd.DataFrame(columns=['onset', 'duration', 'trial_type'])
+
+        try:
+            ev_data = np.genfromtxt(os.path.join(ev_dir, condition))
+
+            if ev_data.ndim == 1:
+                task_events_tmp.loc[0, 'onset'] = ev_data[0]
+                task_events_tmp.loc[0, 'duration'] = ev_data[1]
+                task_events_tmp.loc[0, 'trial_type'] = condition.replace('.txt', '')
+
+            elif ev_data.ndim == 2:
+                for block in np.arange(ev_data.shape[0]):
+                    task_events_tmp.loc[block, 'onset'] = ev_data[block, 0]
+                    task_events_tmp.loc[block, 'duration'] = ev_data[block, 1]
+                    task_events_tmp.loc[block, 'trial_type'] = condition.replace('.txt', '')
+        except:
+            pass
+        
+        task_events = pd.concat((task_events, task_events_tmp), axis=0)
+
+    task_events.reset_index(inplace=True, drop=True)
+
+    return task_events
+
+def get_task_events_meg(task_events_file_path, 
+                        onset_column='Stim.OnsetTime',
+                        duration_ms=2000,
+                        verbose=True
+                        ):
+    """
+    Extract trial onsets and durations from MEG working memory task Excel file.
+    
+    Parameters:
+    -----------
+    task_events_file_path : str
+        Path to the MEG working memory Excel file (e.g., '100307_MEG_Wrkmem_run1.xlsx')
+    onset_column : str, default 'Stim.OnsetTime'
+        Column to use for trial onset timing. Options:
+        - 'Stim.OnsetTime': When stimulus appears (recommended)
+        - 'CueTarget.OnsetTime': When cue/target appears (sparse data)
+        - 'SyncSlide.OnsetTime': Synchronization events
+        - 'GetReady.OnsetTime': Get ready cue onset
+    duration_ms : float, default 2000
+        Duration of each trial in milliseconds
+    
+    Returns:
+    --------
+    events_df : pd.DataFrame
+        DataFrame with columns ['onset', 'duration', 'trial_type', 'block_number'] in seconds
+        where trial_type is '0back'/'2back' and block_number is the block index
+        suitable for use with nilearn GLM functions
+    """
+    
+    # Read Excel file
+    try:
+        data = pd.read_excel(task_events_file_path, sheet_name=0)
+    except Exception as e:
+        raise ValueError(f"Could not read Excel file: {e}")
+    
+    # Check if onset column exists and has sufficient data
+    if onset_column not in data.columns:
+        available_cols = [col for col in data.columns if 'OnsetTime' in col]
+        raise ValueError(f"Column '{onset_column}' not found. Available timing columns: {available_cols}")
+    
+    timing_data_count = data[onset_column].notna().sum()
+    if verbose:
+        print(f"Timing column '{onset_column}' has {timing_data_count}/{len(data)} non-null values")
+    
+    # Remove rows where onset time is missing or where BlockType is missing (non-task trials)
+    valid_trials = data[onset_column].notna() & data['BlockType'].notna()
+    data_clean = data[valid_trials].copy()
+    
+    if len(data_clean) == 0:
+        raise ValueError(f"No valid trials found with both {onset_column} and BlockType data")
+    
+    if verbose:
+        print(f"Found {len(data_clean)} valid trials (removed {len(data) - len(data_clean)} non-task trials)")
+    
+    # Extract onsets and convert from milliseconds to seconds
+    onsets = data_clean[onset_column].values
+    onsets = onsets / 1000.0  # Convert ms to seconds
+    
+    # Set durations (convert from ms to seconds)
+    duration_sec = duration_ms / 1000.0
+    durations = np.full(len(onsets), duration_sec)
+    
+    # Determine trial types (0back/2back from BlockType) and block numbers
+    trial_types = determine_trial_types_fixed(data_clean)
+    block_numbers = extract_block_numbers(data_clean)
+    
+    # Create events DataFrame
+    events_df = pd.DataFrame({
+        'onset': onsets,
+        'duration': durations,
+        'trial_type': trial_types,
+        'block_number': block_numbers
+    })
+    
+    # Sort by onset time
+    events_df = events_df.sort_values('onset').reset_index(drop=True)
+    
+    # Print summary
+    if verbose:
+        print(f"\nTrial extraction summary:")
+        print(f"- Total trials: {len(events_df)}")
+        print(f"- Trial duration: {duration_sec:.3f} seconds")
+        print(f"- Onset range: {events_df['onset'].min():.1f} to {events_df['onset'].max():.1f} seconds")
+        print(f"- Trial types: {events_df['trial_type'].value_counts().to_dict()}")
+        print(f"- Block numbers: {sorted(events_df['block_number'].unique())}")
+    
+    return events_df
+
+def determine_trial_types_fixed(data):
+    """Extract trial types (0back/2back) from BlockType column."""
+    
+    block_types = data['BlockType'].values
+    trial_types = []
+    for block_type in block_types:
+        if pd.isna(block_type):
+            trial_types.append('unknown')
+        elif '0-Back' in str(block_type) or '0Back' in str(block_type):
+            trial_types.append('0back')
+        elif '2-Back' in str(block_type) or '2Back' in str(block_type):
+            trial_types.append('2back')
+        else:
+            trial_types.append('unknown')
+    return trial_types
+
+def extract_block_numbers(data):
+    """Extract block numbers from BlockNumber column."""
+    
+    block_numbers = data['BlockNumber'].values
+    return [int(num) if not pd.isna(num) else -1 for num in block_numbers]
