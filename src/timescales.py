@@ -381,6 +381,9 @@ class Timescales(DataLoader):
                     # Time to decay to 1/e
                     threshold = 0.5
                     timescale = self._compute_decay_time(acf, threshold)
+                elif method == 'exponential_tau':
+                    fs = 1 / self.tr
+                    timescale, _ = self._compute_tau_from_acf(acf, fs)
                 else:
                     raise ValueError(f"Unknown method: {method}")
                 
@@ -459,6 +462,54 @@ class Timescales(DataLoader):
                 decay_times[i] = np.nan
         
         return decay_times
+
+    def _compute_tau_from_acf(self, acf: np.ndarray, fs: float, max_lag_ms=None):
+        """
+        Compute neuronal timescale (tau) from pre-computed autocorrelation function.
+        
+        Based on Gao et al. 2020, Figure 1C methodology.
+        
+        Parameters:
+        -----------
+        acf : array-like
+            Pre-computed autocorrelation function. Should be normalized (ACF[0] = 1).
+        fs : float
+            Sampling frequency in Hz
+        max_lag_ms : float, optional
+            Maximum lag to consider in milliseconds. If None, uses full ACF.
+            
+        Returns:
+        --------
+        tau : float or array
+            Timescale(s) in seconds
+        fit_info : dict
+            Diagnostic information about the fit
+        """
+        # Ensure input is 2D (n_series, n_lags)
+        n_parcels, n_lags = acf.shape
+        
+        # Create lag times in seconds
+        lags = np.arange(n_lags) / fs
+        
+        # Limit to max_lag_ms if specified
+        if max_lag_ms is not None:
+            max_lag_samples = int(max_lag_ms * fs / 1000)
+            max_lag_samples = min(max_lag_samples, n_lags)
+            acf = acf[:, :max_lag_samples]
+            lags = lags[:max_lag_samples]
+            n_lags = max_lag_samples
+        
+        taus = np.zeros(n_parcels)
+        fit_infos = []
+        
+        for i in range(n_parcels):
+            acf_single = acf[i, :]
+            
+            tau, fit_info = fit_exponential_decay(lags, acf_single)
+            taus[i] = tau
+            fit_infos.append(fit_info)
+        
+        return taus, fit_infos
 
     # ==================== Deconfounding Functions ====================
     def regress_task_structure(self):
@@ -866,4 +917,69 @@ def fit_glm(data, design_matrix):
     residuals = data - predicted
     
     return residuals, predicted, betas.T
+
+def fit_exponential_decay(lags, acf):
+    """
+    Fit exponential decay function to ACF: ACF(t) = exp(-t/tau)
+    
+    This is done by linear regression in log space: log(ACF) = -t/tau + const
+    Following Gao et al. 2020 methodology.
+    """
+    
+    # Find first zero crossing to limit fit range (positive ACF only)
+    negative_idx = np.where(acf <= 0)[0]
+    if len(negative_idx) > 0:
+        end_idx = negative_idx[0]
+    else:
+        end_idx = len(acf)
+    
+    # Exclude lag 0 and fit only positive values
+    start_idx = 1  # Skip lag 0 (ACF=1)
+    lags_fit = lags[start_idx:end_idx]
+    acf_fit = acf[start_idx:end_idx]
+    
+    # Remove any remaining non-positive values
+    valid_idx = acf_fit > 0
+    lags_fit = lags_fit[valid_idx]
+    acf_fit = acf_fit[valid_idx]
+    
+    try:
+        # Linear fit in log space: log(ACF) = -t/tau + const
+        # So slope = -1/tau, therefore tau = -1/slope
+        slope, intercept, r_value, p_value, std_err = sp.stats.linregress(lags_fit, np.log(acf_fit))
         
+        if slope >= 0:
+            # Non-decaying or increasing ACF - invalid
+            tau = np.nan
+            error = 'positive_slope'
+        else:
+            tau = -1 / slope
+            error = None
+        
+        fit_info = {
+            'tau': tau,
+            'slope': slope,
+            'intercept': intercept,
+            'r_squared': r_value**2,
+            'p_value': p_value,
+            'std_err': std_err,
+            'n_points': len(lags_fit),
+            'fit_range': [lags_fit[0], lags_fit[-1]],
+            'lags_fit': lags_fit,
+            'acf_fit': acf_fit,
+            'log_acf_fit': np.log(acf_fit),
+            'error': error
+        }
+    except (ValueError, RuntimeWarning) as e:
+        # Fitting failed (e.g., log of negative numbers)
+        tau = np.nan
+        fit_info = {
+            'tau': np.nan,
+            'r_squared': np.nan,
+            'n_points': len(lags_fit),
+            'fit_range': [lags_fit[0] if len(lags_fit) > 0 else np.nan, 
+                         lags_fit[-1] if len(lags_fit) > 0 else np.nan],
+            'error': f'fitting_failed: {str(e)}'
+        }
+    
+    return tau, fit_info 
