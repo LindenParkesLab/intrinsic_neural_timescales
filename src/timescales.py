@@ -511,6 +511,8 @@ class Timescales(DataLoader):
     # ==================== Deconfounding Functions ====================
     def regress_task_structure(self):
         timeseries_residuals = dict().fromkeys(self.timeseries_data)
+        task_events = dict().fromkeys(self.timeseries_data)
+        design_matrices = dict().fromkeys(self.timeseries_data)
         
         for scan_key in tqdm(self.scans, desc=f"Regressing task structure out of timeseries"):
             # Parse scan key
@@ -532,20 +534,25 @@ class Timescales(DataLoader):
                         drift_model = 'cosine'
 
                     # Create design matrix using nilearn
-                    task_events = self.get_task_events(scan_key)
-                    design_matrix = create_design_matrix_nilearn(task_events, n_timepoints, tr, 
+                    task_events[scan_key] = self.get_task_events(scan_key)
+                    design_matrices[scan_key] = create_design_matrix_nilearn(task_events[scan_key], n_timepoints, tr, 
                                                                  hrf_model=hrf_model, drift_model=drift_model
                                                                  )
                     
                     # Fit GLM using nilearn approach
-                    residuals, predicted, betas = fit_glm(timeseries, design_matrix)
-                    timeseries_residuals[scan_key] = residuals
+                    timeseries_residuals[scan_key], predicted, betas = fit_glm(timeseries, design_matrices[scan_key])
                 except:
                     timeseries_residuals[scan_key] = None
+                    task_events[scan_key] = None
+                    design_matrices[scan_key] = None
             else:
                 timeseries_residuals[scan_key] = None
+                task_events[scan_key] = None
+                design_matrices[scan_key] = None
 
         self.timeseries_residuals = timeseries_residuals
+        self.task_events = task_events
+        self.design_matrices = design_matrices
     
     # ==================== Analysis Functions ====================        
     def match_registry_to_behavior(self):

@@ -142,7 +142,7 @@ class DataLoader:
         if output_dir is not None:
             self.output_dir = Path(output_dir).expanduser()
         else:
-            self.output_dir = Path('/mnt/storage_ssd_raid/research_projects/intrinsic_neural_timescales')
+            self.output_dir = Path('/media/lindenmp/storage_ssd_1/research_projects/intrinsic_neural_timescales')
         
         # Create output directory if it doesn't exist
         self.output_dir.mkdir(parents=True, exist_ok=True)
