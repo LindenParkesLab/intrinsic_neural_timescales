@@ -322,6 +322,8 @@ class Timescales(DataLoader):
             raise ValueError("Must compute autocorrelation first")
         
         timescales_dict = {}
+        if method == 'exponential_tau':
+            tau_fit_infos = {}
         n_loaded = 0
         n_computed = 0
         output_type = f'timescale_{method}'
@@ -380,7 +382,8 @@ class Timescales(DataLoader):
                     timescale = self._compute_decay_time(acf, tr, threshold)
                 elif method == 'exponential_tau':
                     fs = 1 / tr
-                    timescale, _ = self._compute_tau_from_acf(acf, fs)
+                    timescale, fit_infos = self._compute_tau_from_acf(acf, fs)
+                    tau_fit_infos[scan_key] = fit_infos
                 else:
                     raise ValueError(f"Unknown method: {method}")
                 
@@ -404,7 +407,9 @@ class Timescales(DataLoader):
                 timescales_dict[scan_key] = None
 
         self.timescales_dict = timescales_dict
-        
+        if method == 'exponential_tau':
+            self.tau_fit_infos = tau_fit_infos
+
         if verbose:
             print(f"\n{method} timescale computation complete:")
             print(f"  Loaded from cache: {n_loaded}")
@@ -513,6 +518,7 @@ class Timescales(DataLoader):
         timeseries_residuals = dict().fromkeys(self.timeseries_data)
         task_events = dict().fromkeys(self.timeseries_data)
         design_matrices = dict().fromkeys(self.timeseries_data)
+        task_events_acf = dict().fromkeys(self.timeseries_data)
         
         for scan_key in tqdm(self.scans, desc=f"Regressing task structure out of timeseries"):
             # Parse scan key
@@ -534,25 +540,39 @@ class Timescales(DataLoader):
                         drift_model = 'cosine'
 
                     # Create design matrix using nilearn
-                    task_events[scan_key] = self.get_task_events(scan_key)
-                    design_matrices[scan_key] = create_design_matrix_nilearn(task_events[scan_key], n_timepoints, tr, 
+                    tsk_evnts = self.get_task_events(scan_key)
+                    # replace all trials with a single trial types
+                    # tsk_evnts['trial_type'] = 'trial'
+                    design_matrix = create_design_matrix_nilearn(tsk_evnts, n_timepoints, tr, 
                                                                  hrf_model=hrf_model, drift_model=drift_model
                                                                  )
-                    
                     # Fit GLM using nilearn approach
-                    timeseries_residuals[scan_key], predicted, betas = fit_glm(timeseries, design_matrices[scan_key])
+                    timeseries_residuals[scan_key], predicted, betas = fit_glm(timeseries, design_matrix)
+                    task_events[scan_key] = tsk_evnts
+                    design_matrices[scan_key] = design_matrix
+                    
+                    # get autocorrelation of task events
+                    tsk_evnts_flat = tsk_evnts.copy()
+                    tsk_evnts_flat['trial_type'] = 'trial'
+                    design_matrix_flat = create_design_matrix_nilearn(tsk_evnts_flat, n_timepoints, tr, 
+                                                                      hrf_model=hrf_model, drift_model=drift_model
+                                                                      )
+                    task_events_acf[scan_key] = compute_acf(design_matrix_flat['trial'].values)
                 except:
                     timeseries_residuals[scan_key] = None
                     task_events[scan_key] = None
                     design_matrices[scan_key] = None
+                    task_events_acf[scan_key] = None
             else:
                 timeseries_residuals[scan_key] = None
                 task_events[scan_key] = None
                 design_matrices[scan_key] = None
+                task_events_acf[scan_key] = None
 
         self.timeseries_residuals = timeseries_residuals
         self.task_events = task_events
         self.design_matrices = design_matrices
+        self.task_events_acf = task_events_acf
     
     # ==================== Analysis Functions ====================        
     def match_registry_to_behavior(self):
@@ -824,6 +844,9 @@ def fit_exponential_decay(lags, acf):
     lags_fit = lags_fit[valid_idx]
     acf_fit = acf_fit[valid_idx]
     
+    # lags_fit = lags[1:]
+    # acf_fit = acf[1:]
+    
     try:
         # Linear fit in log space: log(ACF) = -t/tau + const
         # So slope = -1/tau, therefore tau = -1/slope
@@ -863,4 +886,36 @@ def fit_exponential_decay(lags, acf):
             'error': f'fitting_failed: {str(e)}'
         }
     
-    return tau, fit_info 
+    return tau, fit_info
+
+def calculate_tsnr(timeseries_matrix):
+    """
+    Calculate temporal signal-to-noise ratio (tSNR) for ROI timeseries data.
+    
+    Parameters
+    ----------
+    timeseries_matrix : numpy.ndarray
+        2D array with shape (n_rois, n_timepoints) where each row represents
+        an ROI and each column represents a timepoint.
+    
+    Returns
+    -------
+    tsnr : numpy.ndarray
+        1D array with shape (n_rois,) containing tSNR values for each ROI.
+        tSNR = mean(signal) / std(signal) across time for each ROI.
+    
+    Notes
+    -----
+    - Higher tSNR values indicate better signal quality
+    - ROIs with zero standard deviation will result in inf values
+    - Consider masking out ROIs with very low signal or high motion
+    """
+    # Calculate mean and standard deviation across time (axis=1)
+    mean_signal = np.mean(timeseries_matrix, axis=1)
+    std_signal = np.std(timeseries_matrix, axis=1, ddof=1)  # ddof=1 for sample std
+    
+    # Calculate tSNR, handling division by zero
+    with np.errstate(divide='ignore', invalid='ignore'):
+        tsnr = mean_signal / std_signal
+    
+    return tsnr
