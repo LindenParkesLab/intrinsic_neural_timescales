@@ -579,6 +579,7 @@ class DataLoader:
         scan: HCPScanInfo,
         cache: bool = True,
         nuisance_regression: bool = True,
+        standardize: bool = False,
         verbose: bool = False,
         dry_load: bool = False
     ) -> np.ndarray:
@@ -634,7 +635,8 @@ class DataLoader:
             timeseries = timeseries - y_pred
         
         # z score
-        timeseries = sp.stats.zscore(timeseries, axis=0)
+        if standardize:
+            timeseries = sp.stats.zscore(timeseries, axis=0)
         
         # Transpose data to (n_parcels, n_timepoints)
         timeseries = timeseries.T
