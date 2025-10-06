@@ -661,6 +661,7 @@ class DataLoader:
         atlas: Optional[str] = None,
         cache: bool = False,
         nuisance_regression: bool = True,
+        standardize: bool = False,
         verbose: bool = True,
         dry_load: bool = False
     ) -> Dict[str, Optional[np.ndarray]]:
@@ -713,6 +714,7 @@ class DataLoader:
                     cache=cache, 
                     verbose=False, 
                     nuisance_regression=nuisance_regression,
+                    standardize=standardize,
                     dry_load=dry_load
                 )
                 
