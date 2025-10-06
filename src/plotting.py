@@ -7,6 +7,7 @@ from scipy.stats import pearsonr, spearmanr
 
 import seaborn as sns
 import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
 from matplotlib.colors import Normalize
 from matplotlib.cm import ScalarMappable
 plt.ion()
@@ -17,9 +18,37 @@ from nilearn import plotting
 from nilearn.image import new_img_like
 from nilearn.surface import load_surf_data, vol_to_surf
 
-def plot_autocorrelation_analysis(autocorr_raw, autocorr_resid, zero_crossings_raw, zero_crossings_resid, 
-                                  design_matrix, events, tr,
-                                  n_example_voxels=5, figsize=(10, 5), save_path=None, dpi=300):
+
+def create_sydnor_sa_colormap():
+    """
+    Create a custom colormap that transitions from yellow/orange (sensorimotor pole, low rank) 
+    through white at the center to purple (association pole, high rank).
+    
+    Returns:
+        matplotlib.colors.LinearSegmentedColormap: The custom colormap
+    """
+    
+    # Define the colors for the colormap
+    # Format: (position, (R, G, B))
+    colors = [
+        (0.0, '#FFA500'),   # Orange/yellow (sensorimotor pole, low rank)
+        (0.5, "#FFFFFF"),   # White (middle, 0 point)
+        (1.0, '#8A2BE2')    # Purple (association pole, high rank)
+    ]
+    
+    # Create the colormap
+    sydnor_sa = mcolors.LinearSegmentedColormap.from_list('sydnor_sa', colors, N=256)
+    
+    # Register the colormap with matplotlib so it can be used by name
+    try:
+        plt.colormaps.register(cmap=sydnor_sa, name='sydnor_sa')
+    except:
+        pass
+    
+    return sydnor_sa
+
+def plot_autocorrelation_analysis(autocorr_raw, autocorr_resid, zero_crossings_raw, zero_crossings_resid, tr,
+                                  max_lag=None, n_example_voxels=5, figsize=(12.5, 5), save_path=None, dpi=300):
     """
     Plot autocorrelation analysis results and block design.
     
@@ -27,8 +56,6 @@ def plot_autocorrelation_analysis(autocorr_raw, autocorr_resid, zero_crossings_r
     - autocorr_raw: autocorrelation before task removal (n_voxels x n_lags)
     - autocorr_resid: autocorrelation after task removal (n_voxels x n_lags)
     - zero_crossings: first zero-crossing indices (n_voxels,)
-    - design_matrix: nilearn DesignMatrix object
-    - events: pandas DataFrame with events (onset, duration, trial_type) for nilearn
     - tr: repetition time in seconds
     - max_lag: maximum lag to plot (in timepoints)
     - n_example_voxels: number of example voxel ACF curves to show
@@ -36,16 +63,17 @@ def plot_autocorrelation_analysis(autocorr_raw, autocorr_resid, zero_crossings_r
     """
     
     # Limit the lag range for plotting
-    max_lag = 25
-    max_lag = min(max_lag, autocorr_raw.shape[1])
+    if max_lag is None:
+        max_lag = np.max((zero_crossings_resid.max(), zero_crossings_raw.max())).astype(int)
+    # max_lag = min(max_lag, autocorr_raw.shape[1])
     lag_times = np.arange(max_lag) * tr  # Convert to seconds
     
     # Create figure with subplots
-    fig, axes = plt.subplots(2, 2, figsize=figsize)
+    fig, axes = plt.subplots(1, 3, figsize=figsize)
     fig.suptitle('fMRI Autocorrelation Analysis Results (using nilearn)', fontsize=16, fontweight='bold')
     
     # Plot 1: Average ACF comparison (before vs after)
-    ax1 = axes[0, 0]
+    ax1 = axes[0]
     mean_acf_raw = np.mean(autocorr_raw[:, :max_lag], axis=0)
     mean_acf_resid = np.mean(autocorr_resid[:, :max_lag], axis=0)
     std_acf_raw = np.std(autocorr_raw[:, :max_lag], axis=0)
@@ -67,7 +95,7 @@ def plot_autocorrelation_analysis(autocorr_raw, autocorr_resid, zero_crossings_r
     ax1.grid(True, alpha=0.3)
     
     # Plot 2: Example individual voxel ACF curves
-    ax2 = axes[0, 1]
+    ax2 = axes[1]
     n_voxels = autocorr_raw.shape[0]
     example_indices = np.linspace(0, n_voxels-1, n_example_voxels, dtype=int)
     
@@ -85,48 +113,22 @@ def plot_autocorrelation_analysis(autocorr_raw, autocorr_resid, zero_crossings_r
     ax2.set_title(f'Example Individual Voxel ACF\n(dashed=before, solid=after)')
     ax2.legend(fontsize=8)
     ax2.grid(True, alpha=0.3)
-    
-    # Plot 3: Design matrix regressors
-    ax3 = axes[1, 0]
-    
-    # Plot design matrix columns (task regressors and HRF-convolved)
-    time_vector = np.arange(design_matrix.shape[0]) * tr
-    task_columns = [col for col in design_matrix.columns if not any(x in col.lower() for x in ['drift', 'constant'])]
-    
-    if len(task_columns) > 0:
-        # Show task regressors
-        for i, col in enumerate(task_columns[:3]):  # Show first 3 task regressors
-            ax3.plot(time_vector, design_matrix[col], label=col, linewidth=2, alpha=0.8)
         
-        # Overlay event markers
-        for _, event in events.iterrows():
-            ax3.axvspan(event['onset'], event['onset'] + event['duration'], 
-                       alpha=0.2, color='orange', label='Events' if _ == 0 else "")
-        
-        ax3.set_xlabel('Time (seconds)')
-        ax3.set_ylabel('Amplitude')
-        ax3.set_title('Design Matrix Regressors\n(nilearn HRF convolution)')
-        ax3.legend()
-        ax3.grid(True, alpha=0.3)
-    else:
-        ax3.text(0.5, 0.5, 'No task regressors found', ha='center', va='center', transform=ax3.transAxes)
-        ax3.set_title('Design Matrix')
-    
     # Plot 4: Zero-crossing distribution
-    ax4 = axes[1, 1]
+    ax3 = axes[2]
     zero_crossings_seconds = zero_crossings_raw * tr
-    ax4.hist(zero_crossings_seconds, bins=20, alpha=0.7, color='b', edgecolor='black')
-    ax4.axvline(np.mean(zero_crossings_seconds), color='b', linestyle='--', linewidth=2,
+    ax3.hist(zero_crossings_seconds, bins=20, alpha=0.7, color='b', edgecolor='black')
+    ax3.axvline(np.mean(zero_crossings_seconds), color='b', linestyle='--', linewidth=2,
                label=f'Mean: {np.mean(zero_crossings_seconds):.1f}s')
     zero_crossings_seconds = zero_crossings_resid * tr
-    ax4.hist(zero_crossings_seconds, bins=20, alpha=0.7, color='r', edgecolor='black')
-    ax4.axvline(np.mean(zero_crossings_seconds), color='r', linestyle='--', linewidth=2,
+    ax3.hist(zero_crossings_seconds, bins=20, alpha=0.7, color='r', edgecolor='black')
+    ax3.axvline(np.mean(zero_crossings_seconds), color='r', linestyle='--', linewidth=2,
                label=f'Mean: {np.mean(zero_crossings_seconds):.1f}s')
-    ax4.set_xlabel('First Zero-Crossing (seconds)')
-    ax4.set_ylabel('Number of Voxels')
-    ax4.set_title('Distribution of Zero-Crossings')
-    ax4.legend()
-    ax4.grid(True, alpha=0.3)
+    ax3.set_xlabel('INTs (seconds)')
+    ax3.set_ylabel('Number of Voxels')
+    ax3.set_title('Distribution of INTs')
+    ax3.legend()
+    ax3.grid(True, alpha=0.3)
     
     plt.tight_layout()
     
@@ -140,7 +142,8 @@ def plot_autocorrelation_analysis(autocorr_raw, autocorr_resid, zero_crossings_r
 def plot_repeated_measures_violins(df, color_vector=None, figsize=(15, 8), 
                                    alpha_points=0.6, alpha_lines=0.3, 
                                    violin_alpha=0.7, colormap='viridis',
-                                   line_width=0.5, point_size=2):
+                                   line_width=0.5, point_size=2, 
+                                   correlation_method='pearson'):
     """
     Create violin plots for repeated measures data with connecting lines.
     
@@ -164,11 +167,18 @@ def plot_repeated_measures_violins(df, color_vector=None, figsize=(15, 8),
         Width of connecting lines
     point_size : float, default 2
         Size of individual data points
+    correlation_method : str, default 'pearson'
+        Correlation method to use: 'pearson' or 'spearman'
         
     Returns:
     --------
     fig, ax : matplotlib figure and axes objects
     """
+    import pandas as pd
+    import numpy as np
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    from scipy.stats import pearsonr, spearmanr
     
     # Drop the first column if it's just an index
     if df.columns[0] in ['', 'Unnamed: 0'] or df.iloc[:, 0].dtype in ['int64', 'int32']:
@@ -229,6 +239,41 @@ def plot_repeated_measures_violins(df, color_vector=None, figsize=(15, 8),
         ax.scatter(x_jittered, y_values, 
                   color=point_colors[i], alpha=alpha_points, 
                   s=point_size, zorder=2)
+    
+    # Compute and annotate correlations if color_vector is provided
+    if color_vector is not None:
+        # Get overall y-axis limits for final adjustment
+        y_min, y_max = ax.get_ylim()
+        max_annotation_height = y_min  # Track highest annotation for final y-limit adjustment
+        
+        for i, condition in enumerate(conditions):
+            # Get data values for this condition
+            condition_values = df[condition].values
+            
+            # Compute correlation
+            if correlation_method.lower() == 'pearson':
+                correlation, _ = pearsonr(condition_values, color_vector)
+            elif correlation_method.lower() == 'spearman':
+                correlation, _ = spearmanr(condition_values, color_vector)
+            else:
+                raise ValueError("correlation_method must be 'pearson' or 'spearman'")
+            
+            # Find the maximum value for this specific distribution
+            condition_max = np.max(condition_values)
+            
+            # Set annotation height relative to this distribution's maximum
+            condition_range = y_max - y_min
+            annotation_height = condition_max + condition_range * 0.05  # 5% above this distribution's max
+            
+            # Track the highest annotation
+            max_annotation_height = max(max_annotation_height, annotation_height)
+            
+            # Annotate correlation above this specific violin
+            ax.text(i, annotation_height, f'r={correlation:.3f}', 
+                   ha='center', va='bottom', fontsize=8, fontweight='bold')
+        
+        # Adjust y-axis limits to accommodate the highest annotation
+        ax.set_ylim(y_min, max_annotation_height + (y_max - y_min) * 0.05)
     
     # Customize the plot
     ax.set_xlabel('Condition', fontsize=10)
@@ -357,19 +402,11 @@ def plot_subject_level_violins(df, observation_indices, figsize=(15, 8),
     # Get colors for different regions - soft orange to purple gradient
     n_obs = len(observation_indices)
     if n_obs == 1:
-        obs_colors = ['#FFB366']  # Soft orange
+        obs_colors = ['#FFA500']  # Soft orange
     else:
-        # Create a custom colormap from soft orange to purple
-        from matplotlib.colors import LinearSegmentedColormap
-        orange_color = '#FFB366'  # Soft orange
-        purple_color = '#9370DB'  # Purple
-        
-        # Create colormap from orange to purple
-        colors = [orange_color, purple_color]
-        custom_cmap = LinearSegmentedColormap.from_list('orange_purple', colors, N=256)
-        
+        sydnor_sa_cmap = create_sydnor_sa_colormap()
         # Sample colors evenly across the gradient
-        obs_colors = [custom_cmap(i / (n_obs - 1)) for i in range(n_obs)]
+        obs_colors = [sydnor_sa_cmap(i / (n_obs - 1)) for i in range(n_obs)]
     
     # Create subject colors for lines if needed
     if line_color_by == 'subject':
@@ -1416,3 +1453,232 @@ def plot_brain_surface_data(data_vector, parcellation='schaefer_400', surface='f
         print(f"Figure saved to: {save_path}")
     
     return fig, axes
+
+
+def plot_subject_timeseries_heatmap(raw_data, residual_data, design_matrix, scan_string,
+                                    figsize=(12, 18),
+                                    cmap='RdBu_r', vmin=None, vmax=None,
+                                    time_units='minutes', tr=None,
+                                    title_prefix="Neural Time Series",
+                                    save_path=None, dpi=300):
+    """
+    Plot a subject's neural time series as 2D heat matrices with task regression analysis.
+    
+    Creates a 5-row visualization showing:
+    1. Raw time series
+    2. Task-regressed residuals  
+    3. Task-related signal (Raw - Residual)
+    4. Variance of task-related signal across brain regions
+    5. Design matrix (task regressors)
+    
+    Parameters:
+    -----------
+    raw_data
+    residual_data
+    design_matrix
+    scan_string : str
+        Scan identifier, e.g., 'sub-100307_modality-MRI3T_tr-0.72_condition-task_scan-tfMRIWMLR_atlas-Schaefer4007'
+    include_residuals : bool, default True
+        Whether to compute and plot task regression analysis
+    figsize : tuple, default (12, 18)
+        Figure size (width, height)
+    cmap : str, default 'RdBu_r'
+        Colormap for neural data heatmaps
+    vmin, vmax : float, optional
+        Color scaling limits. If None, uses 2nd-98th percentiles
+    time_units : str, default 'seconds'
+        Time axis units ('seconds', 'minutes', 'timepoints')
+    tr : float, optional
+        Repetition time in seconds. Extracted from scan_string if None
+    title_prefix : str, default "Neural Time Series"
+        Title prefix
+    save_path : str, optional
+        Path to save figure
+    dpi : int, default 300
+        Resolution for saved figure
+        
+    Returns:
+    --------
+    fig : matplotlib.Figure
+    axes : tuple of matplotlib.Axes
+    """
+    
+    n_regions, n_timepoints = raw_data.shape
+    
+    # Extract TR from scan string if not provided
+    if tr is None:
+        tr_parts = [p for p in scan_string.split('_') if p.startswith('tr-')]
+        tr = float(tr_parts[0].split('-')[1]) if tr_parts else 1.0
+    
+    # Create time axis and labels
+    time_multiplier = {'seconds': tr, 'minutes': tr/60, 'timepoints': 1}[time_units]
+    time_axis = np.arange(n_timepoints) * time_multiplier
+    time_label = f"Time ({time_units})"
+    
+    # ============== GET TASK REGRESSION DATA ==============
+    task_signal = raw_data - residual_data
+    
+    # ============== SETUP PLOTTING ==============
+    # Determine color scaling
+    all_neural_data = [raw_data.flatten()]
+    if residual_data is not None:
+        all_neural_data.extend([residual_data.flatten(), task_signal.flatten()])
+    
+    combined_data = np.concatenate(all_neural_data)
+    if vmin is None:
+        vmin = np.percentile(combined_data, 2)
+    if vmax is None:
+        vmax = np.percentile(combined_data, 98)
+    
+    # Create coordinate system
+    x_coords = np.arange(n_timepoints)
+    
+    # Setup tick positions
+    n_time_ticks = min(8, max(3, n_timepoints//50))
+    time_tick_pos = np.linspace(0, n_timepoints-1, n_time_ticks, dtype=int)
+    time_tick_labels = [f'{time_axis[i]:.1f}' for i in time_tick_pos]
+    
+    n_region_ticks = min(10, max(3, n_regions//50))
+    region_tick_pos = np.linspace(0, n_regions-1, n_region_ticks, dtype=int)
+    region_tick_labels = [f'{i+1}' for i in region_tick_pos]
+    
+    # Extract subject info for title
+    try:
+        subject_parts = [p for p in scan_string.split('_') if p.startswith(('sub-', 'scan-'))]
+        subtitle = ', '.join(subject_parts)
+    except:
+        subtitle = scan_string
+    
+    # ============== CREATE FIGURE ==============
+    n_plots = 5
+    fig, axes = plt.subplots(nrows=n_plots, ncols=1, figsize=figsize)
+    
+    if n_plots == 1:
+        axes = [axes]
+    
+    # Force consistent x-limits for all plots
+    for ax in axes:
+        ax.set_xlim(0, n_timepoints - 1)
+    
+    # Helper function for adding colorbars
+    def add_colorbar(im, ax, label):
+        cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        cbar.set_label(label, rotation=270, labelpad=20, fontsize=11)
+        return cbar
+    
+    # Helper function for setting ticks
+    def set_plot_ticks(ax, show_xlabel=False):
+        ax.set_xticks(time_tick_pos)
+        ax.set_xticklabels(time_tick_labels if show_xlabel else [])
+        if show_xlabel:
+            ax.set_xlabel(time_label, fontsize=12)
+        
+        if len(region_tick_pos) > 0:
+            ax.set_yticks(region_tick_pos)
+            ax.set_yticklabels(region_tick_labels)
+    
+    # ============== PLOT 1: RAW DATA ==============
+    im1 = axes[0].imshow(raw_data, cmap=cmap, vmin=vmin, vmax=vmax, 
+                         aspect='auto', interpolation='nearest')
+    axes[0].set_title('Raw Time Series', fontsize=14, fontweight='bold', pad=8)
+    axes[0].set_ylabel('Brain Region', fontsize=12)
+    set_plot_ticks(axes[0], show_xlabel=(n_plots == 1))
+    add_colorbar(im1, axes[0], 'Signal Amplitude')
+    
+    # ============== REMAINING PLOTS (IF RESIDUALS) ==============
+    if n_plots == 5:
+        # Plot 2: Residual data
+        im2 = axes[1].imshow(residual_data, cmap=cmap, vmin=vmin, vmax=vmax,
+                             aspect='auto', interpolation='nearest')
+        axes[1].set_title('Task-Regressed Residuals', fontsize=14, fontweight='bold', pad=8)
+        axes[1].set_ylabel('Brain Region', fontsize=12)
+        set_plot_ticks(axes[1])
+        add_colorbar(im2, axes[1], 'Signal Amplitude')
+        
+        # Plot 3: Task signal
+        im3 = axes[2].imshow(task_signal, cmap='berlin', vmin=vmin, vmax=vmax,
+                             aspect='auto', interpolation='nearest')
+        axes[2].set_title('Effect of Task Regression (Raw - Residual)', fontsize=14, fontweight='bold', pad=8)
+        axes[2].set_ylabel('Brain Region', fontsize=12)
+        set_plot_ticks(axes[2])
+        add_colorbar(im3, axes[2], 'Signal Amplitude Delta')
+        
+        # Plot 4: Variance line plot
+        which_stat = 'var'
+        if which_stat == 'mean':
+            task_variance = np.mean(np.abs(task_signal), axis=0)
+            stat_label = 'Absolute Mean'
+        elif which_stat == 'var':
+            task_variance = np.var(task_signal, axis=0)
+            stat_label = 'Variance'
+
+        axes[3].plot(x_coords, task_variance, 'b-', linewidth=2, alpha=0.8)
+        axes[3].fill_between(x_coords, task_variance, alpha=0.3, color='blue')
+        axes[3].set_title(f'{stat_label} of Task-Regression Effect Across Brain Regions', 
+                          fontsize=14, fontweight='bold', pad=8)
+        axes[3].set_ylabel(f'{stat_label}', fontsize=12)
+        axes[3].grid(True, alpha=0.3)
+        axes[3].set_xticks(time_tick_pos)
+        axes[3].set_xticklabels([])
+        
+        # Add colorbar for variance plot
+        sm = ScalarMappable(cmap='Blues', norm=Normalize(vmin=np.min(task_variance), vmax=np.max(task_variance)))
+        sm.set_array([])
+        add_colorbar(sm, axes[3], 'Dummy Colorbar')
+        
+        # Plot 5: Design matrix
+        if design_matrix is not None:
+            # Convert to array and transpose
+            if hasattr(design_matrix, 'values'):
+                dm_array = design_matrix.values.T
+                regressor_names = design_matrix.columns.tolist()
+            else:
+                dm_array = design_matrix.T
+                regressor_names = [f'Regressor {i+1}' for i in range(dm_array.shape[0])]
+            
+            n_regressors = dm_array.shape[0]
+            
+            im5 = axes[4].imshow(dm_array, cmap='viridis', aspect='auto', interpolation='nearest')
+            axes[4].set_title('Design Matrix (Task Regressors)', fontsize=14, fontweight='bold', pad=8)
+            axes[4].set_ylabel('Regressors', fontsize=12)
+            
+            # Set x-axis ticks to match other plots
+            axes[4].set_xticks(time_tick_pos)
+            axes[4].set_xticklabels(time_tick_labels)
+            axes[4].set_xlabel(time_label, fontsize=12)
+            
+            # Set y-axis for regressors (not brain regions)
+            if n_regressors <= 15:
+                axes[4].set_yticks(np.arange(n_regressors))
+                truncated_names = [name[:15] + '...' if len(name) > 15 else name 
+                                   for name in regressor_names]
+                axes[4].set_yticklabels(truncated_names, fontsize=9)
+            else:
+                n_reg_ticks = min(10, n_regressors//2)
+                reg_indices = np.linspace(0, n_regressors-1, n_reg_ticks, dtype=int)
+                axes[4].set_yticks(reg_indices)
+                axes[4].set_yticklabels([f'Reg {i+1}' for i in reg_indices])
+            
+            add_colorbar(im5, axes[4], 'Regressor Weight')
+        else:
+            # No design matrix available
+            axes[4].text(0.5, 0.5, 'Design Matrix Not Available', 
+                         ha='center', va='center', transform=axes[4].transAxes, 
+                         fontsize=14, style='italic')
+            axes[4].set_title('Design Matrix (Task Regressors)', fontsize=14, fontweight='bold', pad=8)
+            axes[4].set_ylabel('Regressors', fontsize=12)
+            set_plot_ticks(axes[4], show_xlabel=True)
+    
+    # ============== FINALIZE FIGURE ==============
+    info_text = f'Regions: {n_regions}, Timepoints: {n_timepoints}, TR: {tr}s'
+    title_text = f'{title_prefix} - {subtitle}. {info_text}'
+    fig.suptitle(title_text, fontsize=16, fontweight='bold', y=0.95)
+    # fig.text(0.5, 0.02, info_text, ha='center', fontsize=10, style='italic')
+    
+    plt.tight_layout()
+    plt.subplots_adjust(top=0.89, bottom=0.07)
+    
+    if save_path:
+        plt.savefig(save_path, dpi=dpi, bbox_inches='tight', facecolor='white', edgecolor='none')
+    
+    return fig, tuple(axes)
