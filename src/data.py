@@ -1,4 +1,4 @@
-import os, glob
+import os, glob, re
 import numpy as np
 import scipy as sp
 import pandas as pd
@@ -72,28 +72,36 @@ class DataLoader:
     """
     
     # MEG sampling rate in Hz
-    MEG_SAMPLING_RATE = 508.63
+    HCPYA_MEG_SAMPLING_RATE = 508.63
     
     # Default TR values for common modalities (in seconds)
     DEFAULT_TR = {
-        'MRI3T': 0.72,
-        'MRI7T': 1.0,
-        'MEG': 1 / MEG_SAMPLING_RATE
+        'HCP-YA': {
+            'MRI3T': 0.72,
+            'MRI7T': 1.0,
+            'MEG': 1 / HCPYA_MEG_SAMPLING_RATE
+        },
+        'HCP-D': {
+            'MRI3T': 0.80            
+        }
     }
     
     # Map dataset names to base directories
     BASE_PATHS = {
         'HCP-YA': '/mnt/storage_ssd_raid/research_data/HCP_YA',
+        'HCP-D': '/mnt/storage_ssd_raid/research_data/HCP_D',
     }
     
     # Map dataset names to base directories
     RAWDATA_PATHS = {
         'HCP-YA': os.path.join(BASE_PATHS['HCP-YA'], 'HCP_1200'),
+        'HCP-D': os.path.join(BASE_PATHS['HCP-D'], 'processed'),
     }
     
     # Map dataset names to base directories
     DERIVDATA_PATHS = {
         'HCP-YA': os.path.join(BASE_PATHS['HCP-YA'], 'derivatives'),
+        'HCP-D': os.path.join(BASE_PATHS['HCP-D'], 'derivatives'),
     }
     
     # Subdirectory structure for different data types
@@ -102,6 +110,9 @@ class DataLoader:
             'MRI3T': {'fmri': os.path.join(DERIVDATA_PATHS['HCP-YA'], 'fmri_parcellated'),},
             'MRI7T': {'fmri': os.path.join(DERIVDATA_PATHS['HCP-YA'], '7T_fmri_parcellated'),},
             'MEG': {'meg': os.path.join(DERIVDATA_PATHS['HCP-YA'], 'meg_parcellated'),}
+        },
+        'HCP-D': {
+            'MRI3T': {'fmri': os.path.join(DERIVDATA_PATHS['HCP-D'], 'fmri_parcellated'),}
         }
     }
     
@@ -148,7 +159,7 @@ class DataLoader:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         
         # Set up modality parameters (TR values)
-        self.modality_params = self.DEFAULT_TR.copy()
+        self.modality_params = self.DEFAULT_TR[dataset].copy()
         
         # Initialize scan registry
         self.scan_registry = []
@@ -181,8 +192,7 @@ class DataLoader:
         self,
         subject_ids: List[str],
         atlas: str = 'Schaefer4007',
-        sessions: List[int] = [1, 2],
-        phase_encodings: List[str] = ['LR', 'RL']
+        sessions: List[int] = [1, 2]
     ) -> List[HCPScanInfo]:
         """
         Register 3T REST scans for given subjects.
@@ -197,7 +207,13 @@ class DataLoader:
             List of registered HCPScanInfo objects
         """
         modality = 'MRI3T'
+        if self.dataset == 'HCP-YA':
+            phase_encodings = ['LR', 'RL']
+        elif self.dataset == 'HCP-D':
+            # phase_encodings = ['AP', 'PA']
+            phase_encodings = ['PA', ]
         tr = self.get_tr(modality)
+
         registered = []
         for subject_id in subject_ids:
             for session in sessions:
@@ -221,8 +237,7 @@ class DataLoader:
         self,
         subject_ids: List[str],
         task_names: Optional[List[str]] = None,
-        atlas: str = 'Schaefer4007',
-        phase_encodings: List[str] = ['LR', 'RL']
+        atlas: str = 'Schaefer4007'
     ) -> List[HCPScanInfo]:
         """
         Register 3T task scans for given subjects.
@@ -236,13 +251,18 @@ class DataLoader:
         Returns:
             List of registered HCPScanInfo objects
         """
-        if task_names is None:
-            # All HCP-YA 3T tasks
-            task_names = ['WM', 'EMOTION', 'GAMBLING',
-                          'LANGUAGE', 'RELATIONAL', 'SOCIAL']
-        
         modality = 'MRI3T'
+        if self.dataset == 'HCP-YA':
+            phase_encodings = ['LR', 'RL']
+        elif self.dataset == 'HCP-D':
+            # phase_encodings = ['AP', 'PA']
+            phase_encodings = ['PA', ]
+        if self.dataset == 'HCP-YA' and task_names is None:
+            task_names = ['WM', 'EMOTION', 'GAMBLING', 'LANGUAGE', 'RELATIONAL', 'SOCIAL']
+        elif self.dataset == 'HCP-D' and task_names is None:
+            task_names = ['CARIT', 'EMOTION', 'GUESSING']
         tr = self.get_tr(modality)
+
         registered = []
         for subject_id in subject_ids:
             for task_name in task_names:
@@ -404,23 +424,35 @@ class DataLoader:
         
         return registered
     
-    def validate_scan_registry(self, verbose: bool = True) -> Dict[str, List]:
+    def validate_scan_registry(
+        self, 
+        verbose: bool = True,
+        remove_incomplete_subjects: bool = False
+    ) -> Dict[str, List]:
         """
         Check which scans in the registry exist and automatically remove non-existent ones.
+        Optionally remove all scans for subjects with any missing data.
         
         Args:
             verbose: Print detailed information
+            remove_incomplete_subjects: If True, remove all scans for any subject 
+                                    that had missing scans
             
         Returns:
-            Dictionary with 'existing' and 'missing' scan lists
+            Dictionary with keys:
+                - 'existing': List of scans that exist
+                - 'missing': List of tuples (scan, filepath/error) for missing scans
+                - 'removed_subjects': List of subject IDs removed due to incomplete data
         """
         if not self.scan_registry:
             if verbose:
                 print("Scan registry is empty.")
-            return {'existing': [], 'missing': [], 'removed': []}
+            return {'existing': [], 'missing': [], 'removed_subjects': []}
+        
+        initial_count = len(self.scan_registry)
         
         if verbose:
-            print(f"Validating {len(self.scan_registry)} scans in registry...")
+            print(f"Validating {initial_count} scans in registry...")
         
         existing_scans = []
         missing_scans = []
@@ -448,17 +480,48 @@ class DataLoader:
         for scan, _ in missing_scans:
             self.scan_registry.remove(scan)
         
+        removed_subjects = []
+        
+        # Optionally remove all scans for subjects with any missing data
+        if remove_incomplete_subjects and missing_scans:
+            if verbose:
+                print(f"\nRemoving all scans for subjects with incomplete data...")
+            
+            # Identify subjects that had missing scans
+            subjects_with_missing = set(scan.subject_id for scan, _ in missing_scans)
+            
+            # Remove all remaining scans for these subjects
+            scans_to_remove = [
+                scan for scan in self.scan_registry 
+                if scan.subject_id in subjects_with_missing
+            ]
+            
+            for scan in scans_to_remove:
+                self.scan_registry.remove(scan)
+                if verbose:
+                    print(f"  Removed: {scan} (subject {scan.subject_id} incomplete)")
+            
+            removed_subjects = sorted(list(subjects_with_missing))
+            
+            if verbose:
+                print(f"\nRemoved {len(scans_to_remove)} additional scans from "
+                    f"{len(removed_subjects)} subjects with incomplete data")
+        
         # Summary
         if verbose:
             print(f"\nValidation Summary:")
-            print(f"  Initially: {len(self.scan_registry) + len(missing_scans)} scans")
+            print(f"  Initially: {initial_count} scans")
             print(f"  Existing: {len(existing_scans)}")
-            print(f"  Removed:  {len(missing_scans)}")
+            print(f"  Missing/Removed:  {len(missing_scans)} scans")
+            if remove_incomplete_subjects:
+                print(f"  Incomplete subjects removed: {len(removed_subjects)} subjects")
+                print(f"    Additional scans removed: {len(existing_scans) - len(self.scan_registry)} scans")
             print(f"  Final registry: {len(self.scan_registry)} scans")
         
         return {
             'existing': existing_scans,
-            'missing': missing_scans
+            'missing': missing_scans,
+            'removed_subjects': removed_subjects
         }
 
     # ==================== Loading Methods ====================
@@ -498,6 +561,9 @@ class DataLoader:
         subject_id = kv_dict.get('sub', '')
         scan_name = kv_dict.get('scan', '')
         modality = kv_dict.get('modality', '')
+        
+        if self.dataset == 'HCP-D':
+            subject_id = split_hcpd_string(subject_id)
         
         try:
             if modality == 'MEG':
@@ -559,12 +625,23 @@ class DataLoader:
         else:
             raise ValueError(f"Unknown modality: {scan.modality}")
         
+        # path modifier
+        if self.dataset == 'HCP-YA':
+            path_modifier = None
+        elif self.dataset == 'HCP-D':
+            path_modifier = 'ses-01'
+
         # Subject directory
-        subject_dir = base_path / str(scan.subject_id)
+        subject_dir = base_path / str('sub-' + scan.subject_id)
+        if path_modifier is not None:
+            subject_dir = Path.joinpath(subject_dir, path_modifier)
         
         # Construct filename
         task_str = scan.get_task_string()
-        filename_base = f"{scan.subject_id}_task-{task_str}_atlas-{scan.atlas}_stat-mean_timeseries"
+        if self.dataset == 'HCP-YA':
+            filename_base = f"sub-{scan.subject_id}_task-{task_str}_atlas-{scan.atlas}_stat-mean_timeseries"
+        elif self.dataset == 'HCP-D':
+            filename_base = f"sub-{scan.subject_id}_ses-01_task-{task_str}_atlas-{scan.atlas}_stat-mean_timeseries"
         
         # Extension depends on modality
         if scan.modality == 'MEG':
@@ -1001,3 +1078,7 @@ def extract_block_numbers(data):
     
     block_numbers = data['BlockNumber'].values
     return [int(num) if not pd.isna(num) else -1 for num in block_numbers]
+
+def split_hcpd_string(s):
+    """Split string by inserting underscores before V and M."""
+    return re.sub(r'([VM])', r'_\1', s)
