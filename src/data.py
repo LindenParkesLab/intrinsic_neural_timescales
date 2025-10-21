@@ -19,7 +19,6 @@ class ScanInfo:
         sub-00395_ses-03_task-reversallearning_space-MNI152NLin2009cAsym_seg-Schaefer4007_stat-mean_timeseries.tsv
     """
     subject_id: str
-    session: str  # e.g., '01', '02', '03'
     task: str  # e.g., 'rest', 'reversallearning', 'nback'
     space: str  # e.g., 'MNI152NLin2009cAsym', 'fsLR'
     seg: str  # segmentation, e.g., 'Schaefer4007', 'Glasser360'
@@ -27,6 +26,7 @@ class ScanInfo:
     tr: float
     
     # Optional fields
+    session: Optional[str] = None  # e.g., '01', '02', '03'
     stat: Optional[str] = 'mean'  # Usually 'mean' for timeseries
     run: Optional[str] = None  # e.g., '01', '02' for multiple runs of same task
     desc: Optional[str] = None  # Optional description field
@@ -42,12 +42,14 @@ class ScanInfo:
         """Get string version of scan"""
         entities = [
             f"sub-{self.subject_id}",
-            f"ses-{self.session}",
             f"task-{self.task}",
             f"space-{self.space}",
             f"seg-{self.seg}"
         ]
-        
+            
+        if self.session is not None:
+            entities.append(f"ses-{self.session}")
+
         entities.append(f"modality-{self.modality}")
         entities.append(f"tr-{self.tr}")
         entities.append(f"condition-{self.condition}")
@@ -92,6 +94,9 @@ class DataLoader:
         'WAND': {
             'MRI3T': 2.0            
         },
+        'UCLA': {
+            'MRI3T': 2.0            
+        },
     }
     
     # Map dataset names to base directories
@@ -99,6 +104,7 @@ class DataLoader:
         'HCP-YA': '/mnt/storage_ssd_raid/research_data/HCP_YA',
         'HCP-D': '/mnt/storage_ssd_raid/research_data/HCP_D',
         'WAND': '/mnt/storage_ssd_raid/research_data/WAND',
+        'UCLA': '/mnt/storage_ssd_raid/research_data/UCLA_CNP_LA5c',
     }
     
     # Map dataset names to base directories
@@ -106,6 +112,7 @@ class DataLoader:
         'HCP-YA': os.path.join(BASE_PATHS['HCP-YA'], 'HCP_1200'),
         'HCP-D': os.path.join(BASE_PATHS['HCP-D'], 'processed'),
         'WAND': os.path.join(BASE_PATHS['WAND'], 'bids'),
+        'UCLA': os.path.join(BASE_PATHS['UCLA'], 'bids'),
     }
     
     # Map dataset names to base directories
@@ -113,6 +120,7 @@ class DataLoader:
         'HCP-YA': os.path.join(BASE_PATHS['HCP-YA'], 'derivatives'),
         'HCP-D': os.path.join(BASE_PATHS['HCP-D'], 'derivatives'),
         'WAND': os.path.join(BASE_PATHS['WAND'], 'derivatives'),
+        'UCLA': os.path.join(BASE_PATHS['UCLA'], 'derivatives'),
     }
     
     # Subdirectory structure for different data types
@@ -127,6 +135,9 @@ class DataLoader:
         },
         'WAND': {
             'MRI3T': {'fmri': os.path.join(DERIVDATA_PATHS['WAND'], 'xcpd'),}
+        },
+        'UCLA': {
+            'MRI3T': {'fmri': os.path.join(DERIVDATA_PATHS['UCLA'], 'xcpd'),}
         },
     }
     
@@ -444,11 +455,16 @@ class DataLoader:
         else:
             raise ValueError(f"Unknown modality: {scan.modality}")
         
-        # Subject directory
-        subject_dir = base_path / f'sub-{scan.subject_id}' / f'ses-{scan.session}' / 'func'
-        
-        # Construct filename
-        filename_base = f"sub-{scan.subject_id}_ses-{scan.session}_task-{scan.task}_space-{scan.space}_seg-{scan.seg}_stat-mean_timeseries"
+        if scan.session is None:
+            # Subject directory
+            subject_dir = base_path / f'sub-{scan.subject_id}' / 'func'
+            # Construct filename
+            filename_base = f"sub-{scan.subject_id}_task-{scan.task}_space-{scan.space}_seg-{scan.seg}_stat-mean_timeseries"
+        else:
+            # Subject directory
+            subject_dir = base_path / f'sub-{scan.subject_id}' / f'ses-{scan.session}' / 'func'
+            # Construct filename
+            filename_base = f"sub-{scan.subject_id}_ses-{scan.session}_task-{scan.task}_space-{scan.space}_seg-{scan.seg}_stat-mean_timeseries"
         
         # Extension depends on modality
         if self.dataset == 'HCP-YA' and scan.modality == 'MEG':
