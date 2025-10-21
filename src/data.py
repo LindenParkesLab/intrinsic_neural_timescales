@@ -10,54 +10,59 @@ from sklearn.linear_model import LinearRegression
 
 # Enhanced ScanInfo dataclass that matches HCP conventions
 @dataclass
-class HCPScanInfo:
-    """Container for HCP scan metadata matching exact naming conventions."""
+class ScanInfo:
+    """Container for preprocessed scan metadata matching BIDS naming conventions.
+    
+    Example filename:
+        sub-100206_ses-01_task-rfMRIREST1LR_space-fsLR_seg-Schaefer4007_stat-mean_timeseries.ptseries.nii
+        sub-100206_ses-01_task-tfMRIWMRL_space-fsLR_seg-Schaefer4007_stat-mean_timeseries.ptseries.nii
+        sub-00395_ses-03_task-reversallearning_space-MNI152NLin2009cAsym_seg-Schaefer4007_stat-mean_timeseries.tsv
+    """
     subject_id: str
-    condition: str  # 'rest', 'task'
-    atlas: str  # e.g., 'Schaefer4007'
-    modality: str  # 'MRI3T', 'MRI7T', 'MEG'
+    session: str  # e.g., '01', '02', '03'
+    task: str  # e.g., 'rest', 'reversallearning', 'nback'
+    space: str  # e.g., 'MNI152NLin2009cAsym', 'fsLR'
+    seg: str  # segmentation, e.g., 'Schaefer4007', 'Glasser360'
+    modality: str
     tr: float
     
-    # Modality-specific fields
-    # For 3T/7T fMRI:
-    task_name: Optional[str] = None  # 'WM', 'GAMBLING', 'EMOTION', etc.
-    phase_encoding: Optional[str] = None  # 'LR', 'RL' for 3T; 'PA', 'AP' for 7T
-    scan_number: Optional[int] = None  # 1-2 for 3T REST, 1-4 for 7T REST/MOVIE
+    # Optional fields
+    stat: Optional[str] = 'mean'  # Usually 'mean' for timeseries
+    run: Optional[str] = None  # e.g., '01', '02' for multiple runs of same task
+    desc: Optional[str] = None  # Optional description field
+    den: Optional[str] = None  # Density for surface data, e.g., '91k', '32k'
     
-    # For MEG:
-    meg_scan_number: Optional[int] = None  # 3-5 for REST, 6-7 for WM
-    meg_task_name: Optional[str] = None  # 'Restin' or 'Wrkmem'
-    
-    def get_task_string(self) -> str:
-        """Get the exact task string as it appears in HCP filenames."""
-        
-        if self.modality == 'MRI3T':
-            if self.condition == 'rest':
-                # 3T REST: rfMRIREST1LR, rfMRIREST2RL, etc.
-                return f"rfMRIREST{self.scan_number}{self.phase_encoding}"
-            elif self.condition == 'task':
-                # 3T Task: tfMRIEMOTIONLR, tfMRIWMRL, etc. (no underscore!)
-                return f"tfMRI{self.task_name}{self.phase_encoding}"
-                
-        elif self.modality == 'MRI7T':
-            if self.condition == 'rest':
-                # 7T REST: rfMRIREST17TPA, rfMRIREST27TAP, etc.
-                return f"rfMRIREST{self.scan_number}7T{self.phase_encoding}"
-            elif self.condition == 'task':
-                # 7T Movie: tfMRIMOVIE17TAP, tfMRIMOVIE27TPA, etc.
-                return f"tfMRIMOVIE{self.scan_number}7T{self.phase_encoding}"
-                
-        elif self.modality == 'MEG':
-            # MEG: 3-Restin, 6-Wrkmem, etc.
-            return f"{self.meg_scan_number}{self.meg_task_name}"
-        
-        raise ValueError(f"Cannot construct task string for {self}")
+    def __post_init__(self):
+        if 'rest' in self.task.lower():
+            self.condition = 'rest'
+        else:
+            self.condition = 'task'
     
     def __str__(self):
-        """Return key-value formatted string representation."""
-        task_str = self.get_task_string()
-        return f"sub-{self.subject_id}_modality-{self.modality}_tr-{self.tr}_condition-{self.condition}_scan-{task_str}_atlas-{self.atlas}"
-
+        """Get string version of scan"""
+        entities = [
+            f"sub-{self.subject_id}",
+            f"ses-{self.session}",
+            f"task-{self.task}",
+            f"space-{self.space}",
+            f"seg-{self.seg}"
+        ]
+        
+        entities.append(f"modality-{self.modality}")
+        entities.append(f"tr-{self.tr}")
+        entities.append(f"condition-{self.condition}")
+        
+        if self.run is not None:
+            entities.append(f"run-{self.run}")
+        
+        if self.den is not None:
+            entities.append(f"den-{self.den}")
+        
+        if self.desc is not None:
+            entities.append(f"desc-{self.desc}")
+        
+        return "_".join(entities)
+        
 class DataLoader:
     """
     Class for generating and analyzing neural timescales from preprocessed timeseries data.
@@ -83,37 +88,46 @@ class DataLoader:
         },
         'HCP-D': {
             'MRI3T': 0.80            
-        }
+        },
+        'WAND': {
+            'MRI3T': 2.0            
+        },
     }
     
     # Map dataset names to base directories
     BASE_PATHS = {
         'HCP-YA': '/mnt/storage_ssd_raid/research_data/HCP_YA',
         'HCP-D': '/mnt/storage_ssd_raid/research_data/HCP_D',
+        'WAND': '/mnt/storage_ssd_raid/research_data/WAND',
     }
     
     # Map dataset names to base directories
     RAWDATA_PATHS = {
         'HCP-YA': os.path.join(BASE_PATHS['HCP-YA'], 'HCP_1200'),
         'HCP-D': os.path.join(BASE_PATHS['HCP-D'], 'processed'),
+        'WAND': os.path.join(BASE_PATHS['WAND'], 'bids'),
     }
     
     # Map dataset names to base directories
     DERIVDATA_PATHS = {
         'HCP-YA': os.path.join(BASE_PATHS['HCP-YA'], 'derivatives'),
         'HCP-D': os.path.join(BASE_PATHS['HCP-D'], 'derivatives'),
+        'WAND': os.path.join(BASE_PATHS['WAND'], 'derivatives'),
     }
     
     # Subdirectory structure for different data types
     SUBDIR_MAP = {
         'HCP-YA': {
-            'MRI3T': {'fmri': os.path.join(DERIVDATA_PATHS['HCP-YA'], 'fmri_parcellated'),},
-            'MRI7T': {'fmri': os.path.join(DERIVDATA_PATHS['HCP-YA'], '7T_fmri_parcellated'),},
+            'MRI3T': {'fmri': os.path.join(DERIVDATA_PATHS['HCP-YA'], 'parcellated_data'),},
+            'MRI7T': {'fmri': os.path.join(DERIVDATA_PATHS['HCP-YA'], 'parcellated_data_7T'),},
             'MEG': {'meg': os.path.join(DERIVDATA_PATHS['HCP-YA'], 'meg_parcellated'),}
         },
         'HCP-D': {
-            'MRI3T': {'fmri': os.path.join(DERIVDATA_PATHS['HCP-D'], 'fmri_parcellated'),}
-        }
+            'MRI3T': {'fmri': os.path.join(DERIVDATA_PATHS['HCP-D'], 'parcellated_data'),}
+        },
+        'WAND': {
+            'MRI3T': {'fmri': os.path.join(DERIVDATA_PATHS['WAND'], 'xcpd'),}
+        },
     }
     
     def __init__(
@@ -188,242 +202,44 @@ class DataLoader:
         return self.modality_params[modality]
 
     # ==================== Registration Methods ====================
-    def register_3t_rest_scans(
+    def register_scans(
         self,
         subject_ids: List[str],
-        atlas: str = 'Schaefer4007',
-        sessions: List[int] = [1, 2]
-    ) -> List[HCPScanInfo]:
+        sessions: List[str],
+        tasks: List[str],
+        space: str,
+        seg: str,
+        modality: str
+    ) -> List['ScanInfo']:
         """
-        Register 3T REST scans for given subjects.
+        Register XCP-D preprocessed scans for given subjects.
         
         Args:
-            subject_ids: List of subject IDs
-            atlas: Atlas name (default 'Schaefer4007')
-            sessions: REST sessions to include (1 and/or 2)
-            phase_encodings: Phase encodings to include ('LR' and/or 'RL')
+            subject_ids: List of subject IDs (e.g., ['00395', '00396'])
         
         Returns:
-            List of registered HCPScanInfo objects
+            List of registered ScanInfo objects
         """
-        modality = 'MRI3T'
-        if self.dataset == 'HCP-YA':
-            phase_encodings = ['LR', 'RL']
-        elif self.dataset == 'HCP-D':
-            # phase_encodings = ['AP', 'PA']
-            phase_encodings = ['PA', ]
-        tr = self.get_tr(modality)
-
+        tr = self.get_tr(modality=modality)
         registered = []
         for subject_id in subject_ids:
             for session in sessions:
-                for pe in phase_encodings:
-                    scan = HCPScanInfo(
+                for task in tasks:
+                    scan = ScanInfo(
                         subject_id=str(subject_id),
-                        condition='rest',
-                        atlas=atlas,
+                        session=session,
+                        task=task,
+                        space=space,
+                        seg=seg,
                         modality=modality,
-                        scan_number=session,
-                        phase_encoding=pe,
                         tr=tr
                     )
-                    
                     if scan not in self.scan_registry:
                         self.scan_registry.append(scan)
                     registered.append(scan)
+        
         return registered
-    
-    def register_3t_task_scans(
-        self,
-        subject_ids: List[str],
-        task_names: Optional[List[str]] = None,
-        atlas: str = 'Schaefer4007'
-    ) -> List[HCPScanInfo]:
-        """
-        Register 3T task scans for given subjects.
-        
-        Args:
-            subject_ids: List of subject IDs
-            task_names: Task names (default: all HCP tasks)
-            atlas: Atlas name
-            phase_encodings: Phase encodings to include
-        
-        Returns:
-            List of registered HCPScanInfo objects
-        """
-        modality = 'MRI3T'
-        if self.dataset == 'HCP-YA':
-            phase_encodings = ['LR', 'RL']
-        elif self.dataset == 'HCP-D':
-            # phase_encodings = ['AP', 'PA']
-            phase_encodings = ['PA', ]
-        if self.dataset == 'HCP-YA' and task_names is None:
-            task_names = ['WM', 'EMOTION', 'GAMBLING', 'LANGUAGE', 'RELATIONAL', 'SOCIAL']
-        elif self.dataset == 'HCP-D' and task_names is None:
-            task_names = ['CARIT', 'EMOTION', 'GUESSING']
-        tr = self.get_tr(modality)
 
-        registered = []
-        for subject_id in subject_ids:
-            for task_name in task_names:
-                for pe in phase_encodings:
-                    scan = HCPScanInfo(
-                        subject_id=str(subject_id),
-                        condition='task',
-                        atlas=atlas,
-                        modality='MRI3T',
-                        task_name=task_name,
-                        phase_encoding=pe,
-                        tr=tr
-                    )
-                    
-                    if scan not in self.scan_registry:
-                        self.scan_registry.append(scan)
-                    registered.append(scan)
-        return registered
-    
-    def register_7t_rest_scans(
-        self,
-        subject_ids: List[str],
-        atlas: str = 'Schaefer4007',
-        sessions: List[int] = [1, 2, 3, 4]
-    ) -> List[HCPScanInfo]:
-        """
-        Register 7T REST scans for given subjects.
-        Note: 7T REST uses alternating PA/AP phase encoding.
-        
-        Args:
-            subject_ids: List of subject IDs
-            atlas: Atlas name
-            sessions: REST sessions to include (1-4)
-        
-        Returns:
-            List of registered HCPScanInfo objects
-        """
-        # 7T REST phase encoding pattern: 1=PA, 2=AP, 3=PA, 4=AP
-        pe_pattern = {1: 'PA', 2: 'AP', 3: 'PA', 4: 'AP'}
-        
-        modality = 'MRI7T'
-        tr = self.get_tr(modality)
-        registered = []
-        for subject_id in subject_ids:
-            for session in sessions:
-                scan = HCPScanInfo(
-                    subject_id=str(subject_id),
-                    condition='rest',
-                    atlas=atlas,
-                    modality=modality,
-                    scan_number=session,
-                    phase_encoding=pe_pattern[session],
-                    tr=tr
-                )
-                
-                if scan not in self.scan_registry:
-                    self.scan_registry.append(scan)
-                registered.append(scan)
-        return registered
-    
-    def register_7t_movie_scans(
-        self,
-        subject_ids: List[str],
-        atlas: str = 'Schaefer4007',
-        movies: List[int] = [1, 2, 3, 4]
-    ) -> List[HCPScanInfo]:
-        """
-        Register 7T movie scans for given subjects.
-        Note: 7T movies use alternating AP/PA phase encoding.
-        
-        Args:
-            subject_ids: List of subject IDs
-            atlas: Atlas name
-            movies: Movie numbers to include (1-4)
-        
-        Returns:
-            List of registered HCPScanInfo objects
-        """
-        # 7T movie phase encoding pattern: 1=AP, 2=PA, 3=PA, 4=AP
-        pe_pattern = {1: 'AP', 2: 'PA', 3: 'PA', 4: 'AP'}
-        
-        modality = 'MRI7T'
-        tr = self.get_tr(modality)
-        registered = []
-        for subject_id in subject_ids:
-            for movie_num in movies:
-                scan = HCPScanInfo(
-                    subject_id=str(subject_id),
-                    condition='task',
-                    atlas=atlas,
-                    modality=modality,
-                    scan_number=movie_num,
-                    phase_encoding=pe_pattern[movie_num],
-                    tr=tr
-                )
-                
-                if scan not in self.scan_registry:
-                    self.scan_registry.append(scan)
-                registered.append(scan)
-        return registered
-    
-    def register_meg_scans(
-        self,
-        subject_ids: List[str],
-        atlas: str = 'Schaefer4007',
-        rest_runs: List[int] = None, # [3, 4, 5],
-        wm_runs: List[int] = None # [6, 7]
-    ) -> List[HCPScanInfo]:
-        """
-        Register MEG scans for given subjects.
-        
-        Args:
-            subject_ids: List of subject IDs
-            atlas: Atlas name
-            rest_runs: REST run numbers (typically 3, 4, 5)
-            wm_runs: Working memory run numbers (typically 6, 7)
-        
-        Returns:
-            List of registered HCPScanInfo objects
-        """
-        modality = 'MEG'
-        tr = self.get_tr(modality)
-        registered = []
-        
-        for subject_id in subject_ids:
-            # Register REST runs
-            if rest_runs is not None:
-                for run_num in rest_runs:
-                    scan = HCPScanInfo(
-                        subject_id=str(subject_id),
-                        condition='rest',
-                        atlas=atlas,
-                        modality=modality,
-                        meg_scan_number=run_num,
-                        meg_task_name='Restin',
-                        tr=tr
-                    )
-                    
-                    if scan not in self.scan_registry:
-                        self.scan_registry.append(scan)
-                    registered.append(scan)
-            
-            # Register WM runs
-            if wm_runs is not None:
-                for run_num in wm_runs:
-                    scan = HCPScanInfo(
-                        subject_id=str(subject_id),
-                        condition='task',
-                        atlas=atlas,
-                        modality=modality,
-                        meg_scan_number=run_num,
-                        meg_task_name='Wrkmem',
-                        tr=tr
-                    )
-
-                    if scan not in self.scan_registry:
-                        self.scan_registry.append(scan)
-                    registered.append(scan)
-        
-        return registered
-    
     def validate_scan_registry(
         self, 
         verbose: bool = True,
@@ -453,7 +269,7 @@ class DataLoader:
         
         if verbose:
             print(f"Validating {initial_count} scans in registry...")
-        
+
         existing_scans = []
         missing_scans = []
         
@@ -461,11 +277,13 @@ class DataLoader:
         for scan in self.scan_registry:
             try:
                 filepath = self.get_scan_filepath(scan)
-                task_events = self.get_task_events(str(scan))
+                task_events = self.get_task_events(scan)
                 
-                if filepath.exists() and scan.condition == 'task' and task_events is not None:
-                    existing_scans.append(scan)
-                elif filepath.exists() and scan.condition == 'rest' and task_events is None:
+                # if filepath.exists() and scan.condition == 'task' and task_events is not None:
+                #     existing_scans.append(scan)
+                # elif filepath.exists() and scan.condition == 'rest' and task_events is None:
+                #     existing_scans.append(scan)
+                if filepath.exists():
                     existing_scans.append(scan)
                 else:
                     missing_scans.append((scan, filepath))
@@ -554,12 +372,13 @@ class DataLoader:
         except:
             print(f"Warning: Could not find df_behavior.csv at expected locations")
 
-    def get_task_events(self, scan_key):
+    def get_task_events(self, scan):
         # Parse scan key
-        kv_dict = parse_scan_string(scan_key)
+        kv_dict = parse_scan_string(str(scan))
+        # print(kv_dict)
         
         subject_id = kv_dict.get('sub', '')
-        scan_name = kv_dict.get('scan', '')
+        task = kv_dict.get('task', '')
         modality = kv_dict.get('modality', '')
         
         if self.dataset == 'HCP-D':
@@ -567,27 +386,27 @@ class DataLoader:
         
         try:
             if modality == 'MEG':
-                subdir_str = f'{scan_name[:1]}-{scan_name[1:]}'
-                task_events_file_path = glob.glob(os.path.join(self.rawdata_dir, subject_id, 'unprocessed', 'MEG', subdir_str, 'EPRIME', f'{subject_id}_*_{scan_name[1:]}_*.xlsx'))[0]
+                subdir_str = f'{task[:1]}-{task[1:]}'
+                task_events_file_path = glob.glob(os.path.join(self.rawdata_dir, subject_id, 'unprocessed', 'MEG', subdir_str, 'EPRIME', f'{subject_id}_*_{task[1:]}_*.xlsx'))[0]
                 events = get_task_events_meg(task_events_file_path=task_events_file_path, verbose=False)
                 task_events = events[['onset', 'duration', 'trial_type']]
             elif modality == 'MRI3T':
                 results_dir = os.path.join(self.rawdata_dir, subject_id, 'MNINonLinear', 'Results')
                 contents = os.listdir(results_dir)
                 contents_joined = [''.join(content.split('_')) for content in contents]
-                idx = contents_joined.index(scan_name)
+                idx = contents_joined.index(task)
                 ev_dir = os.path.join(results_dir, contents[idx], 'EVs')
                 task_events = get_task_events_fmri(ev_dir)
             elif modality == 'MRI7T':
                 movie_metadata_dir = os.path.join(self.output_dir, 'data', 'movie_data')
                 
-                if 'MOVIE1' in scan_name:
+                if 'MOVIE1' in task:
                     timing_file = '7T_MOVIE1_CC1_v2_Video_Timing.csv'
-                elif 'MOVIE2' in scan_name:
+                elif 'MOVIE2' in task:
                     timing_file = '7T_MOVIE2_HO1_v2_Video_Timing.csv'
-                elif 'MOVIE3' in scan_name:
+                elif 'MOVIE3' in task:
                     timing_file = '7T_MOVIE3_CC2_v2_Video_Timing.csv'
-                elif 'MOVIE4' in scan_name:
+                elif 'MOVIE4' in task:
                     timing_file = '7T_MOVIE4_HO2_v2_Video_Timing.csv'
                 
                 block_design_file = os.path.join(movie_metadata_dir, timing_file)
@@ -605,12 +424,12 @@ class DataLoader:
         except:
             return None
     
-    def get_scan_filepath(self, scan: HCPScanInfo) -> Path:
+    def get_scan_filepath(self, scan: ScanInfo) -> Path:
         """
         Get the exact filepath for an HCP scan.
         
         Args:
-            scan: HCPScanInfo object
+            scan: ScanInfo object
         
         Returns:
             Path to the timeseries file (without checking existence)
@@ -625,35 +444,27 @@ class DataLoader:
         else:
             raise ValueError(f"Unknown modality: {scan.modality}")
         
-        # path modifier
-        if self.dataset == 'HCP-YA':
-            path_modifier = None
-        elif self.dataset == 'HCP-D':
-            path_modifier = 'ses-01'
-
         # Subject directory
-        subject_dir = base_path / str('sub-' + scan.subject_id)
-        if path_modifier is not None:
-            subject_dir = Path.joinpath(subject_dir, path_modifier)
+        subject_dir = base_path / f'sub-{scan.subject_id}' / f'ses-{scan.session}' / 'func'
         
         # Construct filename
-        task_str = scan.get_task_string()
-        if self.dataset == 'HCP-YA':
-            filename_base = f"sub-{scan.subject_id}_task-{task_str}_atlas-{scan.atlas}_stat-mean_timeseries"
-        elif self.dataset == 'HCP-D':
-            filename_base = f"sub-{scan.subject_id}_ses-01_task-{task_str}_atlas-{scan.atlas}_stat-mean_timeseries"
+        filename_base = f"sub-{scan.subject_id}_ses-{scan.session}_task-{scan.task}_space-{scan.space}_seg-{scan.seg}_stat-mean_timeseries"
         
         # Extension depends on modality
-        if scan.modality == 'MEG':
+        if self.dataset == 'HCP-YA' and scan.modality == 'MEG':
             filename = f"{filename_base}.ptseries.npy"
-        else:
+        elif self.dataset == 'HCP-YA' and scan.modality != 'MEG':
             filename = f"{filename_base}.ptseries.nii"
-        
+        elif self.dataset == 'HCP-D':
+            filename = f"{filename_base}.ptseries.nii"
+        else:
+            filename = f"{filename_base}.tsv"
+            
         return subject_dir / filename
     
     def load_scan_timeseries(
         self,
-        scan: HCPScanInfo,
+        scan: ScanInfo,
         cache: bool = True,
         nuisance_regression: bool = True,
         standardize: bool = False,
@@ -664,7 +475,7 @@ class DataLoader:
         Load timeseries for a single HCP scan.
         
         Args:
-            scan: HCPScanInfo object
+            scan: ScanInfo object
             cache: Whether to cache the data
             verbose: Print loading details
         
@@ -693,6 +504,9 @@ class DataLoader:
         elif '.nii' in filepath.suffixes:
             img = nib.load(str(filepath))
             timeseries = img.get_fdata()
+        elif filepath.suffix == '.tsv':
+            df = pd.read_csv(filepath, sep='\t')
+            timeseries = df.values  # shape: (n_timepoints, n_parcels)
         else:
             raise ValueError(f"Unknown file type: {filepath}")
         
@@ -735,7 +549,7 @@ class DataLoader:
         subjects: Optional[List[str]] = None,
         modalities: Optional[List[str]] = None,
         conditions: Optional[List[str]] = None,
-        atlas: Optional[str] = None,
+        seg: Optional[str] = None,
         cache: bool = False,
         nuisance_regression: bool = True,
         standardize: bool = False,
@@ -749,7 +563,7 @@ class DataLoader:
             subjects: Filter to specific subjects
             modalities: Filter to specific modalities
             conditions: Filter to specific conditions
-            atlas: Filter to specific atlas
+            seg: Filter to specific seg
             cache: Whether to cache data
             nuisance_regression: Whether to apply nuisance regression
             verbose: Print progress
@@ -767,7 +581,7 @@ class DataLoader:
                 continue
             if conditions and scan.condition not in conditions:
                 continue
-            if atlas and scan.atlas != atlas:
+            if seg and scan.seg != seg:
                 continue
             scans_to_load.append(scan)
         
@@ -784,7 +598,7 @@ class DataLoader:
         for i, scan in enumerate(scans_to_load):
             try:
                 if verbose and i % 10 == 0:
-                    print(f"  [{i+1}/{len(scans_to_load)}] {scan.subject_id} {scan.get_task_string()}")
+                    print(f"  [{i+1}/{len(scans_to_load)}] {scan.subject_id} {scan.task}")
                 
                 loaded[str(scan)] = self.load_scan_timeseries(
                     scan, 
@@ -838,16 +652,8 @@ class DataLoader:
             # Parse the key-value string
             scan_str = str(scan)
             kv_dict = parse_scan_string(scan_str)
-            
-            scan_data.append({
-                'scan_string': scan_str,
-                'subject_id': kv_dict.get('sub', ''),
-                'modality': kv_dict.get('modality', ''),
-                'scan': kv_dict.get('scan', ''),
-                'atlas': kv_dict.get('atlas', ''),
-                'condition': scan.condition,
-                'tr': self.get_tr(scan.modality)
-            })
+            kv_dict = {'scan_string': scan_str, **kv_dict}
+            scan_data.append(kv_dict)
         
         return pd.DataFrame(scan_data)
     
@@ -898,10 +704,10 @@ def parse_scan_string(scan_string: str) -> Dict[str, str]:
     Parse a key-value formatted scan string into a dictionary.
     
     Args:
-        scan_string: String like "sub-100307_modality-MRI3T_scan-rfMRIREST1LR_atlas-Schaefer4007"
+        scan_string: String like "sub-100307_modality-MRI3T_task-rfMRIREST1LR_atlas-Schaefer4007"
     
     Returns:
-        Dictionary with keys: sub, modality, scan, atlas, etc.
+        Dictionary with keys: sub, modality, task, seg, etc.
     """
     parts = scan_string.split('_')
     kv_dict = {}
@@ -927,7 +733,7 @@ def build_scan_string(**kwargs) -> str:
     """
     parts = []
     # Ensure consistent ordering
-    key_order = ['sub', 'modality', 'scan', 'atlas', 'stat']
+    key_order = ['sub', 'modality', 'task', 'seg', 'stat']
     
     for key in key_order:
         if key in kwargs and kwargs[key] is not None:
