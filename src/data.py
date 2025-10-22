@@ -31,6 +31,7 @@ class ScanInfo:
     run: Optional[str] = None  # e.g., '01', '02' for multiple runs of same task
     desc: Optional[str] = None  # Optional description field
     den: Optional[str] = None  # Density for surface data, e.g., '91k', '32k'
+    rbc: Optional[bool] = False
     
     def __post_init__(self):
         if 'rest' in self.task.lower():
@@ -94,6 +95,9 @@ class DataLoader:
         'WAND': {
             'MRI3T': 2.0            
         },
+        'PNC': {
+            'MRI3T': 3.0            
+        },
         'UCLA': {
             'MRI3T': 2.0            
         },
@@ -104,6 +108,7 @@ class DataLoader:
         'HCP-YA': '/mnt/storage_ssd_raid/research_data/HCP_YA',
         'HCP-D': '/mnt/storage_ssd_raid/research_data/HCP_D',
         'WAND': '/mnt/storage_ssd_raid/research_data/WAND',
+        'PNC': '/mnt/storage_ssd_raid/research_data/RBC/PNC',
         'UCLA': '/mnt/storage_ssd_raid/research_data/UCLA_CNP_LA5c',
     }
     
@@ -112,6 +117,7 @@ class DataLoader:
         'HCP-YA': os.path.join(BASE_PATHS['HCP-YA'], 'HCP_1200'),
         'HCP-D': os.path.join(BASE_PATHS['HCP-D'], 'processed'),
         'WAND': os.path.join(BASE_PATHS['WAND'], 'bids'),
+        'PNC': os.path.join(BASE_PATHS['PNC'], 'bids'),
         'UCLA': os.path.join(BASE_PATHS['UCLA'], 'bids'),
     }
     
@@ -120,6 +126,7 @@ class DataLoader:
         'HCP-YA': os.path.join(BASE_PATHS['HCP-YA'], 'derivatives'),
         'HCP-D': os.path.join(BASE_PATHS['HCP-D'], 'derivatives'),
         'WAND': os.path.join(BASE_PATHS['WAND'], 'derivatives'),
+        'PNC': os.path.join(BASE_PATHS['PNC'], 'derivatives'),
         'UCLA': os.path.join(BASE_PATHS['UCLA'], 'derivatives'),
     }
     
@@ -135,6 +142,9 @@ class DataLoader:
         },
         'WAND': {
             'MRI3T': {'fmri': os.path.join(DERIVDATA_PATHS['WAND'], 'xcpd'),}
+        },
+        'PNC': {
+            'MRI3T': {'fmri': os.path.join(DERIVDATA_PATHS['PNC'], 'rbc_cpac', 'cpac_RBCv0'),}
         },
         'UCLA': {
             'MRI3T': {'fmri': os.path.join(DERIVDATA_PATHS['UCLA'], 'xcpd'),}
@@ -232,6 +242,11 @@ class DataLoader:
             List of registered ScanInfo objects
         """
         tr = self.get_tr(modality=modality)
+        if self.dataset == 'PNC':
+            rbc = True
+        else:
+            rbc = False
+        
         registered = []
         for subject_id in subject_ids:
             for session in sessions:
@@ -243,7 +258,8 @@ class DataLoader:
                         space=space,
                         seg=seg,
                         modality=modality,
-                        tr=tr
+                        tr=tr,
+                        rbc=rbc
                     )
                     if scan not in self.scan_registry:
                         self.scan_registry.append(scan)
@@ -290,11 +306,11 @@ class DataLoader:
                 filepath = self.get_scan_filepath(scan)
                 task_events = self.get_task_events(scan)
                 
-                # if filepath.exists() and scan.condition == 'task' and task_events is not None:
-                #     existing_scans.append(scan)
-                # elif filepath.exists() and scan.condition == 'rest' and task_events is None:
-                #     existing_scans.append(scan)
-                if filepath.exists():
+                # if filepath.exists():
+                    # existing_scans.append(scan)
+                if filepath.exists() and scan.condition == 'task' and task_events is not None:
+                    existing_scans.append(scan)
+                elif filepath.exists() and scan.condition == 'rest' and task_events is None:
                     existing_scans.append(scan)
                 else:
                     missing_scans.append((scan, filepath))
@@ -401,13 +417,23 @@ class DataLoader:
                 task_events_file_path = glob.glob(os.path.join(self.rawdata_dir, subject_id, 'unprocessed', 'MEG', subdir_str, 'EPRIME', f'{subject_id}_*_{task[1:]}_*.xlsx'))[0]
                 events = get_task_events_meg(task_events_file_path=task_events_file_path, verbose=False)
                 task_events = events[['onset', 'duration', 'trial_type']]
-            elif modality == 'MRI3T':
+            elif modality == 'MRI3T' and self.dataset != 'PNC':
                 results_dir = os.path.join(self.rawdata_dir, subject_id, 'MNINonLinear', 'Results')
                 contents = os.listdir(results_dir)
                 contents_joined = [''.join(content.split('_')) for content in contents]
                 idx = contents_joined.index(task)
                 ev_dir = os.path.join(results_dir, contents[idx], 'EVs')
                 task_events = get_task_events_fmri(ev_dir)
+            elif modality == 'MRI3T' and self.dataset == 'PNC':
+                session = kv_dict.get('ses', '')
+                try:
+                    task_events_file_path = glob.glob(os.path.join(self.rawdata_dir, f'sub-{subject_id}', f'ses-{session}', 'func', f'sub-{subject_id}_ses-{session}_task-{task}*events.tsv'))[0]
+                    task_events = pd.read_csv(task_events_file_path, sep='\t')       
+                except:
+                    task_events_file_path = os.path.join(self.rawdata_dir, f'sub-{subject_id}', f'ses-{session}', 'func', f'sub-{subject_id}_ses-{session}_task-{task}_events.tsv')
+                    task_events = pd.read_csv(task_events_file_path, sep='\t')
+                # print(task_events_file_path)
+                # print(task_events)
             elif modality == 'MRI7T':
                 movie_metadata_dir = os.path.join(self.output_dir, 'data', 'movie_data')
                 
@@ -454,29 +480,49 @@ class DataLoader:
             base_path = Path(self.SUBDIR_MAP[self.dataset]['MEG']['meg'])
         else:
             raise ValueError(f"Unknown modality: {scan.modality}")
-        
+
+        # Subject directory
         if scan.session is None:
-            # Subject directory
             subject_dir = base_path / f'sub-{scan.subject_id}' / 'func'
-            # Construct filename
-            filename_base = f"sub-{scan.subject_id}_task-{scan.task}_space-{scan.space}_seg-{scan.seg}_stat-mean_timeseries"
         else:
-            # Subject directory
             subject_dir = base_path / f'sub-{scan.subject_id}' / f'ses-{scan.session}' / 'func'
-            # Construct filename
-            filename_base = f"sub-{scan.subject_id}_ses-{scan.session}_task-{scan.task}_space-{scan.space}_seg-{scan.seg}_stat-mean_timeseries"
-        
-        # Extension depends on modality
-        if self.dataset == 'HCP-YA' and scan.modality == 'MEG':
-            filename = f"{filename_base}.ptseries.npy"
-        elif self.dataset == 'HCP-YA' and scan.modality != 'MEG':
-            filename = f"{filename_base}.ptseries.nii"
-        elif self.dataset == 'HCP-D':
-            filename = f"{filename_base}.ptseries.nii"
+
+        # File extension
+        if self.dataset == 'HCP-YA' and scan.modality == 'MEG' and scan.rbc is False:
+            fileext = ".ptseries.npy"
+        elif self.dataset == 'HCP-YA' and scan.modality != 'MEG' and scan.rbc is False:
+            fileext = ".ptseries.nii"
+        elif self.dataset == 'HCP-D' and scan.rbc is False:
+            fileext = ".ptseries.nii"
+        elif scan.rbc is True:
+            fileext = ".1D"
         else:
-            filename = f"{filename_base}.tsv"
-            
-        return subject_dir / filename
+            fileext = ".tsv"
+
+        # Construct filename
+        if scan.rbc is False and scan.session is None:
+            filename = f"sub-{scan.subject_id}_task-{scan.task}_space-{scan.space}_seg-{scan.seg}_stat-mean_timeseries{fileext}"
+            filename_full = str(subject_dir / filename)
+        elif scan.rbc is False and scan.session is not None:
+            filename = f"sub-{scan.subject_id}_ses-{scan.session}_task-{scan.task}_space-{scan.space}_seg-{scan.seg}_stat-mean_timeseries{fileext}"
+            filename_full = str(subject_dir / filename)
+        elif scan.rbc is True and scan.session is not None:
+            # try:
+            #     filename = f"sub-{scan.subject_id}_ses-{scan.session}_task-{scan.task}*atlas-{scan.seg}_space-{scan.space}_reg-36Parameter_desc-Mean_timeseries{fileext}"
+            #     filename_full = str(subject_dir / filename)
+            #     filename_full = glob.glob(filename_full)[0]
+            #     filename_full = Path(filename_full)
+            # except:
+            #     filename = f"sub-{scan.subject_id}_ses-{scan.session}_task-{scan.task}_atlas-{scan.seg}_space-{scan.space}_reg-36Parameter_desc-Mean_timeseries{fileext}"
+            #     filename_full = subject_dir / filename
+
+            filename = f"sub-{scan.subject_id}_ses-{scan.session}_task-{scan.task}_atlas-{scan.seg}_space-{scan.space}_reg-36Parameter_desc-Mean_timeseries{fileext}"
+            filename_full = subject_dir / filename
+            if not filename_full.exists():
+                filename = f"sub-{scan.subject_id}_ses-{scan.session}_task-{scan.task}_acq-singleband_atlas-{scan.seg}_space-{scan.space}_reg-36Parameter_desc-Mean_timeseries{fileext}"
+                filename_full = subject_dir / filename
+
+        return filename_full
     
     def load_scan_timeseries(
         self,
@@ -522,6 +568,9 @@ class DataLoader:
             timeseries = img.get_fdata()
         elif filepath.suffix == '.tsv':
             df = pd.read_csv(filepath, sep='\t')
+            timeseries = df.values  # shape: (n_timepoints, n_parcels)
+        elif filepath.suffix == '.1D':
+            df = pd.read_csv(filepath)
             timeseries = df.values  # shape: (n_timepoints, n_parcels)
         else:
             raise ValueError(f"Unknown file type: {filepath}")
