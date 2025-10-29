@@ -8,6 +8,9 @@ from typing import Dict, List, Optional, Tuple, Union
 from dataclasses import dataclass, field
 from sklearn.linear_model import LinearRegression
 
+import warnings
+warnings.simplefilter(action='ignore', category=FutureWarning)
+
 # Enhanced ScanInfo dataclass that matches HCP conventions
 @dataclass
 class ScanInfo:
@@ -90,16 +93,20 @@ class DataLoader:
             'MEG': 1 / HCPYA_MEG_SAMPLING_RATE
         },
         'HCP-D': {
-            'MRI3T': 0.80            
+            'MRI3T': 0.80
         },
         'WAND': {
-            'MRI3T': 2.0            
+            'MRI3T': 2.0
         },
         'PNC': {
-            'MRI3T': 3.0            
+            'MRI3T': 3.0
+        },
+        'NKI': {
+            'MRI3T': 1.4
+            # 'MRI3T': 0.645
         },
         'UCLA': {
-            'MRI3T': 2.0            
+            'MRI3T': 2.0
         },
     }
     
@@ -109,6 +116,7 @@ class DataLoader:
         'HCP-D': '/mnt/storage_ssd_raid/research_data/HCP_D',
         'WAND': '/mnt/storage_ssd_raid/research_data/WAND',
         'PNC': '/mnt/storage_ssd_raid/research_data/RBC/PNC',
+        'NKI': '/mnt/storage_ssd_raid/research_data/RBC/NKI',
         'UCLA': '/mnt/storage_ssd_raid/research_data/UCLA_CNP_LA5c',
     }
     
@@ -118,6 +126,7 @@ class DataLoader:
         'HCP-D': os.path.join(BASE_PATHS['HCP-D'], 'processed'),
         'WAND': os.path.join(BASE_PATHS['WAND'], 'bids'),
         'PNC': os.path.join(BASE_PATHS['PNC'], 'bids'),
+        'NKI': os.path.join(BASE_PATHS['NKI'], 'bids'),
         'UCLA': os.path.join(BASE_PATHS['UCLA'], 'bids'),
     }
     
@@ -127,6 +136,7 @@ class DataLoader:
         'HCP-D': os.path.join(BASE_PATHS['HCP-D'], 'derivatives'),
         'WAND': os.path.join(BASE_PATHS['WAND'], 'derivatives'),
         'PNC': os.path.join(BASE_PATHS['PNC'], 'derivatives'),
+        'NKI': os.path.join(BASE_PATHS['NKI'], 'derivatives'),
         'UCLA': os.path.join(BASE_PATHS['UCLA'], 'derivatives'),
     }
     
@@ -135,7 +145,7 @@ class DataLoader:
         'HCP-YA': {
             'MRI3T': {'fmri': os.path.join(DERIVDATA_PATHS['HCP-YA'], 'parcellated_data'),},
             'MRI7T': {'fmri': os.path.join(DERIVDATA_PATHS['HCP-YA'], 'parcellated_data_7T'),},
-            'MEG': {'meg': os.path.join(DERIVDATA_PATHS['HCP-YA'], 'meg_parcellated'),}
+            'MEG': {'meg': os.path.join(DERIVDATA_PATHS['HCP-YA'], 'parcellated_data_meg'),}
         },
         'HCP-D': {
             'MRI3T': {'fmri': os.path.join(DERIVDATA_PATHS['HCP-D'], 'parcellated_data'),}
@@ -145,6 +155,9 @@ class DataLoader:
         },
         'PNC': {
             'MRI3T': {'fmri': os.path.join(DERIVDATA_PATHS['PNC'], 'rbc_cpac', 'cpac_RBCv0'),}
+        },
+        'NKI': {
+            'MRI3T': {'fmri': os.path.join(DERIVDATA_PATHS['NKI'], 'rbc_cpac', 'cpac_RBCv0'),}
         },
         'UCLA': {
             'MRI3T': {'fmri': os.path.join(DERIVDATA_PATHS['UCLA'], 'xcpd'),}
@@ -242,7 +255,7 @@ class DataLoader:
             List of registered ScanInfo objects
         """
         tr = self.get_tr(modality=modality)
-        if self.dataset == 'PNC':
+        if self.dataset == 'PNC' or self.dataset == 'NKI':
             rbc = True
         else:
             rbc = False
@@ -306,9 +319,9 @@ class DataLoader:
                 filepath = self.get_scan_filepath(scan)
                 task_events = self.get_task_events(scan)
                 
-                # if filepath.exists():
-                    # existing_scans.append(scan)
-                if filepath.exists() and scan.condition == 'task' and task_events is not None:
+                if self.dataset == 'WAND' and filepath.exists():
+                    existing_scans.append(scan)
+                elif filepath.exists() and scan.condition == 'task' and task_events is not None:
                     existing_scans.append(scan)
                 elif filepath.exists() and scan.condition == 'rest' and task_events is None:
                     existing_scans.append(scan)
@@ -407,17 +420,18 @@ class DataLoader:
         subject_id = kv_dict.get('sub', '')
         task = kv_dict.get('task', '')
         modality = kv_dict.get('modality', '')
-        
+        session = kv_dict.get('ses', '')
+
         if self.dataset == 'HCP-D':
             subject_id = split_hcpd_string(subject_id)
         
         try:
-            if modality == 'MEG':
+            if modality == 'MEG' and self.dataset == 'HCP-YA':
                 subdir_str = f'{task[:1]}-{task[1:]}'
                 task_events_file_path = glob.glob(os.path.join(self.rawdata_dir, subject_id, 'unprocessed', 'MEG', subdir_str, 'EPRIME', f'{subject_id}_*_{task[1:]}_*.xlsx'))[0]
                 events = get_task_events_meg(task_events_file_path=task_events_file_path, verbose=False)
                 task_events = events[['onset', 'duration', 'trial_type']]
-            elif modality == 'MRI3T' and self.dataset != 'PNC':
+            elif modality == 'MRI3T' and (self.dataset == 'HCP-YA' or self.dataset == 'HCP-D'):
                 results_dir = os.path.join(self.rawdata_dir, subject_id, 'MNINonLinear', 'Results')
                 contents = os.listdir(results_dir)
                 contents_joined = [''.join(content.split('_')) for content in contents]
@@ -425,7 +439,6 @@ class DataLoader:
                 ev_dir = os.path.join(results_dir, contents[idx], 'EVs')
                 task_events = get_task_events_fmri(ev_dir)
             elif modality == 'MRI3T' and self.dataset == 'PNC':
-                session = kv_dict.get('ses', '')
                 try:
                     task_events_file_path = glob.glob(os.path.join(self.rawdata_dir, f'sub-{subject_id}', f'ses-{session}', 'func', f'sub-{subject_id}_ses-{session}_task-{task}*events.tsv'))[0]
                     task_events = pd.read_csv(task_events_file_path, sep='\t')       
@@ -434,6 +447,33 @@ class DataLoader:
                     task_events = pd.read_csv(task_events_file_path, sep='\t')
                 # print(task_events_file_path)
                 # print(task_events)
+            elif modality == 'MRI3T' and self.dataset == 'UCLA':
+                try:
+                    task_events_file_path = glob.glob(os.path.join(self.rawdata_dir, f'sub-{subject_id}', 'func', f'sub-{subject_id}_task-{task}*events.tsv'))[0]
+                    task_events_data_tmp = pd.read_csv(task_events_file_path, sep='\t')       
+                except:
+                    task_events_file_path = os.path.join(self.rawdata_dir, f'sub-{subject_id}', 'func', f'sub-{subject_id}_task-{task}_events.tsv')
+                    task_events_data_tmp = pd.read_csv(task_events_file_path, sep='\t')
+
+                if task == 'stopsignal':
+                    # Stop signal
+                    task_events = task_events_data_tmp[['onset', 'duration', 'trial_type']]
+                    task_events.loc[~task_events['trial_type'].isna()]
+                elif task == 'bart':
+                    # BART
+                    task_events_data_tmp = task_events_data_tmp[['onset', 'duration', 'trial_type', 'trial_number']]
+                    task_events = pd.DataFrame(columns=['onset', 'duration', 'trial_type'])
+                    unique_trials = task_events_data_tmp['trial_number'].unique()
+
+                    for trial_number in unique_trials:
+                        trial_data = task_events_data_tmp.loc[task_events_data_tmp['trial_number'] == trial_number].reset_index(drop=True)
+
+                        trial_data_processed = {'onset': trial_data['onset'].iloc[0], 'duration': trial_data['duration'].values.sum(), 'trial_type': trial_data['trial_type'].iloc[0]}
+                        trial_data_processed = pd.DataFrame([trial_data_processed])
+                        task_events = pd.concat((task_events, trial_data_processed), axis=0, ignore_index=True)
+            elif modality == 'MRI3T' and self.dataset == 'NKI':
+                task_events_file_path = glob.glob(os.path.join(self.rawdata_dir, f'sub-{subject_id}', f'ses-{session}', 'func', f'sub-{subject_id}_ses-{session}_task-{task}_acq-1400*_events.tsv'))[0]
+                task_events = pd.read_csv(task_events_file_path, sep='\t')
             elif modality == 'MRI7T':
                 movie_metadata_dir = os.path.join(self.output_dir, 'data', 'movie_data')
                 
@@ -502,25 +542,21 @@ class DataLoader:
         # Construct filename
         if scan.rbc is False and scan.session is None:
             filename = f"sub-{scan.subject_id}_task-{scan.task}_space-{scan.space}_seg-{scan.seg}_stat-mean_timeseries{fileext}"
-            filename_full = str(subject_dir / filename)
+            filename_full = subject_dir / filename
         elif scan.rbc is False and scan.session is not None:
             filename = f"sub-{scan.subject_id}_ses-{scan.session}_task-{scan.task}_space-{scan.space}_seg-{scan.seg}_stat-mean_timeseries{fileext}"
-            filename_full = str(subject_dir / filename)
-        elif scan.rbc is True and scan.session is not None:
-            # try:
-            #     filename = f"sub-{scan.subject_id}_ses-{scan.session}_task-{scan.task}*atlas-{scan.seg}_space-{scan.space}_reg-36Parameter_desc-Mean_timeseries{fileext}"
-            #     filename_full = str(subject_dir / filename)
-            #     filename_full = glob.glob(filename_full)[0]
-            #     filename_full = Path(filename_full)
-            # except:
-            #     filename = f"sub-{scan.subject_id}_ses-{scan.session}_task-{scan.task}_atlas-{scan.seg}_space-{scan.space}_reg-36Parameter_desc-Mean_timeseries{fileext}"
-            #     filename_full = subject_dir / filename
-
+            filename_full = subject_dir / filename
+        elif scan.rbc is True and self.dataset == 'PNC':
             filename = f"sub-{scan.subject_id}_ses-{scan.session}_task-{scan.task}_atlas-{scan.seg}_space-{scan.space}_reg-36Parameter_desc-Mean_timeseries{fileext}"
             filename_full = subject_dir / filename
             if not filename_full.exists():
                 filename = f"sub-{scan.subject_id}_ses-{scan.session}_task-{scan.task}_acq-singleband_atlas-{scan.seg}_space-{scan.space}_reg-36Parameter_desc-Mean_timeseries{fileext}"
                 filename_full = subject_dir / filename
+        elif scan.rbc is True and self.dataset == 'NKI':
+            filename = f"sub-{scan.subject_id}_ses-{scan.session}_task-{scan.task}_acq-1400*_atlas-{scan.seg}_space-{scan.space}_reg-36Parameter_desc-Mean_timeseries{fileext}"
+            filename_full = str(subject_dir / filename)
+            filename_full = glob.glob(filename_full)[0]
+            filename_full = Path(filename_full)
 
         return filename_full
     
@@ -622,7 +658,7 @@ class DataLoader:
         dry_load: bool = False
     ) -> Dict[str, Optional[np.ndarray]]:
         """
-        Load multiple scans with filtering.
+        Load multiple scans with filtering, excluding subjects with any scans containing NaNs or zero-variance regions.
         
         Args:
             subjects: Filter to specific subjects
@@ -631,6 +667,7 @@ class DataLoader:
             seg: Filter to specific seg
             cache: Whether to cache data
             nuisance_regression: Whether to apply nuisance regression
+            standardize: Whether to standardize the data
             verbose: Print progress
             dry_load: If True, return scan keys with None values instead of loading data
         
