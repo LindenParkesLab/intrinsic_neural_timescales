@@ -8,6 +8,8 @@ from tqdm import tqdm
 from nilearn.glm.first_level import make_first_level_design_matrix
 pyfftw.interfaces.cache.enable()  # Cache FFT plans
 from pyfftw.interfaces.numpy_fft import rfft, irfft
+from scipy.optimize import curve_fit
+from statsmodels.tsa.stattools import acf
 
 from src.data import DataLoader, parse_scan_string, build_scan_string
 
@@ -37,9 +39,9 @@ class Timescales(DataLoader):
         self,
         subject_id: str,
         output_type: str,
-        scan_name: str,
+        task: str,
         modality: str,
-        atlas: str,
+        seg: str,
         suffix: str = '.npy',
         mode: str = 'load'
     ) -> Path:
@@ -49,9 +51,9 @@ class Timescales(DataLoader):
         Args:
             subject_id: Subject identifier
             output_type: Type of output (e.g., 'autocorr', 'timescale_acf')
-            scan_name: Name of scan (e.g., 'rfMRIREST1LR')
+            task: Name of scan (e.g., 'rfMRIREST1LR')
             modality: Modality string (e.g., 'MRI3T')
-            atlas: Atlas name
+            seg: Atlas name
             suffix: File extension
         
         Returns:
@@ -66,8 +68,8 @@ class Timescales(DataLoader):
         filename = build_scan_string(
             sub=subject_id,
             modality=modality,
-            scan=scan_name,
-            atlas=atlas,
+            task=task,
+            seg=seg,
             stat=output_type
         ) + suffix
         
@@ -78,9 +80,9 @@ class Timescales(DataLoader):
         data: Any,
         subject_id: str,
         output_type: str,
-        scan_name: str,
+        task: str,
         modality: str,
-        atlas: str = None,
+        seg: str = None,
         metadata: Dict = None,
         use_pickle: bool = False
     ) -> Path:
@@ -89,9 +91,9 @@ class Timescales(DataLoader):
         filepath = self._get_output_filepath(
             subject_id=subject_id,
             output_type=output_type,
-            scan_name=scan_name,
+            task=task,
             modality=modality,
-            atlas=atlas,
+            seg=seg,
             suffix=suffix,
             mode='save'
         )
@@ -115,9 +117,9 @@ class Timescales(DataLoader):
         self,
         subject_id: str,
         output_type: str,
-        scan_name: str,
+        task: str,
         modality: str,
-        atlas: str = None,
+        seg: str = None,
         use_pickle: bool = False
     ) -> Optional[Any]:
         """Load previously saved subject-specific output with key-value naming."""
@@ -125,9 +127,9 @@ class Timescales(DataLoader):
         filepath = self._get_output_filepath(
             subject_id=subject_id,
             output_type=output_type,
-            scan_name=scan_name,
+            task=task,
             modality=modality,
-            atlas=atlas,
+            seg=seg,
             suffix=suffix,
             mode='load'
         )
@@ -158,18 +160,18 @@ class Timescales(DataLoader):
         self,
         subject_id: str,
         output_type: str,
-        scan_name: str,
+        task: str,
         modality: str,
-        atlas: str = None
+        seg: str = None
     ) -> bool:
         """Check if a subject output file already exists."""
         for suffix in ['.npy', '.npz', '.pkl']:
             filepath = self._get_output_filepath(
                 subject_id=subject_id,
                 output_type=output_type,
-                scan_name=scan_name,
+                task=task,
                 modality=modality,
-                atlas=atlas,
+                seg=seg,
                 suffix=suffix,
                 moad='load'
             )
@@ -215,7 +217,7 @@ class Timescales(DataLoader):
         else:
             output_type = f'autocorr_freq-{freq_window[0]}hz-{freq_window[1]}hz'
         if use_residuals:
-            output_type = 'residuals_' + output_type
+            output_type = output_type + '_resids'
 
         # Process each scan
         for scan_key in tqdm(self.scans, desc="Computing autocorrelation"):
@@ -225,8 +227,8 @@ class Timescales(DataLoader):
             subject_id = kv_dict.get('sub', '')
             modality = kv_dict.get('modality', '')
             condition = kv_dict.get('condition', '')
-            scan_name = kv_dict.get('scan', '')
-            atlas = kv_dict.get('atlas', '')
+            task = kv_dict.get('task', '')
+            seg = kv_dict.get('seg', '')
             tr = kv_dict.get('tr', '')
             
             # Check for existing output
@@ -234,9 +236,9 @@ class Timescales(DataLoader):
                 loaded_acf = self._load_subject_output(
                     subject_id=subject_id,
                     output_type=output_type,
-                    scan_name=scan_name,
+                    task=task,
                     modality=modality,
-                    atlas=atlas
+                    seg=seg
                 )
                 
                 if loaded_acf is not None:
@@ -269,9 +271,9 @@ class Timescales(DataLoader):
                         data=acf_result,
                         subject_id=subject_id,
                         output_type=output_type,
-                        scan_name=scan_name,
+                        task=task,
                         modality=modality,
-                        atlas=atlas,
+                        seg=seg,
                         metadata={
                             'use_fft': use_fft,
                             'freq_window': freq_window,
@@ -304,6 +306,7 @@ class Timescales(DataLoader):
         force_recompute: bool = False,
         save_outputs: bool = True,
         suffix: str = None,
+        use_residuals: bool = False,
         verbose: bool = True
     ) -> Dict[str, Any]:
         """
@@ -336,8 +339,9 @@ class Timescales(DataLoader):
             
             subject_id = kv_dict.get('sub', '')
             modality = kv_dict.get('modality', '')
-            scan_name = kv_dict.get('scan', '')
-            atlas = kv_dict.get('atlas', '')
+            condition = kv_dict.get('condition', '')
+            task = kv_dict.get('task', '')
+            seg = kv_dict.get('seg', '')
             tr = kv_dict.get('tr', '')
             
             # Check for existing output
@@ -345,9 +349,9 @@ class Timescales(DataLoader):
                 loaded_timescales = self._load_subject_output(
                     subject_id=subject_id,
                     output_type=output_type,
-                    scan_name=scan_name,
+                    task=task,
                     modality=modality,
-                    atlas=atlas
+                    seg=seg
                 )
                 
                 if loaded_timescales is not None:
@@ -365,40 +369,54 @@ class Timescales(DataLoader):
             try:
                 if method == 'zero_crossing':
                     # Find first zero crossing for each parcel
-                    timescale = self._compute_zero_crossing(acf) * tr
+                    timescales = self._compute_zero_crossing(acf) * tr
                 elif method == 'auc_zero_crossing':
                     # Area under curve
-                    timescale = self._compute_auc(acf, tr, max_lag=None)
+                    timescales = self._compute_auc(acf, tr, max_lag=None)
                 elif method == 'auc_100':
                     # Area under curve
-                    timescale = self._compute_auc(acf, tr, max_lag=100)
+                    timescales = self._compute_auc(acf, tr, max_lag=100)
                 elif method == 'decay_time_1e':
                     # Time to decay to 1/e
                     threshold = 1 / np.e
-                    timescale = self._compute_decay_time(acf, tr, threshold)
+                    timescales = self._compute_decay_time(acf, tr, threshold)
                 elif method == 'decay_time_half':
                     # Time to decay to 1/e
                     threshold = 0.5
-                    timescale = self._compute_decay_time(acf, tr, threshold)
+                    timescales = self._compute_decay_time(acf, tr, threshold)
                 elif method == 'exponential_tau':
                     fs = 1 / tr
-                    timescale, fit_infos = self._compute_tau_from_acf(acf, fs)
+                    timescales, fit_infos = self._compute_tau_from_acf(acf, fs)
                     tau_fit_infos[scan_key] = fit_infos
+                elif method == 'tau_optimized':
+                    if use_residuals and condition == 'task':
+                        timeseries_scan = self.timeseries_residuals[scan_key]
+                    else:
+                        timeseries_scan = self.timeseries_data[scan_key]
+                    fs = 1 / tr
+                    timescales, _ = self._compute_optimized_tau_B(timeseries_scan, fs)
+                elif method == 'B_optimized':
+                    if use_residuals and condition == 'task':
+                        timeseries_scan = self.timeseries_residuals[scan_key]
+                    else:
+                        timeseries_scan = self.timeseries_data[scan_key]
+                    fs = 1 / tr
+                    _, timescales = self._compute_optimized_tau_B(timeseries_scan, fs)
                 else:
                     raise ValueError(f"Unknown method: {method}")
                 
-                timescales_dict[scan_key] = timescale
+                timescales_dict[scan_key] = timescales
                 n_computed += 1
                 
                 # Save output
                 if save_outputs:
                     self._save_subject_output(
-                        data=timescale,
+                        data=timescales,
                         subject_id=subject_id,
                         output_type=output_type,
-                        scan_name=scan_name,
+                        task=task,
                         modality=modality,
-                        atlas=atlas,
+                        seg=seg,
                         metadata={'method': method, 'tr': tr}
                     )
                     
@@ -414,6 +432,111 @@ class Timescales(DataLoader):
             print(f"\n{method} timescale computation complete:")
             print(f"  Loaded from cache: {n_loaded}")
             print(f"  Newly computed: {n_computed}")
+            print(f"  Total: {len(self.scans)}")
+
+    def compute_timeseries_measures(
+        self,
+        method: str = 'tsnr',
+        force_recompute: bool = False,
+        save_outputs: bool = True,
+        use_residuals: bool = False,
+        verbose: bool = True
+    ):
+        """
+        Compute temporal signal-to-noise ratio (tSNR) for all scans with caching.
+        
+        Parameters:
+        -----------
+        force_recompute : bool, default=False
+            If True, recompute even if cached results exist
+        save_outputs : bool, default=True
+            If True, save computed results to disk
+        verbose : bool, default=True
+            If True, print progress information
+        """
+        data_dict = dict.fromkeys(self.scans)
+        
+        # Track what was loaded vs computed
+        n_loaded = 0
+        n_computed = 0
+        n_failed = 0
+        output_type = f'metric_{method}'
+        if use_residuals:
+            output_type = output_type + '_resids'
+
+        # Process each scan
+        for scan_key in tqdm(self.scans, desc=f"Computing {method}"):
+            # Parse scan key using key-value format
+            kv_dict = self._parse_scan_string(scan_key)
+            
+            subject_id = kv_dict.get('sub', '')
+            modality = kv_dict.get('modality', '')
+            condition = kv_dict.get('condition', '')
+            task = kv_dict.get('task', '')
+            seg = kv_dict.get('seg', '')
+            tr = kv_dict.get('tr', '')
+            
+            # Check for existing output
+            if not force_recompute:
+                loaded_metric = self._load_subject_output(
+                    subject_id=subject_id,
+                    output_type=output_type,
+                    task=task,
+                    modality=modality,
+                    seg=seg
+                )
+                
+                if loaded_metric is not None:
+                    data_dict[scan_key] = loaded_metric
+                    n_loaded += 1
+                    continue
+            
+            # Compute timeseries measure
+            try:
+                if use_residuals and condition == 'task':
+                    # print('Using residuals...')
+                    timeseries_scan = self.timeseries_residuals[scan_key]
+                else:
+                    timeseries_scan = self.timeseries_data[scan_key]
+
+                if method == 'tsnr':
+                    timeseries_result = calculate_tsnr(timeseries_scan)
+                elif method == 'var':
+                    timeseries_result = np.var(timeseries_scan, axis=1)
+                
+                data_dict[scan_key] = timeseries_result
+                n_computed += 1
+                
+                # Save output if requested
+                if save_outputs:
+                    self._save_subject_output(
+                        data=timeseries_result,
+                        subject_id=subject_id,
+                        output_type=output_type,
+                        task=task,
+                        modality=modality,
+                        seg=seg,
+                        metadata={
+                            'tr': tr,
+                            'modality': modality,
+                            'dataset': self.dataset
+                        }
+                    )
+            
+            except Exception as e:
+                print(f"Warning: Failed to compute tSNR for {scan_key}: {e}")
+                data_dict[scan_key] = None
+                n_failed += 1
+        
+        # Store results
+        self.data_dict = data_dict
+        
+        if verbose:
+            print(f"\n{method} computation complete:")
+            print(f"  Loaded from cache: {n_loaded}")
+            print(f"  Newly computed: {n_computed}")
+            if n_failed > 0:
+                print(f"  Failed: {n_failed}")
             print(f"  Total: {len(self.scans)}")
 
     # ============== Timescale Computation Methods ==============
@@ -513,6 +636,17 @@ class Timescales(DataLoader):
         
         return taus, fit_infos
 
+    def _compute_optimized_tau_B(self, timeseries_scan: np.ndarray, fs: float) -> np.ndarray:
+        """Find first zero crossing for each parcel."""
+        n_parcels = timeseries_scan.shape[0]
+        tau_final = np.zeros(n_parcels)
+        B_final = np.zeros(n_parcels)
+        
+        for i in range(n_parcels):
+            tau_final[i], B_final[i], r, sweep_data = estimate_offset_with_optimal_lag(timeseries_scan[i], fs)
+        
+        return tau_final, B_final
+
     # ==================== Deconfounding Functions ====================
     def regress_task_structure(self):
         timeseries_residuals = dict().fromkeys(self.timeseries_data)
@@ -582,7 +716,7 @@ class Timescales(DataLoader):
         df_behavior_matched = pd.DataFrame(columns=self.df_behavior.columns)
         df_behavior_matched.index.name = 'subject_id'
         
-        for subject_id in self.scan_registry['subject_id'].unique():
+        for subject_id in self.scan_registry['sub'].unique():
             subject_id = str(subject_id)
             if subject_id in self.df_behavior.index and subject_id not in df_behavior_matched.index:
                 df_behavior_matched.loc[subject_id] = self.df_behavior.loc[subject_id]
@@ -615,16 +749,16 @@ class Timescales(DataLoader):
             
             subject_id = kv_dict.get('sub', '')
             modality = kv_dict.get('modality', '')
-            scan_name = kv_dict.get('scan', '')
-            atlas = kv_dict.get('atlas', '')
+            task = kv_dict.get('task', '')
+            seg = kv_dict.get('seg', '')
             
             # Check for existing output
             loaded_data = self._load_subject_output(
                 subject_id=subject_id,
                 output_type=output_type,
-                scan_name=scan_name,
+                task=task,
                 modality=modality,
-                atlas=atlas
+                seg=seg
             )
             
             data_dict[scan_key] = loaded_data
@@ -676,7 +810,6 @@ def compute_acf(
     
     for timeseries in data:
         if np.std(timeseries) > 0:  # Avoid division by zero
-            
             # Apply frequency filtering BEFORE computing autocorrelation
             if freq_window is not None:
                 timeseries_filtered = apply_bandpass_filter(timeseries, sampling_rate, freq_window, filter_order)
@@ -685,9 +818,9 @@ def compute_acf(
             
             # Standardize the (potentially filtered) time series
             standardized = (timeseries_filtered - np.mean(timeseries_filtered)) / np.std(timeseries_filtered)
+            n = len(standardized)
             
             if use_fft:
-                n = len(standardized)
                 # Pad to next power of 2 for optimal FFT performance
                 fft_size = 2 ** (int(np.log2(2 * n - 1)) + 1)
                 padded = np.zeros(fft_size)
@@ -703,8 +836,12 @@ def compute_acf(
                 # Compute full autocorrelation
                 acf = np.correlate(standardized, standardized, mode='full')
                 acf = acf[len(acf)//2:]  # Take only non-negative lags
-            
+    
             acf = acf / acf[0]  # Normalize by lag-0 value
+            autocorr_list.append(acf)
+        else:
+            acf = np.zeros(n)
+            acf[:] = np.nan
             autocorr_list.append(acf)
             
     return np.array(autocorr_list)
@@ -795,7 +932,7 @@ def create_design_matrix_nilearn(
 
 def fit_glm(data, design_matrix):
     """
-    Fit GLM.
+    Fit GLM with masking for NaN and zero-variance regions.
     
     Parameters:
     - data: 2D array (n_parcels, n_timepoints)
@@ -805,19 +942,43 @@ def fit_glm(data, design_matrix):
     - residuals: residual time series after GLM fitting
     - predicted: predicted time series
     - betas: regression coefficients
+    - valid_mask: boolean mask indicating which regions were included in fitting
     """
     
     # Convert design matrix to numpy array
     X = design_matrix.values
+    n_parcels, n_timepoints = data.shape
+    
+    # Initialize outputs
+    residuals = np.full_like(data, np.nan)
+    predicted = np.full_like(data, np.nan)
+    betas = np.full((n_parcels, X.shape[1]), np.nan)
+    
+    # Create mask for valid regions (no NaNs and non-zero variance)
+    has_nan = np.any(np.isnan(data), axis=1)
+    has_zero_variance = np.var(data, axis=1) == 0
+    valid_mask = ~(has_nan | has_zero_variance)
+    
+    if np.sum(valid_mask) == 0:
+        # No valid regions - return all NaNs
+        return residuals, predicted, betas, valid_mask
+    
+    # Fit GLM only for valid regions
+    data_valid = data[valid_mask, :]
     
     # Fit GLM using least squares
-    betas, residuals_sum, rank, s = np.linalg.lstsq(X, data.T, rcond=None)
+    betas_valid, residuals_sum, rank, s = np.linalg.lstsq(X, data_valid.T, rcond=None)
     
-    # Compute predicted and residual signals
-    predicted = np.dot(X, betas).T
-    residuals = data - predicted
+    # Compute predicted and residual signals for valid regions
+    predicted_valid = np.dot(X, betas_valid).T
+    residuals_valid = data_valid - predicted_valid
     
-    return residuals, predicted, betas.T
+    # Place results back into full arrays
+    residuals[valid_mask, :] = residuals_valid
+    predicted[valid_mask, :] = predicted_valid
+    betas[valid_mask, :] = betas_valid.T
+    
+    return residuals, predicted, betas
 
 def fit_exponential_decay(lags, acf):
     """
@@ -919,3 +1080,132 @@ def calculate_tsnr(timeseries_matrix):
         tsnr = mean_signal / std_signal
     
     return tsnr
+
+def offset_exp_steps(k, tau, B, fs):
+    """Exponential decay model with offset"""
+    return (1 - B) * np.exp(-k / (tau * fs)) + B
+
+def find_optimal_max_lag(ts, fs, max_lag_range=None, stability_threshold=1):
+    """
+    Find the optimal max_lag for fitting by sweeping through different values
+    and finding where tau and B estimates become stable.
+    """
+    n = len(ts)
+    
+    if max_lag_range is None:
+        min_lag = 5
+        # max_lag_limit = n // 4
+        max_lag_limit = 30
+        max_lag_range = np.arange(min_lag, max_lag_limit, 1)
+    
+    tau_estimates = []
+    B_estimates = []
+    max_lags_tested = []
+    rmse_values = []
+    
+    for max_lag in max_lag_range:
+        if max_lag >= n // 4:  # Don't exceed reasonable limit
+            break
+            
+        try:
+            # Compute autocorrelation
+            r = acf(ts, nlags=max_lag, fft=True)
+            # r = compute_acf(ts, use_fft=True)[0, :max_lag]
+            ks = np.arange(len(r))
+            
+            # Better initialization for tau
+            tau_init_idx = np.where(r < 0.4)[0]
+            if len(tau_init_idx) > 0:
+                tau_init = tau_init_idx[0] / fs
+            else:
+                tau_init = 2.0
+            
+            p0 = (tau_init, 0.0)
+            bounds = ((0.1, -0.5), (100.0, 0.5))
+            
+            # Fit the model
+            popt, _ = curve_fit(lambda k, tau, B: offset_exp_steps(k, tau, B, fs), 
+                               ks, r, p0=p0, bounds=bounds)
+            
+            # Check fit quality
+            fitted = offset_exp_steps(ks, popt[0], popt[1], fs)
+            rmse = np.sqrt(np.mean((r - fitted)**2))
+            
+            tau_estimates.append(popt[0])
+            B_estimates.append(popt[1])
+            max_lags_tested.append(max_lag)
+            rmse_values.append(rmse)
+        except:
+            continue
+    
+    if len(tau_estimates) < 3:  # Need at least 3 points
+        return max_lag_range[len(max_lag_range)//2], None
+    
+    # Convert to arrays
+    tau_estimates = np.array(tau_estimates)
+    B_estimates = np.array(B_estimates)
+    max_lags_tested = np.array(max_lags_tested)
+    rmse_values = np.array(rmse_values)
+    
+    # Calculate relative changes
+    tau_rel_changes = np.abs(np.diff(tau_estimates)) / (tau_estimates[:-1] + 1e-6) * 100
+    B_rel_changes = np.abs(np.diff(B_estimates)) / (np.abs(B_estimates[:-1]) + 1e-6) * 100
+    
+    # Find where both tau and B are stable
+    stable_mask = (tau_rel_changes < stability_threshold) & (B_rel_changes < stability_threshold)
+    
+    if np.any(stable_mask):
+        # Find first stable point (shortest max_lag with stability)
+        first_stable_idx = np.where(stable_mask)[0][0] + 1  # +1 because diff reduces length by 1
+        optimal_max_lag = max_lags_tested[first_stable_idx]
+    else:
+        # If no stability found, use the one with lowest RMSE in the second half
+        second_half_idx = len(rmse_values) // 2
+        best_idx = second_half_idx + np.argmin(rmse_values[second_half_idx:])
+        optimal_max_lag = max_lags_tested[best_idx]
+    
+    # Package results
+    sweep_results = {
+        'max_lags': max_lags_tested,
+        'tau_estimates': tau_estimates,
+        'B_estimates': B_estimates,
+        'rmse_values': rmse_values,
+        'tau_rel_changes': tau_rel_changes,
+        'B_rel_changes': B_rel_changes,
+        'optimal_max_lag': optimal_max_lag,
+        'stability_threshold': stability_threshold
+    }
+    
+    return optimal_max_lag, sweep_results
+
+def estimate_offset_with_optimal_lag(ts, fs, max_lag_range=None, stability_threshold=0.05):
+    """
+    Estimate tau and B using optimal max_lag found by stability analysis
+    """
+    # Find optimal max_lag
+    optimal_max_lag, sweep_data = find_optimal_max_lag(ts, fs,
+                                                       max_lag_range=max_lag_range, stability_threshold=stability_threshold)
+    
+    # Use optimal max_lag for final estimation
+    r = acf(ts, nlags=optimal_max_lag, fft=True)
+    # r = compute_acf(ts, use_fft=True)[0, :optimal_max_lag]
+    ks = np.arange(len(r))
+    
+    # Better initialization
+    tau_init_idx = np.where(r < 0.4)[0]
+    if len(tau_init_idx) > 0:
+        tau_init = tau_init_idx[0] / fs
+    else:
+        tau_init = 2.0
+        
+    p0 = (tau_init, 0.0)
+    bounds = ((0.1, -0.5), (100.0, 0.5))
+    
+    try:
+        popt, _ = curve_fit(lambda k, tau, B: offset_exp_steps(k, tau, B, fs), 
+                            ks, r, p0=p0, bounds=bounds)
+        tau_final, B_final = popt
+    except:
+        tau_final, B_final = np.nan, np.nan
+    
+    return tau_final, B_final, r, sweep_data
