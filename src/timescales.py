@@ -84,10 +84,13 @@ class Timescales(DataLoader):
         modality: str,
         seg: str = None,
         metadata: Dict = None,
-        use_pickle: bool = False
     ) -> Path:
         """Save subject-specific output data with key-value naming."""
-        suffix = '.pkl' if use_pickle else '.npy'
+        if data.ndim == 1:
+            suffix = '.txt'
+        elif data.ndim > 1:
+            suffix = '.npy'
+        
         filepath = self._get_output_filepath(
             subject_id=subject_id,
             output_type=output_type,
@@ -99,17 +102,13 @@ class Timescales(DataLoader):
         )
         
         # Save data
-        if use_pickle:
-            with open(filepath, 'wb') as f:
-                pickle.dump({'data': data, 'metadata': metadata}, f)
-        else:
-            if metadata is not None:
-                # Save as npz with metadata
-                np.savez(filepath.with_suffix('.npz'), 
-                        data=data, 
-                        metadata=metadata)
-            else:
-                np.save(filepath, data)
+        if suffix == '.npy' and metadata is not None:
+            np.savez(filepath.with_suffix('.npz'), 
+                     data=data, metadata=metadata)
+        elif suffix == '.npy' and metadata is None:
+            np.save(filepath, data)
+        elif suffix == '.txt':
+            np.savetxt(filepath, data)
         
         return filepath
 
@@ -120,10 +119,9 @@ class Timescales(DataLoader):
         task: str,
         modality: str,
         seg: str = None,
-        use_pickle: bool = False
     ) -> Optional[Any]:
         """Load previously saved subject-specific output with key-value naming."""
-        suffix = '.pkl' if use_pickle else '.npy'
+        suffix = '.npy'
         filepath = self._get_output_filepath(
             subject_id=subject_id,
             output_type=output_type,
@@ -137,21 +135,22 @@ class Timescales(DataLoader):
         # Check for .npz if .npy doesn't exist
         if not filepath.exists() and suffix == '.npy':
             filepath = filepath.with_suffix('.npz')
+            # if that doesn't find the file, try .txt
+            if not filepath.exists():
+                filepath = filepath.with_suffix('.txt')
         
         if not filepath.exists():
             return None
         
         # Load data
         try:
-            if use_pickle:
-                with open(filepath, 'rb') as f:
-                    loaded = pickle.load(f)
-                    return loaded.get('data', loaded)
-            elif filepath.suffix == '.npz':
+            if filepath.suffix == '.npz':
                 loaded = np.load(filepath, allow_pickle=True)
                 return loaded['data']
-            else:
+            elif filepath.suffix == '.npy':
                 return np.load(filepath)
+            elif filepath.suffix == '.txt':
+                return np.loadtxt(filepath)
         except Exception as e:
             print(f"Warning: Could not load {filepath}: {e}")
             return None
@@ -373,9 +372,6 @@ class Timescales(DataLoader):
                 elif method == 'auc_zero_crossing':
                     # Area under curve
                     timescales = self._compute_auc(acf, tr, max_lag=None)
-                elif method == 'auc_100':
-                    # Area under curve
-                    timescales = self._compute_auc(acf, tr, max_lag=100)
                 elif method == 'decay_time_1e':
                     # Time to decay to 1/e
                     threshold = 1 / np.e
@@ -384,24 +380,12 @@ class Timescales(DataLoader):
                     # Time to decay to 1/e
                     threshold = 0.5
                     timescales = self._compute_decay_time(acf, tr, threshold)
-                elif method == 'exponential_tau':
-                    fs = 1 / tr
-                    timescales, fit_infos = self._compute_tau_from_acf(acf, fs)
-                    tau_fit_infos[scan_key] = fit_infos
-                elif method == 'tau_optimized':
-                    if use_residuals and condition == 'task':
-                        timeseries_scan = self.timeseries_residuals[scan_key]
-                    else:
-                        timeseries_scan = self.timeseries_data[scan_key]
-                    fs = 1 / tr
-                    timescales, _ = self._compute_optimized_tau_B(timeseries_scan, fs)
-                elif method == 'B_optimized':
-                    if use_residuals and condition == 'task':
-                        timeseries_scan = self.timeseries_residuals[scan_key]
-                    else:
-                        timeseries_scan = self.timeseries_data[scan_key]
-                    fs = 1 / tr
-                    _, timescales = self._compute_optimized_tau_B(timeseries_scan, fs)
+                elif method == 'tau':
+                    # Compute tau for each parcel
+                    timescales = self._compute_tau_from_acf(acf, tr, version='loglin')
+                elif method == 'tau_murray':
+                    # Compute tau for each parcel using Murray et al. 2014
+                    timescales = self._compute_tau_from_acf(acf, tr, version='murray')
                 else:
                     raise ValueError(f"Unknown method: {method}")
                 
@@ -588,64 +572,28 @@ class Timescales(DataLoader):
         
         return decay_times
 
-    def _compute_tau_from_acf(self, acf: np.ndarray, fs: float, max_lag_ms=None):
-        """
-        Compute neuronal timescale (tau) from pre-computed autocorrelation function.
-        
-        Based on Gao et al. 2020, Figure 1C methodology.
-        
-        Parameters:
-        -----------
-        acf : array-like
-            Pre-computed autocorrelation function. Should be normalized (ACF[0] = 1).
-        fs : float
-            Sampling frequency in Hz
-        max_lag_ms : float, optional
-            Maximum lag to consider in milliseconds. If None, uses full ACF.
-            
-        Returns:
-        --------
-        tau : float or array
-            Timescale(s) in seconds
-        fit_info : dict
-            Diagnostic information about the fit
-        """
-        # Ensure input is 2D (n_series, n_lags)
-        n_parcels, n_lags = acf.shape
-        
-        # Create lag times in seconds
-        lags = np.arange(n_lags) / fs
-        
-        # Limit to max_lag_ms if specified
-        if max_lag_ms is not None:
-            max_lag_samples = int(max_lag_ms * fs / 1000)
-            max_lag_samples = min(max_lag_samples, n_lags)
-            acf = acf[:, :max_lag_samples]
-            lags = lags[:max_lag_samples]
-            n_lags = max_lag_samples
-        
-        taus = np.zeros(n_parcels)
-        fit_infos = []
+    def _compute_tau_from_acf(self, acf: np.ndarray, tr: float, version: str):
+        """Compute tau for each parcel using Murray et al. 2014."""
+        n_parcels = acf.shape[0]
+        n_lags = acf.shape[1]
+        tau = np.zeros(n_parcels)
         
         for i in range(n_parcels):
-            acf_single = acf[i, :]
-            
-            tau, fit_info = fit_exponential_decay(lags, acf_single)
-            taus[i] = tau
-            fit_infos.append(fit_info)
-        
-        return taus, fit_infos
+            if version == 'loglin':
+                tau[i], A = fit_tau(acf[i], delta=tr)
+            elif version == 'murray':
+                if n_lags > 1000:
+                    negative_indices = np.where(acf[i] < 0)[0]
+                    if len(negative_indices) > 0:
+                        time_window = negative_indices[0] + (negative_indices[0] * 0.25)
+                        max_lag = get_acf_time_index(time_window=time_window, tr=tr)
+                        tau[i], B, A = fit_tau_murray(acf[i, :max_lag], delta=tr)
+                    else:
+                        tau[i], B, A = fit_tau_murray(acf[i], delta=tr)
+                else:
+                    tau[i], B, A = fit_tau_murray(acf[i], delta=tr)
 
-    def _compute_optimized_tau_B(self, timeseries_scan: np.ndarray, fs: float) -> np.ndarray:
-        """Find first zero crossing for each parcel."""
-        n_parcels = timeseries_scan.shape[0]
-        tau_final = np.zeros(n_parcels)
-        B_final = np.zeros(n_parcels)
-        
-        for i in range(n_parcels):
-            tau_final[i], B_final[i], r, sweep_data = estimate_offset_with_optimal_lag(timeseries_scan[i], fs)
-        
-        return tau_final, B_final
+        return tau
 
     # ==================== Deconfounding Functions ====================
     def regress_task_structure(self):
@@ -845,6 +793,97 @@ def compute_acf(
             autocorr_list.append(acf)
             
     return np.array(autocorr_list)
+
+def fit_tau(acf, delta):
+    """
+    Fast tau estimation without offset (log-linear fit).
+    """
+    k = np.arange(1, len(acf))  # Skip k=0 to avoid log(acf[0])=log(1)=0
+    
+    # Only use positive ACF values
+    mask = acf[k] > 0
+    k_valid = k[mask]
+    acf_valid = acf[k][mask]
+    
+    # Linear fit: log(ACF) = log(A) - k*delta/tau
+    log_acf = np.log(acf_valid)
+    slope, intercept = np.polyfit(k_valid, log_acf, 1)
+    
+    tau = -delta / slope
+    A = np.exp(intercept)
+    
+    return tau, A
+
+def fit_tau_murray(acf, delta):
+    """
+    Fit intrinsic timescale (tau) using Murray et al. 2014 approach.
+    
+    Fits: R(kΔ) = A[exp(-kΔ/τ) + B]
+    
+    Parameters
+    ----------
+    acf : np.ndarray
+        Normalized autocorrelation function (ACF[0] should be ~1)
+    delta : float
+        Time bin width (e.g., 0.05 for 50ms bins, or TR for fMRI)
+    
+    Returns
+    -------
+    tau : float
+        Intrinsic timescale
+    B : float
+        Offset (reflects long timescales)
+    A : float
+        Amplitude
+    """
+    def murray_model(k, A, tau, B):
+        return A * (np.exp(-k * delta / tau) + B)
+    
+    k = np.arange(len(acf))
+    
+    # Smarter initialization
+    # Tau: find where ACF drops to ~0.4
+    tau_init_idx = np.where(acf < 0.4)[0]
+    if len(tau_init_idx) > 0:
+        tau_init = tau_init_idx[0] * delta
+    else:
+        tau_init = len(acf) * delta / 4
+    
+    # A: approximate from ACF[0]
+    A_init = acf[0] / (1 + 0.1)  # assume B ~ 0.1
+    
+    # B: small positive value
+    B_init = 0.1
+    
+    p0 = [A_init, tau_init, B_init]
+    bounds = ([0, 0, -0.5], [2, np.inf, 0.5])
+    
+    popt, _ = curve_fit(murray_model, k, acf, p0=p0, bounds=bounds, maxfev=5000)
+    
+    A, tau, B = popt
+    return tau, B, A
+
+def get_acf_time_index(time_window=25, tr=None):
+    """
+    Returns the slice endpoint for an ACF array to cover a specified time window.
+    
+    Parameters
+    ----------
+    time_window : float, optional
+        Length of time to return in seconds (default: 25)
+    tr : float
+        Repetition time in seconds
+        
+    Returns
+    -------
+    int
+        Slice endpoint (use as acf[:endpoint] to get lags 0 to n)
+    """
+    if tr is None:
+        raise ValueError("TR must be provided")
+    
+    max_lag = int(time_window / tr)
+    return max_lag + 1
 
 def apply_bandpass_filter(
     timeseries,
@@ -1081,104 +1120,6 @@ def calculate_tsnr(timeseries_matrix):
     
     return tsnr
 
-def offset_exp_steps(k, tau, B, fs):
-    """Exponential decay model with offset"""
-    return (1 - B) * np.exp(-k / (tau * fs)) + B
-
-def find_optimal_max_lag(ts, fs, max_lag_range=None, stability_threshold=1):
-    """
-    Find the optimal max_lag for fitting by sweeping through different values
-    and finding where tau and B estimates become stable.
-    """
-    n = len(ts)
-    
-    if max_lag_range is None:
-        min_lag = 5
-        # max_lag_limit = n // 4
-        max_lag_limit = 30
-        max_lag_range = np.arange(min_lag, max_lag_limit, 1)
-    
-    tau_estimates = []
-    B_estimates = []
-    max_lags_tested = []
-    rmse_values = []
-    
-    for max_lag in max_lag_range:
-        if max_lag >= n // 4:  # Don't exceed reasonable limit
-            break
-            
-        try:
-            # Compute autocorrelation
-            r = acf(ts, nlags=max_lag, fft=True)
-            # r = compute_acf(ts, use_fft=True)[0, :max_lag]
-            ks = np.arange(len(r))
-            
-            # Better initialization for tau
-            tau_init_idx = np.where(r < 0.4)[0]
-            if len(tau_init_idx) > 0:
-                tau_init = tau_init_idx[0] / fs
-            else:
-                tau_init = 2.0
-            
-            p0 = (tau_init, 0.0)
-            bounds = ((0.1, -0.5), (100.0, 0.5))
-            
-            # Fit the model
-            popt, _ = curve_fit(lambda k, tau, B: offset_exp_steps(k, tau, B, fs), 
-                               ks, r, p0=p0, bounds=bounds)
-            
-            # Check fit quality
-            fitted = offset_exp_steps(ks, popt[0], popt[1], fs)
-            rmse = np.sqrt(np.mean((r - fitted)**2))
-            
-            tau_estimates.append(popt[0])
-            B_estimates.append(popt[1])
-            max_lags_tested.append(max_lag)
-            rmse_values.append(rmse)
-        except:
-            continue
-    
-    if len(tau_estimates) < 3:  # Need at least 3 points
-        return max_lag_range[len(max_lag_range)//2], None
-    
-    # Convert to arrays
-    tau_estimates = np.array(tau_estimates)
-    B_estimates = np.array(B_estimates)
-    max_lags_tested = np.array(max_lags_tested)
-    rmse_values = np.array(rmse_values)
-    
-    # Calculate relative changes
-    tau_rel_changes = np.abs(np.diff(tau_estimates)) / (tau_estimates[:-1] + 1e-6) * 100
-    B_rel_changes = np.abs(np.diff(B_estimates)) / (np.abs(B_estimates[:-1]) + 1e-6) * 100
-    
-    # Find where both tau and B are stable
-    stable_mask = (tau_rel_changes < stability_threshold) & (B_rel_changes < stability_threshold)
-    
-    if np.any(stable_mask):
-        # Find first stable point (shortest max_lag with stability)
-        first_stable_idx = np.where(stable_mask)[0][0] + 1  # +1 because diff reduces length by 1
-        optimal_max_lag = max_lags_tested[first_stable_idx]
-    else:
-        # If no stability found, use the one with lowest RMSE in the second half
-        second_half_idx = len(rmse_values) // 2
-        best_idx = second_half_idx + np.argmin(rmse_values[second_half_idx:])
-        optimal_max_lag = max_lags_tested[best_idx]
-    
-    # Package results
-    sweep_results = {
-        'max_lags': max_lags_tested,
-        'tau_estimates': tau_estimates,
-        'B_estimates': B_estimates,
-        'rmse_values': rmse_values,
-        'tau_rel_changes': tau_rel_changes,
-        'B_rel_changes': B_rel_changes,
-        'optimal_max_lag': optimal_max_lag,
-        'stability_threshold': stability_threshold
-    }
-    
-    return optimal_max_lag, sweep_results
-
-def estimate_offset_with_optimal_lag(ts, fs, max_lag_range=None, stability_threshold=0.05):
     """
     Estimate tau and B using optimal max_lag found by stability analysis
     """
