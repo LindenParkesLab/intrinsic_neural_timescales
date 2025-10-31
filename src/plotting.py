@@ -249,12 +249,14 @@ def plot_repeated_measures_violins(df, color_vector=None, figsize=(15, 8),
         for i, condition in enumerate(conditions):
             # Get data values for this condition
             condition_values = df[condition].values
+            nan_mask = df[condition].isnull().values
+            nan_mask = ~nan_mask
             
             # Compute correlation
             if correlation_method.lower() == 'pearson':
-                correlation, _ = pearsonr(condition_values, color_vector)
+                correlation, _ = pearsonr(condition_values[nan_mask], color_vector[nan_mask])
             elif correlation_method.lower() == 'spearman':
-                correlation, _ = spearmanr(condition_values, color_vector)
+                correlation, _ = spearmanr(condition_values[nan_mask], color_vector[nan_mask])
             else:
                 raise ValueError("correlation_method must be 'pearson' or 'spearman'")
             
