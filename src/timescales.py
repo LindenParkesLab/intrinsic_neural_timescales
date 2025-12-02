@@ -10,6 +10,7 @@ pyfftw.interfaces.cache.enable()  # Cache FFT plans
 from pyfftw.interfaces.numpy_fft import rfft, irfft
 from scipy.optimize import curve_fit
 from statsmodels.tsa.stattools import acf
+from collections import defaultdict
 
 from src.data import DataLoader, parse_scan_string, build_scan_string
 
@@ -194,11 +195,10 @@ class Timescales(DataLoader):
     def compute_autocorrelation_function(
         self,
         use_fft: bool = False,
-        freq_window: tuple = None,
-        filter_order: int = 4,
         force_recompute: bool = False,
         save_outputs: bool = True,
         use_residuals: bool = False,
+        lowpass_cutoff: float = None,
         verbose: bool = True
     ):
         """
@@ -211,10 +211,10 @@ class Timescales(DataLoader):
         n_loaded = 0
         n_computed = 0
         n_failed = 0
-        if freq_window is None:
+        if lowpass_cutoff is None:
             output_type = 'autocorr'
         else:
-            output_type = f'autocorr_freq-{freq_window[0]}hz-{freq_window[1]}hz'
+            output_type = f'autocorr_lp-{lowpass_cutoff}hz'
         if use_residuals:
             output_type = output_type + '_resids'
 
@@ -253,14 +253,11 @@ class Timescales(DataLoader):
                 else:
                     timeseries_scan = self.timeseries_data[scan_key]
 
-                acf_result = compute_acf(
-                    timeseries_scan,
-                    use_fft=use_fft,
-                    freq_window=freq_window,
-                    tr=tr,
-                    filter_order=filter_order
-                )
-                
+                if lowpass_cutoff is not None:
+                    sampling_freq = 1 / tr
+                    timeseries_scan = apply_lowpass_filter(timeseries_scan, sampling_freq, lowpass_cutoff)
+                acf_result = compute_acf(timeseries_scan, use_fft=use_fft)
+
                 autocorr_dict[scan_key] = acf_result
                 n_computed += 1
                 
@@ -275,8 +272,7 @@ class Timescales(DataLoader):
                         seg=seg,
                         metadata={
                             'use_fft': use_fft,
-                            'freq_window': freq_window,
-                            'filter_order': filter_order,
+                            'lowpass_cutoff': lowpass_cutoff,
                             'tr': tr,
                             'modality': modality,
                             'dataset': self.dataset
@@ -385,7 +381,10 @@ class Timescales(DataLoader):
                     timescales = self._compute_tau_from_acf(acf, tr, version='loglin')
                 elif method == 'tau_murray':
                     # Compute tau for each parcel using Murray et al. 2014
-                    timescales = self._compute_tau_from_acf(acf, tr, version='murray')
+                    timescales, _ = self._compute_tau_from_acf(acf, tr, version='murray')
+                elif method == 'B_murray':
+                    # Compute B for each parcel using Murray et al. 2014
+                    _, timescales = self._compute_tau_from_acf(acf, tr, version='murray')
                 else:
                     raise ValueError(f"Unknown method: {method}")
                 
@@ -577,23 +576,28 @@ class Timescales(DataLoader):
         n_parcels = acf.shape[0]
         n_lags = acf.shape[1]
         tau = np.zeros(n_parcels)
+        B = np.zeros(n_parcels)
         
         for i in range(n_parcels):
             if version == 'loglin':
                 tau[i], A = fit_tau(acf[i], delta=tr)
             elif version == 'murray':
+                # tau[i], B[i], A = fit_tau_murray(acf[i], delta=tr)
                 if n_lags > 1000:
                     negative_indices = np.where(acf[i] < 0)[0]
                     if len(negative_indices) > 0:
-                        time_window = negative_indices[0] + (negative_indices[0] * 0.25)
+                        time_window = negative_indices[0] + (negative_indices[0] * 0.5)
                         max_lag = get_acf_time_index(time_window=time_window, tr=tr)
-                        tau[i], B, A = fit_tau_murray(acf[i, :max_lag], delta=tr)
+                        tau[i], B[i], A = fit_tau_murray(acf[i, :max_lag], delta=tr)
                     else:
-                        tau[i], B, A = fit_tau_murray(acf[i], delta=tr)
+                        tau[i], B[i], A = fit_tau_murray(acf[i], delta=tr)
                 else:
-                    tau[i], B, A = fit_tau_murray(acf[i], delta=tr)
+                    tau[i], B[i], A = fit_tau_murray(acf[i], delta=tr)
 
-        return tau
+        if version == 'murray':
+            return tau, B
+        else:
+            return tau
 
     # ==================== Deconfounding Functions ====================
     def regress_task_structure(self):
@@ -717,9 +721,6 @@ class Timescales(DataLoader):
 def compute_acf(
         data,
         use_fft: bool = False,
-        freq_window: tuple = None,
-        tr: float = None, 
-        filter_order: int = 4
     ):
     """
     Compute autocorrelation function for time series data with optional frequency filtering.
@@ -730,26 +731,12 @@ def compute_acf(
         2D array (n_parcels, n_timepoints) or 1D array (single time series)
     use_fft : bool, default=False
         Whether to use FFT for computation
-    freq_window : tuple, optional
-        Frequency band (low_freq, high_freq) in Hz for filtering.
-        Requires tr to be specified.
-        Time-domain filtering is applied before ACF computation.
-    tr : float, optional
-        Acquisition timing. sampling rate in Hz is 1 / tr
-    filter_order : int, default=4
-        Order of Butterworth filter for frequency filtering
         
     Returns:
     --------
     autocorr : ndarray
         Autocorrelation function(s)
     """
-    
-    # Validation
-    if freq_window is not None and tr is None:
-        raise ValueError("tr must be specified when using freq_window")
-    elif freq_window is not None and tr is not None:
-        sampling_rate = 1 / tr
     
     if data.ndim == 1:
         data = data.reshape(1, -1)
@@ -758,14 +745,8 @@ def compute_acf(
     
     for timeseries in data:
         if np.std(timeseries) > 0:  # Avoid division by zero
-            # Apply frequency filtering BEFORE computing autocorrelation
-            if freq_window is not None:
-                timeseries_filtered = apply_bandpass_filter(timeseries, sampling_rate, freq_window, filter_order)
-            else:
-                timeseries_filtered = timeseries.copy()
-            
             # Standardize the (potentially filtered) time series
-            standardized = (timeseries_filtered - np.mean(timeseries_filtered)) / np.std(timeseries_filtered)
+            standardized = (timeseries - np.mean(timeseries)) / np.std(timeseries)
             n = len(standardized)
             
             if use_fft:
@@ -885,49 +866,40 @@ def get_acf_time_index(time_window=25, tr=None):
     max_lag = int(time_window / tr)
     return max_lag + 1
 
-def apply_bandpass_filter(
-    timeseries,
-    sampling_rate: float,
-    freq_window: tuple,
-    filter_order: int = 4
-    ):
+def apply_lowpass_filter(data, sampling_freq, lowpass_cutoff):
     """
-    Apply bandpass filter to time series using Butterworth filter.
+    Apply progressive lowpass filtering to MEG data and compute autocorrelation functions.
     
-    Parameters:
-    -----------
-    timeseries : ndarray
-        1D time series data
-    sampling_rate : float
-        Sampling rate in Hz
-    freq_window : tuple
-        (low_freq, high_freq) in Hz
-    filter_order : int
-        Order of Butterworth filter
+    Parameters
+    ----------
+    data : ndarray
+        Data with shape (n_regions, n_timepoints)
+    sampling_freq : float
+        Sampling frequency in Hz (e.g., 500)
+    lowpass_cutoff : float
+        Frequency cutoff in Hz for lowpass filtering (e.g., 50, 30, 10, 5, 1, 0.5)
+        Filter will remove faster fluctuations
+
+    """
+    n_regions, n_timepoints = data.shape
+
+    # Design lowpass filter (Butterworth, 4th order)
+    nyquist = sampling_freq / 2
+    normalized_cutoff = lowpass_cutoff / nyquist
+    
+    # Ensure lowpass_cutoff is below Nyquist frequency
+    if normalized_cutoff >= 1.0:
+        print(f"Warning: Cutoff {lowpass_cutoff} Hz is >= Nyquist frequency {nyquist} Hz.")
         
-    Returns:
-    --------
-    timeseries_filtered : ndarray
-        Filtered time series
-    """
-    low_freq, high_freq = freq_window
-    nyquist = sampling_rate / 2.0
+    b, a = sp.signal.butter(4, normalized_cutoff, btype='low')
     
-    # Normalize frequencies to Nyquist frequency
-    low_norm = low_freq / nyquist
-    high_norm = high_freq / nyquist
-    
-    # Ensure frequencies are within valid range
-    low_norm = max(low_norm, 0.001)  # Avoid DC component issues
-    high_norm = min(high_norm, 0.999)  # Avoid Nyquist frequency issues
-    
-    # Design Butterworth bandpass filter
-    b, a = sp.signal.butter(filter_order, [low_norm, high_norm], btype='band')
-    
-    # Apply filter using filtfilt for zero-phase filtering
-    timeseries_filtered = sp.signal.filtfilt(b, a, timeseries)
-    
-    return timeseries_filtered
+    # Filter each region
+    filtered_data = np.zeros_like(data)
+    for region_idx in range(n_regions):
+        # Use filtfilt for zero-phase filtering
+        filtered_data[region_idx, :] = sp.signal.filtfilt(b, a, data[region_idx, :])
+            
+    return filtered_data
 
 def create_design_matrix_nilearn(
     events,
@@ -1150,3 +1122,410 @@ def calculate_tsnr(timeseries_matrix):
         tau_final, B_final = np.nan, np.nan
     
     return tau_final, B_final, r, sweep_data
+
+# ==================== Standalone Utility Functions (for use in notebooks) ====================
+def filter_data_dict(data_dict, data_dict_residuals=None):
+    
+    remove_these_keys = []
+    for scan_key in data_dict.keys():
+        if data_dict[scan_key] is None:
+            sub_key = scan_key.split('_')[0]
+            remove_these_keys.append([k for k, v in data_dict.items() if sub_key in k])
+
+    if data_dict_residuals is not None:
+        for scan_key in data_dict.keys():
+            if 'condition-task' in scan_key:
+                try:
+                    data_dict[scan_key] = data_dict_residuals[scan_key].copy()
+                except:
+                    sub_key = scan_key.split('_')[0]
+                    remove_these_keys.append([k for k, v in data_dict.items() if sub_key in k])
+
+    remove_these_keys = [item for sublist in remove_these_keys for item in sublist]
+    for remove_key in remove_these_keys:
+        try:
+            del data_dict[remove_key]
+        except:
+            pass
+
+    if data_dict_residuals is None:
+        return data_dict
+    else:
+        return data_dict, data_dict_residuals
+
+def create_ints_dataframe_custom_grouping(data_dict, n_regions=400,
+                                          average_3t_rest=False, average_3t_task_pairs=False, 
+                                          average_7t_rest=False, average_7t_movies=False, 
+                                          average_meg_rest=False, average_meg_task=False,
+                                          sort_by_median=False):
+    """
+    Create a dataframe with brain regions as indices and unique scans as columns.
+    Groups scans by scan type only (ignoring subject, modality, condition, atlas).
+    Values represent INTs averaged over subjects for each scan type.
+    
+    Parameters:
+    -----------
+    data_dict : dict
+        Dictionary where keys are scan strings like 
+        'sub-100307_modality-MEG_condition-rest_scan-3Restin_atlas-Schaefer4007'
+        and values are vectors of INTs (one per brain region)
+    n_regions : int, default 400
+        Number of brain regions
+    average_3t_rest : bool, default False
+        If True, average 3T rest scans (rfMRIREST1LR, rfMRIREST1RL, etc.) into "REST_3T"
+    average_3t_task_pairs : bool, default False
+        If True, average 3T task LR/RL pairs (e.g., tfMRIWMLR + tfMRIWMRL)
+    average_7t_rest : bool, default False
+        If True, average 7T rest scans (rfMRIREST17TPA, rfMRIREST27TAP, etc.) into "REST_7T"
+    average_7t_movies : bool, default False
+        If True, average 7T movie scans (tfMRIMOVIE17TAP, tfMRIMOVIE27TPA, etc.) into "MOVIE"
+    sort_by_median : bool, default False
+        If True, sort columns by their mean INT values in descending order
+    
+    Returns:
+    --------
+    df_ints : pd.DataFrame
+        DataFrame with brain regions as index and unique scan types as columns.
+        Values are INTs averaged across subjects for each scan type.
+    """
+    
+    def extract_scan_name(scan_key):
+        """Extract just the scan part from a full scan key."""
+        parts = scan_key.split('_')
+        for part in parts:
+            if part.startswith('task-'):
+                return part
+        return None
+    
+    # Group scans by scan type only
+    scan_groups = defaultdict(list)
+    
+    for scan_key, ints_vector in data_dict.items():
+        scan_name = extract_scan_name(scan_key)
+        if scan_name:
+            scan_groups[scan_name].append(ints_vector)
+    
+    # Check that all vectors have the expected length
+    for scan_key, ints_vector in data_dict.items():
+        if len(ints_vector) != n_regions:
+            raise ValueError(f"Expected {n_regions} regions, but scan {scan_key} has {len(ints_vector)} values")
+    
+    # Calculate mean INTs for each scan type across subjects
+    averaged_data = {}
+    
+    for scan_name, vectors_list in scan_groups.items():
+        if len(vectors_list) > 0:
+            stacked_vectors = np.stack(vectors_list, axis=0)
+            mean_vector = np.nanmean(stacked_vectors, axis=0)
+            # mean_vector = np.nanmedian(stacked_vectors, axis=0)
+            averaged_data[scan_name] = mean_vector
+            
+            print(f"Scan: {scan_name}")
+            print(f"  Number of subjects: {len(vectors_list)}")
+            print(f"  Mean INT range: [{mean_vector.min():.3f}, {mean_vector.max():.3f}]")
+    
+    # Apply optional scan averaging
+    if average_7t_rest or average_7t_movies or average_3t_rest or average_3t_task_pairs:
+        print(f"\nApplying optional scan averaging...")
+
+    # Average 3T rest scans  
+    if average_3t_rest:
+        rest_3t_scans = ['task-rfMRIREST1LR', 'task-rfMRIREST1RL', 'task-rfMRIREST2LR', 'task-rfMRIREST2RL',
+                         'task-rfMRIREST1AP', 'task-rfMRIREST1PA', 'task-rfMRIREST2AP', 'task-rfMRIREST2PA']
+        rest_3t_data = []
+        rest_3t_found = []
+        
+        for scan_name in list(averaged_data.keys()):
+            if scan_name in rest_3t_scans:
+                rest_3t_data.append(averaged_data[scan_name])
+                rest_3t_found.append(scan_name)
+                del averaged_data[scan_name]
+        
+        if rest_3t_data:
+            rest_3t_mean = np.nanmean(np.stack(rest_3t_data, axis=0), axis=0)
+            averaged_data['task-REST3T'] = rest_3t_mean
+            print(f"  Averaged {len(rest_3t_data)} 3T rest scans into: scan-REST3T")
+    
+    # Average 3T task LR/RL pairs
+    if average_3t_task_pairs:
+        task_pairs = {}
+        
+        for scan_name in list(averaged_data.keys()):
+            if scan_name.startswith('task-tfMRI') and (scan_name.endswith('LR') or scan_name.endswith('RL') or scan_name.endswith('AP') or scan_name.endswith('PA')):
+                # Get base task name (remove LR/RL)
+                base_task = scan_name[:-2]  # Remove last 2 characters (LR or RL)
+                
+                if base_task not in task_pairs:
+                    task_pairs[base_task] = []
+                task_pairs[base_task].append((scan_name, averaged_data[scan_name]))
+        
+        # Average pairs and remove originals
+        for base_task, scan_list in task_pairs.items():
+            if len(scan_list) == 2:  # We have both LR and RL
+                vectors = [item[1] for item in scan_list]
+                pair_mean = np.nanmean(np.stack(vectors, axis=0), axis=0)
+                
+                # Remove original scans
+                for scan_name, _ in scan_list:
+                    del averaged_data[scan_name]
+                
+                # Create new scan name
+                new_scan_name = base_task  # base_task already includes 'task-'
+                averaged_data[new_scan_name] = pair_mean
+                print(f"  Averaged LR/RL pair for {base_task} into: {new_scan_name}")
+
+    # Average 7T rest scans
+    if average_7t_rest:
+        rest_7t_scans = ['task-rfMRIREST17TPA', 'task-rfMRIREST27TAP', 'task-rfMRIREST37TPA', 'task-rfMRIREST47TAP']
+        rest_7t_data = []
+        rest_7t_found = []
+        
+        for scan_name in list(averaged_data.keys()):
+            if scan_name in rest_7t_scans:
+                rest_7t_data.append(averaged_data[scan_name])
+                rest_7t_found.append(scan_name)
+                del averaged_data[scan_name]
+        
+        if rest_7t_data:
+            rest_7t_mean = np.nanmean(np.stack(rest_7t_data, axis=0), axis=0)
+            averaged_data['task-REST7T'] = rest_7t_mean
+            print(f"  Averaged {len(rest_7t_data)} 7T rest scans into: scan-REST7T")
+    
+    # Average 7T movie scans
+    if average_7t_movies:
+        movie_7t_scans = ['task-tfMRIMOVIE17TAP', 'task-tfMRIMOVIE27TPA', 'task-tfMRIMOVIE37TPA', 'task-tfMRIMOVIE47TAP']
+        movie_7t_data = []
+        movie_7t_found = []
+        
+        for scan_name in list(averaged_data.keys()):
+            if scan_name in movie_7t_scans:
+                movie_7t_data.append(averaged_data[scan_name])
+                movie_7t_found.append(scan_name)
+                del averaged_data[scan_name]
+        
+        if movie_7t_data:
+            movie_7t_mean = np.nanmean(np.stack(movie_7t_data, axis=0), axis=0)
+            averaged_data['task-MOVIE'] = movie_7t_mean
+            print(f"  Averaged {len(movie_7t_data)} 7T movie scans into: scan-MOVIE")
+            
+    # Average MEG rest scans
+    if average_meg_rest:
+        rest_meg_scans = ['task-3Restin', 'task-4Restin', 'task-5Restin']
+        rest_meg_data = []
+        rest_meg_found = []
+        
+        for scan_name in list(averaged_data.keys()):
+            if scan_name in rest_meg_scans:
+                rest_meg_data.append(averaged_data[scan_name])
+                rest_meg_found.append(scan_name)
+                del averaged_data[scan_name]
+        
+        if rest_meg_data:
+            rest_meg_mean = np.nanmean(np.stack(rest_meg_data, axis=0), axis=0)
+            averaged_data['task-RESTMEG'] = rest_meg_mean
+            print(f"  Averaged {len(rest_meg_data)} MEG rest scans into: scan-RESTMEG")
+
+    # Average MEG task scans
+    if average_meg_task:
+        task_meg_scans = ['task-6Wrkmem', 'task-7Wrkmem']
+        task_meg_data = []
+        task_meg_found = []
+        
+        for scan_name in list(averaged_data.keys()):
+            if scan_name in task_meg_scans:
+                task_meg_data.append(averaged_data[scan_name])
+                task_meg_found.append(scan_name)
+                del averaged_data[scan_name]
+        
+        if task_meg_data:
+            task_meg_mean = np.nanmean(np.stack(task_meg_data, axis=0), axis=0)
+            averaged_data['task-TASKMEG'] = task_meg_mean
+            print(f"  Averaged {len(task_meg_data)} MEG task scans into: scan-TASKMEG")
+
+    # Create DataFrame
+    df_ints = pd.DataFrame(averaged_data)
+    df_ints.index.name = 'brain_region'
+    df_ints.index = range(n_regions)
+    
+    # Sort columns by mean if requested
+    if sort_by_median:
+        # column_summary_stat = df_ints.mean(axis=0)
+        column_summary_stat = df_ints.median(axis=0)
+        sorted_columns = column_summary_stat.sort_values(ascending=False).index
+        df_ints = df_ints[sorted_columns]
+        print(f"Sorted columns by mean INT values (descending order)")
+    
+    print(f"\nCreated DataFrame with shape: {df_ints.shape}")
+    print(f"Brain regions (rows): {df_ints.shape[0]}")
+    print(f"Unique scan types (columns): {df_ints.shape[1]}")
+    print(f"Final scan types: {list(df_ints.columns)}")
+    
+    return df_ints
+
+def sort_and_group_timescales(timescales, brain_map, ntile=10):
+    n_nodes = len(brain_map)
+    brain_map_sort_idx = np.argsort(brain_map)
+    
+    timescales_sorted = timescales[:, brain_map_sort_idx]
+    timescales_sorted_dec = np.zeros((timescales_sorted.shape[0], ntile))
+
+    step_size = int(n_nodes / ntile)
+    counter = 0
+    for i in np.arange(0, n_nodes, step_size):
+        timescales_sorted_dec[:, counter] = timescales_sorted[:, i:i+step_size].mean(axis=1)
+        counter += 1
+        
+    return timescales_sorted_dec
+
+def convert_data_dict(data_dict, scan_registry, brain_map=None, verbose=True):
+    data_dict_converted = dict().fromkeys(scan_registry['task'].unique())
+
+    for task in data_dict_converted.keys():
+        task_filter = scan_registry['task'] == task
+        sub_list = list(scan_registry.loc[task_filter, 'scan_string'])
+        extracted_data = {key: data_dict[key] for key in sub_list if key in data_dict}
+        extracted_data = np.array(list(extracted_data.values()))
+
+        if brain_map is not None:
+            extracted_data = sort_and_group_timescales(extracted_data, brain_map)
+
+        data_dict_converted[task] = extracted_data
+        
+        if verbose:
+            print(task, extracted_data.shape)
+            
+    return data_dict_converted
+
+def average_data_dict_converted(data_dict_converted, average_7t_rest=False, average_3t_rest=False, 
+                                average_3t_task_pairs=False, average_7t_movies=False):
+    """
+    Apply scan averaging to a dictionary of scan data organized by brain systems.
+    
+    Parameters:
+    -----------
+    data_dict_converted : dict
+        Dictionary where keys are scan names (e.g., 'rfMRIREST1LR', 'tfMRIWMLR')
+        and values are arrays of shape (n_subjects, 10) where 10 corresponds to brain systems
+    average_7t_rest : bool, default False
+        If True, average 7T rest scans (rfMRIREST17TPA, rfMRIREST27TAP, etc.) into "REST_7T"
+    average_3t_rest : bool, default False
+        If True, average 3T rest scans (rfMRIREST1LR, rfMRIREST1RL, etc.) into "REST_3T"
+    average_3t_task_pairs : bool, default False
+        If True, average 3T task LR/RL pairs (e.g., tfMRIWMLR + tfMRIWMRL)
+    average_7t_movies : bool, default False
+        If True, average 7T movie scans (tfMRIMOVIE17TAP, tfMRIMOVIE27TPA, etc.) into "MOVIE"
+    
+    Returns:
+    --------
+    averaged_dict : dict
+        Dictionary with averaged scan data, same structure as input but with averaged scans
+    """
+    
+    # Create a copy to avoid modifying the original
+    averaged_dict = data_dict_converted.copy()
+    
+    print("Applying scan averaging to centiles dictionary...")
+    
+    # 1. Average 7T rest scans
+    if average_7t_rest:
+        rest_7t_scans = ['rfMRIREST17TPA', 'rfMRIREST27TAP', 'rfMRIREST37TPA', 'rfMRIREST47TAP']
+        rest_7t_data = []
+        rest_7t_found = []
+        
+        for scan_name in list(averaged_dict.keys()):
+            if scan_name in rest_7t_scans:
+                rest_7t_data.append(averaged_dict[scan_name])
+                rest_7t_found.append(scan_name)
+                del averaged_dict[scan_name]
+        
+        if rest_7t_data:
+            # Average across the different 7T rest scans (axis=0 combines scans)
+            rest_7t_mean = np.nanmean(np.stack(rest_7t_data, axis=0), axis=0)
+            averaged_dict['REST7T'] = rest_7t_mean
+            print(f"  Averaged {len(rest_7t_data)} 7T rest scans into: REST7T")
+            print(f"    Shape: {rest_7t_mean.shape}")
+    
+    # 2. Average 3T rest scans  
+    if average_3t_rest:
+        rest_3t_scans = ['rfMRIREST1LR', 'rfMRIREST1RL', 'rfMRIREST2LR', 'rfMRIREST2RL',
+                         'rfMRIREST1AP', 'rfMRIREST1PA', 'rfMRIREST2AP', 'rfMRIREST2PA']
+        rest_3t_data = []
+        rest_3t_found = []
+        
+        for scan_name in list(averaged_dict.keys()):
+            if scan_name in rest_3t_scans:
+                rest_3t_data.append(averaged_dict[scan_name])
+                rest_3t_found.append(scan_name)
+                del averaged_dict[scan_name]
+        
+        if rest_3t_data:
+            rest_3t_mean = np.nanmean(np.stack(rest_3t_data, axis=0), axis=0)
+            averaged_dict['REST3T'] = rest_3t_mean
+            print(f"  Averaged {len(rest_3t_data)} 3T rest scans into: REST3T")
+            print(f"    Shape: {rest_3t_mean.shape}")
+    
+    # 3. Average 3T task LR/RL pairs
+    if average_3t_task_pairs:
+        task_pairs = {}
+        
+        for scan_name in list(averaged_dict.keys()):
+            if scan_name.startswith('tfMRI') and (scan_name.endswith('LR') or scan_name.endswith('RL')) or (scan_name.endswith('AP') or scan_name.endswith('PA')):
+                # Get base task name (remove LR/RL)
+                base_task = scan_name[:-2]  # Remove last 2 characters (LR or RL)
+                
+                if base_task not in task_pairs:
+                    task_pairs[base_task] = []
+                task_pairs[base_task].append((scan_name, averaged_dict[scan_name]))
+        
+        # Average pairs and remove originals
+        for base_task, scan_list in task_pairs.items():
+            if len(scan_list) == 2:  # We have both LR and RL
+                vectors = [item[1] for item in scan_list]
+                pair_mean = np.nanmean(np.stack(vectors, axis=0), axis=0)
+                
+                # Remove original scans
+                for scan_name, _ in scan_list:
+                    del averaged_dict[scan_name]
+                
+                # Create new scan name (remove tfMRI prefix for cleaner name)
+                new_scan_name = base_task.replace('tfMRI', '')  # e.g., 'tfMRIWM' -> 'WM'
+                averaged_dict[new_scan_name] = pair_mean
+                print(f"  Averaged LR/RL pair for {base_task} into: {new_scan_name}")
+                print(f"    Shape: {pair_mean.shape}")
+    
+    # 4. Average 7T movie scans
+    if average_7t_movies:
+        movie_7t_scans = ['tfMRIMOVIE17TAP', 'tfMRIMOVIE27TPA', 'tfMRIMOVIE37TPA', 'tfMRIMOVIE47TAP']
+        movie_7t_data = []
+        movie_7t_found = []
+        
+        for scan_name in list(averaged_dict.keys()):
+            if scan_name in movie_7t_scans:
+                movie_7t_data.append(averaged_dict[scan_name])
+                movie_7t_found.append(scan_name)
+                del averaged_dict[scan_name]
+        
+        if movie_7t_data:
+            movie_7t_mean = np.nanmean(np.stack(movie_7t_data, axis=0), axis=0)
+            averaged_dict['MOVIE'] = movie_7t_mean
+            print(f"  Averaged {len(movie_7t_data)} 7T movie scans into: MOVIE")
+            print(f"    Shape: {movie_7t_mean.shape}")
+    
+    # Print summary
+    print(f"\nFinal dictionary contains {len(averaged_dict)} scan types:")
+    for scan_name, data in averaged_dict.items():
+        print(f"  {scan_name}: {data.shape}")
+    
+    # Print summary of averaging operations
+    averaging_ops = []
+    if average_7t_rest: averaging_ops.append("7T rest")
+    if average_3t_rest: averaging_ops.append("3T rest") 
+    if average_3t_task_pairs: averaging_ops.append("3T task pairs")
+    if average_7t_movies: averaging_ops.append("7T movies")
+    
+    if averaging_ops:
+        print(f"\nApplied averaging for: {', '.join(averaging_ops)}")
+    else:
+        print("\nNo scan averaging applied")
+    
+    return averaged_dict
