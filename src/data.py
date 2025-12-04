@@ -122,7 +122,8 @@ class DataLoader:
     
     # Map dataset names to base directories
     RAWDATA_PATHS = {
-        'HCP-YA': os.path.join(BASE_PATHS['HCP-YA'], 'HCP_1200'),
+        # 'HCP-YA': os.path.join(BASE_PATHS['HCP-YA'], 'HCP_1200'),
+        'HCP-YA': '/mnt/synology/work/research_data/HCP_YA/HCP_1200/',
         'HCP-D': os.path.join(BASE_PATHS['HCP-D'], 'processed'),
         'WAND': os.path.join(BASE_PATHS['WAND'], 'bids'),
         'PNC': os.path.join(BASE_PATHS['PNC'], 'bids'),
@@ -132,7 +133,8 @@ class DataLoader:
     
     # Map dataset names to base directories
     DERIVDATA_PATHS = {
-        'HCP-YA': os.path.join(BASE_PATHS['HCP-YA'], 'derivatives'),
+        # 'HCP-YA': os.path.join(BASE_PATHS['HCP-YA'], 'derivatives'),
+        'HCP-YA': '/mnt/storage_ssd_raid/research_data/HCP_YA/derivatives',
         'HCP-D': os.path.join(BASE_PATHS['HCP-D'], 'derivatives'),
         'WAND': os.path.join(BASE_PATHS['WAND'], 'derivatives'),
         'PNC': os.path.join(BASE_PATHS['PNC'], 'derivatives'),
@@ -201,7 +203,7 @@ class DataLoader:
         if output_dir is not None:
             self.output_dir = Path(output_dir).expanduser()
         else:
-            self.output_dir = Path('/media/lindenmp/storage_ssd_1/research_projects/intrinsic_neural_timescales')
+            self.output_dir = Path('/home/lindenmp/research_projects/intrinsic_neural_timescales')
         
         # Create output directory if it doesn't exist
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -475,7 +477,7 @@ class DataLoader:
                 task_events_file_path = glob.glob(os.path.join(self.rawdata_dir, f'sub-{subject_id}', f'ses-{session}', 'func', f'sub-{subject_id}_ses-{session}_task-{task}_acq-1400*_events.tsv'))[0]
                 task_events = pd.read_csv(task_events_file_path, sep='\t')
             elif modality == 'MRI7T':
-                movie_metadata_dir = os.path.join(self.output_dir, 'data', 'movie_data')
+                movie_metadata_dir = os.path.join(self.output_dir, 'supporting_data', 'movie_data')
                 
                 if 'MOVIE1' in task:
                     timing_file = '7T_MOVIE1_CC1_v2_Video_Timing.csv'
@@ -990,3 +992,34 @@ def extract_block_numbers(data):
 def split_hcpd_string(s):
     """Split string by inserting underscores before V and M."""
     return re.sub(r'([VM])', r'_\1', s)
+
+# ==================== Standalone Utility Functions (for use in notebooks) ====================
+def load_supporting_data(in_dir):
+    
+    sa_axis_file = os.path.join(in_dir, 'schaefer400-7_sa-axis.npy')
+    sa_axis = np.load(sa_axis_file)
+    sa_axis = sp.stats.rankdata(sa_axis)
+
+    sf_axis_file = os.path.join(in_dir, 'schaefer400-7_cyto.npy')
+    sf_axis = np.load(sf_axis_file)
+    sf_axis = sp.stats.rankdata(sf_axis)
+
+    # Load parcellation data
+    parc_file = os.path.join(in_dir, 'Schaefer2018_400Parcels_7Networks_order_FSLMNI152_1mm.Centroid_RAS.csv')
+    parc = pd.read_csv(parc_file, header=0, names=['ROI_Label', 'ROI_Name', 'R', 'A', 'S'])
+
+    # Extract Yeo systems
+    yeo_systems = parc['ROI_Name']
+    yeo_systems = yeo_systems.str.replace('7Networks_LH_', '')
+    yeo_systems = yeo_systems.str.replace('7Networks_RH_', '')
+    yeo_systems = [i.split('_')[0] for i in yeo_systems]
+    yeo_systems = [i.split(' ')[1] for i in yeo_systems]
+    
+    supporting_data = {
+        'sa_axis': sa_axis,
+        'sf_axis': sf_axis,
+        'parc': parc,
+        'yeo_systems': yeo_systems,
+    }
+    
+    return supporting_data
