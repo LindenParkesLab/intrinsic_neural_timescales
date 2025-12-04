@@ -61,7 +61,7 @@ class Timescales(DataLoader):
             Path object for the output file
         """
         # Create output subdirectory structure
-        output_subdir = self.output_dir / 'timescales_outputs' / self.dataset / output_type
+        output_subdir = self.output_dir / 'data' / 'timescales_outputs' / self.dataset / output_type
         if mode == 'save':
             output_subdir.mkdir(parents=True, exist_ok=True)
         
@@ -1124,6 +1124,24 @@ def calculate_tsnr(timeseries_matrix):
     return tau_final, B_final, r, sweep_data
 
 # ==================== Standalone Utility Functions (for use in notebooks) ====================
+def compute_deflections(rest_timescales, task_timescales, nuisance_regression=False):
+    rest_timescales = rest_timescales.reshape(-1, 1)
+    task_timescales = task_timescales.reshape(-1, 1)
+
+    int_deflections = task_timescales - rest_timescales
+    
+    if nuisance_regression:
+        deflections_mean = np.mean(int_deflections)
+        
+        X = np.concatenate((rest_timescales, np.ones((rest_timescales.shape[0], 1))), axis=1)
+        beta = np.dot(np.linalg.pinv(X), int_deflections)
+        predicted = np.dot(X, beta)
+        int_deflections = int_deflections - predicted
+        # print(int_deflections.shape, predicted.shape)
+        int_deflections += deflections_mean
+    
+    return int_deflections[:, 0]
+
 def filter_data_dict(data_dict, data_dict_residuals=None):
     
     remove_these_keys = []
@@ -1155,7 +1173,9 @@ def filter_data_dict(data_dict, data_dict_residuals=None):
 
 def create_ints_dataframe_custom_grouping(data_dict, n_regions=400,
                                           average_3t_rest=False, average_3t_task_pairs=False, 
-                                          average_7t_rest=False, average_7t_movies=False, 
+                                          average_3t_tasks=False,
+                                          average_7t_rest=False, average_7t_movies=False,
+                                          average_all_rest=False,
                                           average_meg_rest=False, average_meg_task=False,
                                           sort_by_median=False):
     """
@@ -1173,14 +1193,23 @@ def create_ints_dataframe_custom_grouping(data_dict, n_regions=400,
         Number of brain regions
     average_3t_rest : bool, default False
         If True, average 3T rest scans (rfMRIREST1LR, rfMRIREST1RL, etc.) into "REST_3T"
+        Cannot be True if average_all_rest is True
     average_3t_task_pairs : bool, default False
         If True, average 3T task LR/RL pairs (e.g., tfMRIWMLR + tfMRIWMRL)
+        Cannot be True if average_3t_tasks is True
+    average_3t_tasks : bool, default False
+        If True, average ALL 3T task scans (all tfMRI scans except 7T movies) into "TASK3T"
+        Cannot be True if average_3t_task_pairs is True
     average_7t_rest : bool, default False
         If True, average 7T rest scans (rfMRIREST17TPA, rfMRIREST27TAP, etc.) into "REST_7T"
+        Cannot be True if average_all_rest is True
     average_7t_movies : bool, default False
         If True, average 7T movie scans (tfMRIMOVIE17TAP, tfMRIMOVIE27TPA, etc.) into "MOVIE"
+    average_all_rest : bool, default False
+        If True, average ALL rest scans (both 3T and 7T) into "RESTALL"
+        Cannot be True if average_3t_rest or average_7t_rest is True
     sort_by_median : bool, default False
-        If True, sort columns by their mean INT values in descending order
+        If True, sort columns by their median INT values in descending order
     
     Returns:
     --------
@@ -1188,6 +1217,13 @@ def create_ints_dataframe_custom_grouping(data_dict, n_regions=400,
         DataFrame with brain regions as index and unique scan types as columns.
         Values are INTs averaged across subjects for each scan type.
     """
+    
+    # Check for mutually exclusive options
+    if average_3t_task_pairs and average_3t_tasks:
+        raise ValueError("average_3t_task_pairs and average_3t_tasks cannot both be True")
+    
+    if average_all_rest and (average_3t_rest or average_7t_rest):
+        raise ValueError("average_all_rest cannot be True if average_3t_rest or average_7t_rest is True")
     
     def extract_scan_name(scan_key):
         """Extract just the scan part from a full scan key."""
@@ -1225,20 +1261,35 @@ def create_ints_dataframe_custom_grouping(data_dict, n_regions=400,
             print(f"  Mean INT range: [{mean_vector.min():.3f}, {mean_vector.max():.3f}]")
     
     # Apply optional scan averaging
-    if average_7t_rest or average_7t_movies or average_3t_rest or average_3t_task_pairs:
+    if average_7t_rest or average_7t_movies or average_3t_rest or average_3t_task_pairs or average_3t_tasks or average_all_rest or average_meg_rest or average_meg_task:
         print(f"\nApplying optional scan averaging...")
+
+    # Average ALL rest scans (3T and 7T)
+    if average_all_rest:
+        all_rest_scans = ['task-rfMRIREST1LR', 'task-rfMRIREST1RL', 'task-rfMRIREST2LR', 'task-rfMRIREST2RL',
+                          'task-rfMRIREST1AP', 'task-rfMRIREST1PA', 'task-rfMRIREST2AP', 'task-rfMRIREST2PA',
+                          'task-rfMRIREST17TPA', 'task-rfMRIREST27TAP', 'task-rfMRIREST37TPA', 'task-rfMRIREST47TAP']
+        all_rest_data = []
+        
+        for scan_name in list(averaged_data.keys()):
+            if scan_name in all_rest_scans:
+                all_rest_data.append(averaged_data[scan_name])
+                del averaged_data[scan_name]
+        
+        if all_rest_data:
+            all_rest_mean = np.nanmean(np.stack(all_rest_data, axis=0), axis=0)
+            averaged_data['task-RESTALL'] = all_rest_mean
+            print(f"  Averaged {len(all_rest_data)} rest scans (3T and 7T) into: scan-RESTALL")
 
     # Average 3T rest scans  
     if average_3t_rest:
         rest_3t_scans = ['task-rfMRIREST1LR', 'task-rfMRIREST1RL', 'task-rfMRIREST2LR', 'task-rfMRIREST2RL',
                          'task-rfMRIREST1AP', 'task-rfMRIREST1PA', 'task-rfMRIREST2AP', 'task-rfMRIREST2PA']
         rest_3t_data = []
-        rest_3t_found = []
         
         for scan_name in list(averaged_data.keys()):
             if scan_name in rest_3t_scans:
                 rest_3t_data.append(averaged_data[scan_name])
-                rest_3t_found.append(scan_name)
                 del averaged_data[scan_name]
         
         if rest_3t_data:
@@ -1246,14 +1297,28 @@ def create_ints_dataframe_custom_grouping(data_dict, n_regions=400,
             averaged_data['task-REST3T'] = rest_3t_mean
             print(f"  Averaged {len(rest_3t_data)} 3T rest scans into: scan-REST3T")
     
+    # Average ALL 3T task scans (excluding 7T movies)
+    if average_3t_tasks:
+        task_3t_data = []
+        
+        for scan_name in list(averaged_data.keys()):
+            if scan_name.startswith('task-tfMRI') and 'MOVIE' not in scan_name:
+                task_3t_data.append(averaged_data[scan_name])
+                del averaged_data[scan_name]
+        
+        if task_3t_data:
+            task_3t_mean = np.nanmean(np.stack(task_3t_data, axis=0), axis=0)
+            averaged_data['task-TASK3T'] = task_3t_mean
+            print(f"  Averaged {len(task_3t_data)} 3T task scans into: scan-TASK3T")
+    
     # Average 3T task LR/RL pairs
     if average_3t_task_pairs:
         task_pairs = {}
         
         for scan_name in list(averaged_data.keys()):
             if scan_name.startswith('task-tfMRI') and (scan_name.endswith('LR') or scan_name.endswith('RL') or scan_name.endswith('AP') or scan_name.endswith('PA')):
-                # Get base task name (remove LR/RL)
-                base_task = scan_name[:-2]  # Remove last 2 characters (LR or RL)
+                # Get base task name (remove LR/RL/AP/PA)
+                base_task = scan_name[:-2]  # Remove last 2 characters
                 
                 if base_task not in task_pairs:
                     task_pairs[base_task] = []
@@ -1261,7 +1326,7 @@ def create_ints_dataframe_custom_grouping(data_dict, n_regions=400,
         
         # Average pairs and remove originals
         for base_task, scan_list in task_pairs.items():
-            if len(scan_list) == 2:  # We have both LR and RL
+            if len(scan_list) == 2:  # We have both LR and RL (or AP and PA)
                 vectors = [item[1] for item in scan_list]
                 pair_mean = np.nanmean(np.stack(vectors, axis=0), axis=0)
                 
@@ -1278,12 +1343,10 @@ def create_ints_dataframe_custom_grouping(data_dict, n_regions=400,
     if average_7t_rest:
         rest_7t_scans = ['task-rfMRIREST17TPA', 'task-rfMRIREST27TAP', 'task-rfMRIREST37TPA', 'task-rfMRIREST47TAP']
         rest_7t_data = []
-        rest_7t_found = []
         
         for scan_name in list(averaged_data.keys()):
             if scan_name in rest_7t_scans:
                 rest_7t_data.append(averaged_data[scan_name])
-                rest_7t_found.append(scan_name)
                 del averaged_data[scan_name]
         
         if rest_7t_data:
@@ -1295,12 +1358,10 @@ def create_ints_dataframe_custom_grouping(data_dict, n_regions=400,
     if average_7t_movies:
         movie_7t_scans = ['task-tfMRIMOVIE17TAP', 'task-tfMRIMOVIE27TPA', 'task-tfMRIMOVIE37TPA', 'task-tfMRIMOVIE47TAP']
         movie_7t_data = []
-        movie_7t_found = []
         
         for scan_name in list(averaged_data.keys()):
             if scan_name in movie_7t_scans:
                 movie_7t_data.append(averaged_data[scan_name])
-                movie_7t_found.append(scan_name)
                 del averaged_data[scan_name]
         
         if movie_7t_data:
@@ -1312,12 +1373,10 @@ def create_ints_dataframe_custom_grouping(data_dict, n_regions=400,
     if average_meg_rest:
         rest_meg_scans = ['task-3Restin', 'task-4Restin', 'task-5Restin']
         rest_meg_data = []
-        rest_meg_found = []
         
         for scan_name in list(averaged_data.keys()):
             if scan_name in rest_meg_scans:
                 rest_meg_data.append(averaged_data[scan_name])
-                rest_meg_found.append(scan_name)
                 del averaged_data[scan_name]
         
         if rest_meg_data:
@@ -1329,12 +1388,10 @@ def create_ints_dataframe_custom_grouping(data_dict, n_regions=400,
     if average_meg_task:
         task_meg_scans = ['task-6Wrkmem', 'task-7Wrkmem']
         task_meg_data = []
-        task_meg_found = []
         
         for scan_name in list(averaged_data.keys()):
             if scan_name in task_meg_scans:
                 task_meg_data.append(averaged_data[scan_name])
-                task_meg_found.append(scan_name)
                 del averaged_data[scan_name]
         
         if task_meg_data:
@@ -1347,13 +1404,12 @@ def create_ints_dataframe_custom_grouping(data_dict, n_regions=400,
     df_ints.index.name = 'brain_region'
     df_ints.index = range(n_regions)
     
-    # Sort columns by mean if requested
+    # Sort columns by median if requested
     if sort_by_median:
-        # column_summary_stat = df_ints.mean(axis=0)
         column_summary_stat = df_ints.median(axis=0)
         sorted_columns = column_summary_stat.sort_values(ascending=False).index
         df_ints = df_ints[sorted_columns]
-        print(f"Sorted columns by mean INT values (descending order)")
+        print(f"Sorted columns by median INT values (descending order)")
     
     print(f"\nCreated DataFrame with shape: {df_ints.shape}")
     print(f"Brain regions (rows): {df_ints.shape[0]}")
@@ -1397,7 +1453,9 @@ def convert_data_dict(data_dict, scan_registry, brain_map=None, verbose=True):
     return data_dict_converted
 
 def average_data_dict_converted(data_dict_converted, average_7t_rest=False, average_3t_rest=False, 
-                                average_3t_task_pairs=False, average_7t_movies=False):
+                                average_3t_task_pairs=False, average_3t_tasks=False,
+                                average_7t_movies=False, average_all_rest=False,
+                                average_meg_rest=False, average_meg_task=False):
     """
     Apply scan averaging to a dictionary of scan data organized by brain systems.
     
@@ -1408,12 +1466,25 @@ def average_data_dict_converted(data_dict_converted, average_7t_rest=False, aver
         and values are arrays of shape (n_subjects, 10) where 10 corresponds to brain systems
     average_7t_rest : bool, default False
         If True, average 7T rest scans (rfMRIREST17TPA, rfMRIREST27TAP, etc.) into "REST_7T"
+        Cannot be True if average_all_rest is True
     average_3t_rest : bool, default False
         If True, average 3T rest scans (rfMRIREST1LR, rfMRIREST1RL, etc.) into "REST_3T"
+        Cannot be True if average_all_rest is True
     average_3t_task_pairs : bool, default False
         If True, average 3T task LR/RL pairs (e.g., tfMRIWMLR + tfMRIWMRL)
+        Cannot be True if average_3t_tasks is True
+    average_3t_tasks : bool, default False
+        If True, average ALL 3T task scans (all tfMRI scans except 7T movies) into "TASK3T"
+        Cannot be True if average_3t_task_pairs is True
     average_7t_movies : bool, default False
         If True, average 7T movie scans (tfMRIMOVIE17TAP, tfMRIMOVIE27TPA, etc.) into "MOVIE"
+    average_all_rest : bool, default False
+        If True, average ALL rest scans (both 3T and 7T) into "RESTALL"
+        Cannot be True if average_3t_rest or average_7t_rest is True
+    average_meg_rest : bool, default False
+        If True, average MEG rest scans into "RESTMEG"
+    average_meg_task : bool, default False
+        If True, average MEG task scans into "TASKMEG"
     
     Returns:
     --------
@@ -1421,21 +1492,44 @@ def average_data_dict_converted(data_dict_converted, average_7t_rest=False, aver
         Dictionary with averaged scan data, same structure as input but with averaged scans
     """
     
+    # Check for mutually exclusive options
+    if average_3t_task_pairs and average_3t_tasks:
+        raise ValueError("average_3t_task_pairs and average_3t_tasks cannot both be True")
+    
+    if average_all_rest and (average_3t_rest or average_7t_rest):
+        raise ValueError("average_all_rest cannot be True if average_3t_rest or average_7t_rest is True")
+    
     # Create a copy to avoid modifying the original
     averaged_dict = data_dict_converted.copy()
     
     print("Applying scan averaging to centiles dictionary...")
     
-    # 1. Average 7T rest scans
+    # 1. Average ALL rest scans (3T and 7T)
+    if average_all_rest:
+        all_rest_scans = ['rfMRIREST1LR', 'rfMRIREST1RL', 'rfMRIREST2LR', 'rfMRIREST2RL',
+                          'rfMRIREST1AP', 'rfMRIREST1PA', 'rfMRIREST2AP', 'rfMRIREST2PA',
+                          'rfMRIREST17TPA', 'rfMRIREST27TAP', 'rfMRIREST37TPA', 'rfMRIREST47TAP']
+        all_rest_data = []
+        
+        for scan_name in list(averaged_dict.keys()):
+            if scan_name in all_rest_scans:
+                all_rest_data.append(averaged_dict[scan_name])
+                del averaged_dict[scan_name]
+        
+        if all_rest_data:
+            all_rest_mean = np.nanmean(np.stack(all_rest_data, axis=0), axis=0)
+            averaged_dict['RESTALL'] = all_rest_mean
+            print(f"  Averaged {len(all_rest_data)} rest scans (3T and 7T) into: RESTALL")
+            print(f"    Shape: {all_rest_mean.shape}")
+    
+    # 2. Average 7T rest scans
     if average_7t_rest:
         rest_7t_scans = ['rfMRIREST17TPA', 'rfMRIREST27TAP', 'rfMRIREST37TPA', 'rfMRIREST47TAP']
         rest_7t_data = []
-        rest_7t_found = []
         
         for scan_name in list(averaged_dict.keys()):
             if scan_name in rest_7t_scans:
                 rest_7t_data.append(averaged_dict[scan_name])
-                rest_7t_found.append(scan_name)
                 del averaged_dict[scan_name]
         
         if rest_7t_data:
@@ -1445,17 +1539,15 @@ def average_data_dict_converted(data_dict_converted, average_7t_rest=False, aver
             print(f"  Averaged {len(rest_7t_data)} 7T rest scans into: REST7T")
             print(f"    Shape: {rest_7t_mean.shape}")
     
-    # 2. Average 3T rest scans  
+    # 3. Average 3T rest scans  
     if average_3t_rest:
         rest_3t_scans = ['rfMRIREST1LR', 'rfMRIREST1RL', 'rfMRIREST2LR', 'rfMRIREST2RL',
                          'rfMRIREST1AP', 'rfMRIREST1PA', 'rfMRIREST2AP', 'rfMRIREST2PA']
         rest_3t_data = []
-        rest_3t_found = []
         
         for scan_name in list(averaged_dict.keys()):
             if scan_name in rest_3t_scans:
                 rest_3t_data.append(averaged_dict[scan_name])
-                rest_3t_found.append(scan_name)
                 del averaged_dict[scan_name]
         
         if rest_3t_data:
@@ -1464,14 +1556,29 @@ def average_data_dict_converted(data_dict_converted, average_7t_rest=False, aver
             print(f"  Averaged {len(rest_3t_data)} 3T rest scans into: REST3T")
             print(f"    Shape: {rest_3t_mean.shape}")
     
-    # 3. Average 3T task LR/RL pairs
+    # 4. Average ALL 3T task scans (excluding 7T movies)
+    if average_3t_tasks:
+        task_3t_data = []
+        
+        for scan_name in list(averaged_dict.keys()):
+            if scan_name.startswith('tfMRI') and 'MOVIE' not in scan_name:
+                task_3t_data.append(averaged_dict[scan_name])
+                del averaged_dict[scan_name]
+        
+        if task_3t_data:
+            task_3t_mean = np.nanmean(np.stack(task_3t_data, axis=0), axis=0)
+            averaged_dict['TASK3T'] = task_3t_mean
+            print(f"  Averaged {len(task_3t_data)} 3T task scans into: TASK3T")
+            print(f"    Shape: {task_3t_mean.shape}")
+    
+    # 5. Average 3T task LR/RL pairs
     if average_3t_task_pairs:
         task_pairs = {}
         
         for scan_name in list(averaged_dict.keys()):
-            if scan_name.startswith('tfMRI') and (scan_name.endswith('LR') or scan_name.endswith('RL')) or (scan_name.endswith('AP') or scan_name.endswith('PA')):
-                # Get base task name (remove LR/RL)
-                base_task = scan_name[:-2]  # Remove last 2 characters (LR or RL)
+            if scan_name.startswith('tfMRI') and (scan_name.endswith('LR') or scan_name.endswith('RL') or scan_name.endswith('AP') or scan_name.endswith('PA')):
+                # Get base task name (remove LR/RL/AP/PA)
+                base_task = scan_name[:-2]  # Remove last 2 characters
                 
                 if base_task not in task_pairs:
                     task_pairs[base_task] = []
@@ -1479,7 +1586,7 @@ def average_data_dict_converted(data_dict_converted, average_7t_rest=False, aver
         
         # Average pairs and remove originals
         for base_task, scan_list in task_pairs.items():
-            if len(scan_list) == 2:  # We have both LR and RL
+            if len(scan_list) == 2:  # We have both LR and RL (or AP and PA)
                 vectors = [item[1] for item in scan_list]
                 pair_mean = np.nanmean(np.stack(vectors, axis=0), axis=0)
                 
@@ -1493,16 +1600,14 @@ def average_data_dict_converted(data_dict_converted, average_7t_rest=False, aver
                 print(f"  Averaged LR/RL pair for {base_task} into: {new_scan_name}")
                 print(f"    Shape: {pair_mean.shape}")
     
-    # 4. Average 7T movie scans
+    # 6. Average 7T movie scans
     if average_7t_movies:
         movie_7t_scans = ['tfMRIMOVIE17TAP', 'tfMRIMOVIE27TPA', 'tfMRIMOVIE37TPA', 'tfMRIMOVIE47TAP']
         movie_7t_data = []
-        movie_7t_found = []
         
         for scan_name in list(averaged_dict.keys()):
             if scan_name in movie_7t_scans:
                 movie_7t_data.append(averaged_dict[scan_name])
-                movie_7t_found.append(scan_name)
                 del averaged_dict[scan_name]
         
         if movie_7t_data:
@@ -1511,6 +1616,38 @@ def average_data_dict_converted(data_dict_converted, average_7t_rest=False, aver
             print(f"  Averaged {len(movie_7t_data)} 7T movie scans into: MOVIE")
             print(f"    Shape: {movie_7t_mean.shape}")
     
+    # 7. Average MEG rest scans
+    if average_meg_rest:
+        rest_meg_scans = ['3Restin', '4Restin', '5Restin']
+        rest_meg_data = []
+        
+        for scan_name in list(averaged_dict.keys()):
+            if scan_name in rest_meg_scans:
+                rest_meg_data.append(averaged_dict[scan_name])
+                del averaged_dict[scan_name]
+        
+        if rest_meg_data:
+            rest_meg_mean = np.nanmean(np.stack(rest_meg_data, axis=0), axis=0)
+            averaged_dict['RESTMEG'] = rest_meg_mean
+            print(f"  Averaged {len(rest_meg_data)} MEG rest scans into: RESTMEG")
+            print(f"    Shape: {rest_meg_mean.shape}")
+    
+    # 8. Average MEG task scans
+    if average_meg_task:
+        task_meg_scans = ['6Wrkmem', '7Wrkmem']
+        task_meg_data = []
+        
+        for scan_name in list(averaged_dict.keys()):
+            if scan_name in task_meg_scans:
+                task_meg_data.append(averaged_dict[scan_name])
+                del averaged_dict[scan_name]
+        
+        if task_meg_data:
+            task_meg_mean = np.nanmean(np.stack(task_meg_data, axis=0), axis=0)
+            averaged_dict['TASKMEG'] = task_meg_mean
+            print(f"  Averaged {len(task_meg_data)} MEG task scans into: TASKMEG")
+            print(f"    Shape: {task_meg_mean.shape}")
+    
     # Print summary
     print(f"\nFinal dictionary contains {len(averaged_dict)} scan types:")
     for scan_name, data in averaged_dict.items():
@@ -1518,10 +1655,14 @@ def average_data_dict_converted(data_dict_converted, average_7t_rest=False, aver
     
     # Print summary of averaging operations
     averaging_ops = []
+    if average_all_rest: averaging_ops.append("all rest")
     if average_7t_rest: averaging_ops.append("7T rest")
-    if average_3t_rest: averaging_ops.append("3T rest") 
+    if average_3t_rest: averaging_ops.append("3T rest")
+    if average_3t_tasks: averaging_ops.append("3T all tasks")
     if average_3t_task_pairs: averaging_ops.append("3T task pairs")
     if average_7t_movies: averaging_ops.append("7T movies")
+    if average_meg_rest: averaging_ops.append("MEG rest")
+    if average_meg_task: averaging_ops.append("MEG task")
     
     if averaging_ops:
         print(f"\nApplied averaging for: {', '.join(averaging_ops)}")
