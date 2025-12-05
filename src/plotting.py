@@ -55,7 +55,8 @@ def plot_autocorrelation_analysis(autocorr_raw, autocorr_resid, zero_crossings_r
     Parameters:
     - autocorr_raw: autocorrelation before task removal (n_voxels x n_lags)
     - autocorr_resid: autocorrelation after task removal (n_voxels x n_lags)
-    - zero_crossings: first zero-crossing indices (n_voxels,)
+    - zero_crossings_raw: first zero-crossing indices (n_voxels,), may contain NaNs
+    - zero_crossings_resid: first zero-crossing indices (n_voxels,), may contain NaNs
     - tr: repetition time in seconds
     - max_lag: maximum lag to plot (in timepoints)
     - n_example_voxels: number of example voxel ACF curves to show
@@ -64,7 +65,7 @@ def plot_autocorrelation_analysis(autocorr_raw, autocorr_resid, zero_crossings_r
     
     # Limit the lag range for plotting
     if max_lag is None:
-        max_lag = np.max((zero_crossings_resid.max(), zero_crossings_raw.max())).astype(int)
+        max_lag = int(np.nanmax((np.nanmax(zero_crossings_resid), np.nanmax(zero_crossings_raw))))
     # max_lag = min(max_lag, autocorr_raw.shape[1])
     lag_times = np.arange(max_lag) * tr  # Convert to seconds
     
@@ -74,10 +75,10 @@ def plot_autocorrelation_analysis(autocorr_raw, autocorr_resid, zero_crossings_r
     
     # Plot 1: Average ACF comparison (before vs after)
     ax1 = axes[0]
-    mean_acf_raw = np.mean(autocorr_raw[:, :max_lag], axis=0)
-    mean_acf_resid = np.mean(autocorr_resid[:, :max_lag], axis=0)
-    std_acf_raw = np.std(autocorr_raw[:, :max_lag], axis=0)
-    std_acf_resid = np.std(autocorr_resid[:, :max_lag], axis=0)
+    mean_acf_raw = np.nanmean(autocorr_raw[:, :max_lag], axis=0)
+    mean_acf_resid = np.nanmean(autocorr_resid[:, :max_lag], axis=0)
+    std_acf_raw = np.nanstd(autocorr_raw[:, :max_lag], axis=0)
+    std_acf_resid = np.nanstd(autocorr_resid[:, :max_lag], axis=0)
     
     ax1.plot(lag_times, mean_acf_raw, 'b-', linewidth=2, label='Before task removal', alpha=0.8)
     ax1.fill_between(lag_times, mean_acf_raw - std_acf_raw, mean_acf_raw + std_acf_raw, 
@@ -97,33 +98,55 @@ def plot_autocorrelation_analysis(autocorr_raw, autocorr_resid, zero_crossings_r
     # Plot 2: Example individual voxel ACF curves
     ax2 = axes[1]
     n_voxels = autocorr_raw.shape[0]
-    example_indices = np.linspace(0, n_voxels-1, n_example_voxels, dtype=int)
     
-    colors = plt.cm.Set1(np.linspace(0, 1, n_example_voxels))
-    for i, voxel_idx in enumerate(example_indices):
-        ax2.plot(lag_times, autocorr_raw[voxel_idx, :max_lag], '--', 
-                color=colors[i], alpha=0.6, linewidth=1)
-        ax2.plot(lag_times, autocorr_resid[voxel_idx, :max_lag], '-', 
-                color=colors[i], alpha=0.8, linewidth=2, 
-                label=f'Voxel {voxel_idx}')
+    # Find valid (non-NaN) voxels for example plotting
+    valid_voxels_mask = ~(np.isnan(zero_crossings_raw) | np.isnan(zero_crossings_resid))
+    valid_indices = np.where(valid_voxels_mask)[0]
+    
+    if len(valid_indices) > 0:
+        # Select evenly spaced examples from valid voxels
+        n_examples = min(n_example_voxels, len(valid_indices))
+        example_indices = valid_indices[np.linspace(0, len(valid_indices)-1, n_examples, dtype=int)]
+        
+        colors = plt.cm.Set1(np.linspace(0, 1, n_examples))
+        for i, voxel_idx in enumerate(example_indices):
+            ax2.plot(lag_times, autocorr_raw[voxel_idx, :max_lag], '--', 
+                    color=colors[i], alpha=0.6, linewidth=1)
+            ax2.plot(lag_times, autocorr_resid[voxel_idx, :max_lag], '-', 
+                    color=colors[i], alpha=0.8, linewidth=2, 
+                    label=f'Voxel {voxel_idx}')
+        ax2.legend(fontsize=8)
+    else:
+        ax2.text(0.5, 0.5, 'No valid voxels', ha='center', va='center', transform=ax2.transAxes)
     
     ax2.axhline(y=0, color='k', linestyle='--', alpha=0.5)
     ax2.set_xlabel('Lag (seconds)')
     ax2.set_ylabel('Autocorrelation')
     ax2.set_title(f'Example Individual Voxel ACF\n(dashed=before, solid=after)')
-    ax2.legend(fontsize=8)
     ax2.grid(True, alpha=0.3)
         
-    # Plot 4: Zero-crossing distribution
+    # Plot 3: Zero-crossing distribution
     ax3 = axes[2]
-    zero_crossings_seconds = zero_crossings_raw * tr
-    ax3.hist(zero_crossings_seconds, bins=20, alpha=0.7, color='b', edgecolor='black')
-    ax3.axvline(np.mean(zero_crossings_seconds), color='b', linestyle='--', linewidth=2,
-               label=f'Mean: {np.mean(zero_crossings_seconds):.1f}s')
-    zero_crossings_seconds = zero_crossings_resid * tr
-    ax3.hist(zero_crossings_seconds, bins=20, alpha=0.7, color='r', edgecolor='black')
-    ax3.axvline(np.mean(zero_crossings_seconds), color='r', linestyle='--', linewidth=2,
-               label=f'Mean: {np.mean(zero_crossings_seconds):.1f}s')
+    
+    # Filter out NaN values for histogram
+    valid_raw = zero_crossings_raw[~np.isnan(zero_crossings_raw)]
+    valid_resid = zero_crossings_resid[~np.isnan(zero_crossings_resid)]
+    
+    if len(valid_raw) > 0:
+        zero_crossings_seconds = valid_raw * tr
+        ax3.hist(zero_crossings_seconds, bins=20, alpha=0.7, color='b', edgecolor='black', label='Before')
+        ax3.axvline(np.mean(zero_crossings_seconds), color='b', linestyle='--', linewidth=2,
+                   label=f'Mean (before): {np.mean(zero_crossings_seconds):.1f}s')
+    
+    if len(valid_resid) > 0:
+        zero_crossings_seconds = valid_resid * tr
+        ax3.hist(zero_crossings_seconds, bins=20, alpha=0.7, color='r', edgecolor='black', label='After')
+        ax3.axvline(np.mean(zero_crossings_seconds), color='r', linestyle='--', linewidth=2,
+                   label=f'Mean (after): {np.mean(zero_crossings_seconds):.1f}s')
+    
+    if len(valid_raw) == 0 and len(valid_resid) == 0:
+        ax3.text(0.5, 0.5, 'No valid zero-crossings', ha='center', va='center', transform=ax3.transAxes)
+    
     ax3.set_xlabel('INTs (seconds)')
     ax3.set_ylabel('Number of Voxels')
     ax3.set_title('Distribution of INTs')
@@ -308,7 +331,8 @@ def plot_subject_level_violins(df, observation_indices, figsize=(15, 8),
                                show_points=True, point_jitter=0.02,
                                show_lines=False, line_alpha=0.3, line_width=0.5,
                                show_violins=True, line_color_by='subject', ylim=None,
-                               fit_trends=False, trend_line_width=3, trend_alpha=0.9):
+                               fit_trends=False, trend_line_width=3, trend_alpha=0.9,
+                               hide_legend=False):
     """
     Create violin plots showing subject-level variation for selected regions.
     Each region index gets its own violin per condition.
@@ -639,7 +663,7 @@ def plot_subject_level_violins(df, observation_indices, figsize=(15, 8),
             legend_labels.extend([f'Index {idx+1}' for idx in observation_indices])
     
     # Set legend if we have elements
-    if legend_handles:
+    if legend_handles and not hide_legend:
         ax.legend(handles=legend_handles, labels=legend_labels, 
                  title='Group Index', 
                  loc='upper right', bbox_to_anchor=(1, 1), 
@@ -1457,38 +1481,44 @@ def plot_brain_surface_data(data_vector, parcellation='schaefer_400', surface='f
     return fig, axes
 
 
-def plot_subject_timeseries_heatmap(raw_data, residual_data, design_matrix, scan_string,
-                                    figsize=(12, 18),
+def plot_subject_timeseries_heatmap(raw_data, scan_string,
+                                    residual_data=None, design_matrix=None,
+                                    figsize=None,
                                     cmap='RdBu_r', vmin=None, vmax=None,
                                     time_units='minutes', tr=None,
                                     title_prefix="Neural Time Series",
                                     save_path=None, dpi=300):
     """
-    Plot a subject's neural time series as 2D heat matrices with task regression analysis.
+    Plot a subject's neural time series as 2D heat matrices with optional task regression analysis.
     
-    Creates a 5-row visualization showing:
-    1. Raw time series
-    2. Task-regressed residuals  
-    3. Task-related signal (Raw - Residual)
-    4. Variance of task-related signal across brain regions
-    5. Design matrix (task regressors)
+    Creates either:
+    - 1-row visualization (if residual_data and design_matrix are None): Raw time series only
+    - 5-row visualization (if residual_data and design_matrix provided):
+      1. Raw time series
+      2. Task-regressed residuals  
+      3. Task-related signal (Raw - Residual)
+      4. Variance of task-related signal across brain regions
+      5. Design matrix (task regressors)
     
     Parameters:
     -----------
-    raw_data
-    residual_data
-    design_matrix
+    raw_data : ndarray
+        Raw time series data (n_regions x n_timepoints)
     scan_string : str
         Scan identifier, e.g., 'sub-100307_modality-MRI3T_tr-0.72_condition-task_scan-tfMRIWMLR_atlas-Schaefer4007'
-    include_residuals : bool, default True
-        Whether to compute and plot task regression analysis
-    figsize : tuple, default (12, 18)
-        Figure size (width, height)
+    residual_data : ndarray, optional (default=None)
+        Task-regressed residuals (n_regions x n_timepoints).
+        If None, only raw data is plotted.
+    design_matrix : ndarray or DataFrame, optional (default=None)
+        Design matrix with task regressors.
+        If None, only raw data is plotted.
+    figsize : tuple, optional
+        Figure size (width, height). If None, auto-determined based on number of plots.
     cmap : str, default 'RdBu_r'
         Colormap for neural data heatmaps
     vmin, vmax : float, optional
         Color scaling limits. If None, uses 2nd-98th percentiles
-    time_units : str, default 'seconds'
+    time_units : str, default 'minutes'
         Time axis units ('seconds', 'minutes', 'timepoints')
     tr : float, optional
         Repetition time in seconds. Extracted from scan_string if None
@@ -1517,20 +1547,25 @@ def plot_subject_timeseries_heatmap(raw_data, residual_data, design_matrix, scan
     time_axis = np.arange(n_timepoints) * time_multiplier
     time_label = f"Time ({time_units})"
     
-    # ============== GET TASK REGRESSION DATA ==============
-    task_signal = raw_data - residual_data
+    # ============== DETERMINE PLOT MODE ==============
+    # Check if we have residual data and design matrix
+    has_task_analysis = (residual_data is not None and design_matrix is not None)
+    
+    # ============== GET TASK REGRESSION DATA (if available) ==============
+    if has_task_analysis:
+        task_signal = raw_data - residual_data
     
     # ============== SETUP PLOTTING ==============
-    # Determine color scaling
+    # Determine color scaling (using nan-aware functions)
     all_neural_data = [raw_data.flatten()]
-    if residual_data is not None:
+    if has_task_analysis:
         all_neural_data.extend([residual_data.flatten(), task_signal.flatten()])
     
     combined_data = np.concatenate(all_neural_data)
     if vmin is None:
-        vmin = np.percentile(combined_data, 2)
+        vmin = np.nanpercentile(combined_data, 2)
     if vmax is None:
-        vmax = np.percentile(combined_data, 98)
+        vmax = np.nanpercentile(combined_data, 98)
     
     # Create coordinate system
     x_coords = np.arange(n_timepoints)
@@ -1552,9 +1587,15 @@ def plot_subject_timeseries_heatmap(raw_data, residual_data, design_matrix, scan
         subtitle = scan_string
     
     # ============== CREATE FIGURE ==============
-    n_plots = 5
+    n_plots = 5 if has_task_analysis else 1
+    
+    # Auto-determine figure size if not provided
+    if figsize is None:
+        figsize = (12, 18) if has_task_analysis else (12, 4)
+    
     fig, axes = plt.subplots(nrows=n_plots, ncols=1, figsize=figsize)
     
+    # Ensure axes is always a list
     if n_plots == 1:
         axes = [axes]
     
@@ -1587,8 +1628,8 @@ def plot_subject_timeseries_heatmap(raw_data, residual_data, design_matrix, scan
     set_plot_ticks(axes[0], show_xlabel=(n_plots == 1))
     add_colorbar(im1, axes[0], 'Signal Amplitude')
     
-    # ============== REMAINING PLOTS (IF RESIDUALS) ==============
-    if n_plots == 5:
+    # ============== REMAINING PLOTS (IF TASK ANALYSIS AVAILABLE) ==============
+    if has_task_analysis:
         # Plot 2: Residual data
         im2 = axes[1].imshow(residual_data, cmap=cmap, vmin=vmin, vmax=vmax,
                              aspect='auto', interpolation='nearest')
@@ -1598,7 +1639,8 @@ def plot_subject_timeseries_heatmap(raw_data, residual_data, design_matrix, scan
         add_colorbar(im2, axes[1], 'Signal Amplitude')
         
         # Plot 3: Task signal
-        im3 = axes[2].imshow(task_signal, cmap='berlin', vmin=vmin, vmax=vmax,
+        vmax_ts = np.nanpercentile(np.abs(task_signal), 98)
+        im3 = axes[2].imshow(task_signal, cmap='berlin', vmin=-vmax_ts, vmax=vmax_ts,
                              aspect='auto', interpolation='nearest')
         axes[2].set_title('Effect of Task Regression (Raw - Residual)', fontsize=14, fontweight='bold', pad=8)
         axes[2].set_ylabel('Brain Region', fontsize=12)
@@ -1608,10 +1650,10 @@ def plot_subject_timeseries_heatmap(raw_data, residual_data, design_matrix, scan
         # Plot 4: Variance line plot
         which_stat = 'var'
         if which_stat == 'mean':
-            task_variance = np.mean(np.abs(task_signal), axis=0)
+            task_variance = np.nanmean(np.abs(task_signal), axis=0)
             stat_label = 'Absolute Mean'
         elif which_stat == 'var':
-            task_variance = np.var(task_signal, axis=0)
+            task_variance = np.nanvar(task_signal, axis=0)
             stat_label = 'Variance'
 
         axes[3].plot(x_coords, task_variance, 'b-', linewidth=2, alpha=0.8)
@@ -1623,8 +1665,8 @@ def plot_subject_timeseries_heatmap(raw_data, residual_data, design_matrix, scan
         axes[3].set_xticks(time_tick_pos)
         axes[3].set_xticklabels([])
         
-        # Add colorbar for variance plot
-        sm = ScalarMappable(cmap='Blues', norm=Normalize(vmin=np.min(task_variance), vmax=np.max(task_variance)))
+        # Add colorbar for variance plot (using nan-aware min/max)
+        sm = ScalarMappable(cmap='Blues', norm=Normalize(vmin=np.nanmin(task_variance), vmax=np.nanmax(task_variance)))
         sm.set_array([])
         add_colorbar(sm, axes[3], 'Dummy Colorbar')
         
@@ -1674,11 +1716,13 @@ def plot_subject_timeseries_heatmap(raw_data, residual_data, design_matrix, scan
     # ============== FINALIZE FIGURE ==============
     info_text = f'Regions: {n_regions}, Timepoints: {n_timepoints}, TR: {tr}s'
     title_text = f'{title_prefix} - {subtitle}. {info_text}'
-    fig.suptitle(title_text, fontsize=16, fontweight='bold', y=0.95)
-    # fig.text(0.5, 0.02, info_text, ha='center', fontsize=10, style='italic')
+    fig.suptitle(title_text, fontsize=16, fontweight='bold', y=0.95 if has_task_analysis else 0.98)
     
     plt.tight_layout()
-    plt.subplots_adjust(top=0.89, bottom=0.07)
+    if has_task_analysis:
+        plt.subplots_adjust(top=0.89, bottom=0.07)
+    else:
+        plt.subplots_adjust(top=0.88, bottom=0.15)
     
     if save_path:
         plt.savefig(save_path, dpi=dpi, bbox_inches='tight', facecolor='white', edgecolor='none')
