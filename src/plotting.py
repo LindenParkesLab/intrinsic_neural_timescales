@@ -1,5 +1,6 @@
 import os, sys, time, getpass, warnings
 import numpy as np
+import scipy as sp
 import pandas as pd
 import seaborn as sns
 from scipy import stats
@@ -46,6 +47,7 @@ def create_sydnor_sa_colormap():
         pass
     
     return sydnor_sa
+
 
 def plot_autocorrelation_analysis(autocorr_raw, autocorr_resid, zero_crossings_raw, zero_crossings_resid, tr,
                                   max_lag=None, n_example_voxels=5, figsize=(12.5, 5), save_path=None, dpi=300):
@@ -1728,3 +1730,120 @@ def plot_subject_timeseries_heatmap(raw_data, scan_string,
         plt.savefig(save_path, dpi=dpi, bbox_inches='tight', facecolor='white', edgecolor='none')
     
     return fig, tuple(axes)
+
+
+def plot_hierarchy_correlation(brain_map, data_dict, which_moment='var', yeo_systems=None, deflection_baseline=None, ncols=4):
+    """
+    Plot SA-axis correlations with automatic subplot layout based on number of conditions.
+    
+    Parameters:
+    -----------
+    brain_map : array-like
+        Sensory-association axis values for brain regions
+    data_dict : dict
+        Dictionary of experimental conditions with neural data
+    which_moment : str
+        Statistical moment to compute ('var', 'mean', 'median', 'std', 'range', 'skewness', 'kurtosis')
+    deflection_baseline : str, optional
+        Baseline condition to subtract from others
+    ncols : int, default 4
+        Number of columns in the subplot grid
+    
+    Returns:
+    --------
+    fig, axes : matplotlib objects
+        Figure and axes objects
+    """
+    
+    # Define a sophisticated color palette
+    # colors = ['#2E86AB', '#A23B72', '#F18F01', '#C73E1D', '#6A994E', '#BC5090', '#FFB627', '#7209B7']    
+    
+    if which_moment == 'var':
+        stat_func = np.var
+        y_axis_label = 'INT Variance'
+    elif which_moment == 'mean':
+        stat_func = np.nanmean
+        y_axis_label = 'INT Mean'
+    elif which_moment == 'median':
+        stat_func = np.nanmedian
+        y_axis_label = 'INT Median'
+    elif which_moment == 'std':
+        stat_func = np.std
+        y_axis_label = 'INT Standard Deviation'
+    elif which_moment == 'range':
+        stat_func = np.ptp
+        y_axis_label = 'INT Range'
+    elif which_moment == 'skewness':
+        stat_func = sp.stats.skew
+        y_axis_label = 'INT Skewness'
+    elif which_moment == 'kurtosis':
+        stat_func = sp.stats.kurtosis
+        y_axis_label = 'INT Kurtosis'
+    else:
+        raise ValueError("Invalid moment type specified. Choose from 'var', 'mean', 'median', 'std', 'range', 'skewness', or 'kurtosis'.")
+        
+    # Get experimental condition names
+    condition_names = list(data_dict.keys())
+    data_dict_copy = data_dict.copy()
+    
+    if deflection_baseline is None:
+        for condition in condition_names:
+            data_dict_copy[condition] = stat_func(data_dict_copy[condition], axis=0)
+    else:
+        baseline_data = stat_func(data_dict_copy[deflection_baseline], axis=0)
+        for condition in condition_names:
+            if condition != deflection_baseline:
+                data_dict_copy[condition] = stat_func(data_dict_copy[condition], axis=0) - baseline_data
+        # Remove baseline from conditions to plot
+        condition_names.remove(deflection_baseline)
+        del data_dict_copy[deflection_baseline]
+        y_axis_label += ' (deflection: {0})'.format(deflection_baseline)
+    
+    # Storage for correlation results
+    correlation_results = []
+    for condition in condition_names:
+        correlation_results.append(np.abs(sp.stats.spearmanr(brain_map, data_dict_copy[condition])[0]))
+    correlation_results = np.array(correlation_results)
+    sorted_idx = np.argsort(correlation_results)[::-1]
+    condition_names = np.array(condition_names)[sorted_idx]
+    
+    # Calculate number of conditions to plot
+    n_conditions = len(condition_names)
+    
+    # Calculate number of rows needed based on specified columns
+    nrows = int(np.ceil(n_conditions / ncols))
+    
+    # Calculate figure size proportional to grid size
+    # Base size: 3.33 inches per column, 4 inches per row
+    fig_width = max(ncols * 4.5, 10)  # Minimum width of 10 inches
+    fig_height = max(nrows * 3.5, 2.5)     # Minimum height of 6 inches
+    
+    # Create subplots
+    fig, axes = plt.subplots(nrows, ncols, figsize=(fig_width, fig_height), dpi=300)
+    
+    # Always convert to a flat list for consistent indexing
+    if nrows * ncols == 1:
+        axes = [axes]
+    else:
+        axes = np.atleast_1d(axes).flatten()
+    
+    # Plot each experimental condition in its own subplot
+    for i, condition in enumerate(condition_names):
+        ax = plot_correlation(brain_map, data_dict_copy[condition], ax=axes[i], data_group=yeo_systems, show_stats=True,
+                              font_size=10, x_label='SA Axis Rank', y_label=y_axis_label, method='spearman',
+                              auto_polynomial=True, models_to_test=[1, 2], model_selection_metric='variance_explained')
+        # Add title with condition name and statistics
+        ax.set_title(f'{condition}', fontsize=12, fontweight='bold', pad=10)
+    
+    # Hide empty subplots if any
+    total_subplots = nrows * ncols
+    for i in range(n_conditions, total_subplots):
+        if i < len(axes):
+            axes[i].set_visible(False)
+    
+    # Add overall title
+    fig.suptitle('SA-Axis vs Experimental Condition Correlations (400 Brain Regions)', 
+                 fontsize=18, fontweight='bold', y=0.98)
+    fig.tight_layout()
+    
+    return fig, axes
