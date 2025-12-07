@@ -164,11 +164,9 @@ def plot_autocorrelation_analysis(autocorr_raw, autocorr_resid, zero_crossings_r
     return fig
 
 
-def plot_repeated_measures_violins(df, color_vector=None, figsize=(15, 8), 
-                                   alpha_points=0.6, alpha_lines=0.3, 
-                                   violin_alpha=0.7, colormap='viridis',
-                                   line_width=0.5, point_size=2, 
-                                   correlation_method='pearson'):
+def plot_repeated_measures_violins(df, ax, color_vector=None, colormap='viridis',
+                                   alpha_points=1, alpha_lines=1, violin_alpha=0.5, line_width=0.5, point_size=1, 
+                                   correlation_method=None, add_colorbar=True):
     """
     Create violin plots for repeated measures data with connecting lines.
     
@@ -176,10 +174,10 @@ def plot_repeated_measures_violins(df, color_vector=None, figsize=(15, 8),
     -----------
     df : pandas.DataFrame
         DataFrame containing the repeated measures data
+    ax : matplotlib.axes.Axes
+        Axes object to plot on
     color_vector : array-like, optional
         Vector of integers (length equal to number of rows) for coloring observations
-    figsize : tuple, default (15, 8)
-        Figure size (width, height)
     alpha_points : float, default 0.6
         Transparency for individual data points
     alpha_lines : float, default 0.3
@@ -194,16 +192,13 @@ def plot_repeated_measures_violins(df, color_vector=None, figsize=(15, 8),
         Size of individual data points
     correlation_method : str, default 'pearson'
         Correlation method to use: 'pearson' or 'spearman'
+    add_colorbar : bool, default True
+        Whether to add a colorbar when color_vector is provided
         
     Returns:
     --------
-    fig, ax : matplotlib figure and axes objects
+    ax : matplotlib axes object
     """
-    import pandas as pd
-    import numpy as np
-    import matplotlib.pyplot as plt
-    import seaborn as sns
-    from scipy.stats import pearsonr, spearmanr
     
     # Drop the first column if it's just an index
     if df.columns[0] in ['', 'Unnamed: 0'] or df.iloc[:, 0].dtype in ['int64', 'int32']:
@@ -222,9 +217,6 @@ def plot_repeated_measures_violins(df, color_vector=None, figsize=(15, 8),
                       value_vars=conditions, 
                       var_name='Condition', value_name='Value')
     df_long.rename(columns={'index': 'Subject'}, inplace=True)
-    
-    # Create the plot
-    fig, ax = plt.subplots(figsize=figsize)
     
     # Create violin plots
     sns.violinplot(data=df_long, x='Condition', y='Value', color='gray',
@@ -274,14 +266,17 @@ def plot_repeated_measures_violins(df, color_vector=None, figsize=(15, 8),
         for i, condition in enumerate(conditions):
             # Get data values for this condition
             condition_values = df[condition].values
-            nan_mask = df[condition].isnull().values
-            nan_mask = ~nan_mask
             
-            # Compute correlation
-            if correlation_method.lower() == 'pearson':
-                correlation, _ = pearsonr(condition_values[nan_mask], color_vector[nan_mask])
+            # Create mask for valid (non-NaN) values
+            valid_mask = ~df[condition].isnull().values
+            
+            # Compute correlation using only valid data
+            if correlation_method is None:
+                pass
+            elif correlation_method.lower() == 'pearson':
+                correlation, _ = pearsonr(condition_values[valid_mask], color_vector[valid_mask])
             elif correlation_method.lower() == 'spearman':
-                correlation, _ = spearmanr(condition_values[nan_mask], color_vector[nan_mask])
+                correlation, _ = spearmanr(condition_values[valid_mask], color_vector[valid_mask])
             else:
                 raise ValueError("correlation_method must be 'pearson' or 'spearman'")
             
@@ -296,8 +291,9 @@ def plot_repeated_measures_violins(df, color_vector=None, figsize=(15, 8),
             max_annotation_height = max(max_annotation_height, annotation_height)
             
             # Annotate correlation above this specific violin
-            ax.text(i, annotation_height, f'r={correlation:.3f}', 
-                   ha='center', va='bottom', fontsize=8, fontweight='bold')
+            if correlation_method is not None:
+                ax.text(i, annotation_height, f'r={correlation:.3f}', 
+                    ha='center', va='bottom', fontsize=6, fontweight='bold')
         
         # Adjust y-axis limits to accommodate the highest annotation
         ax.set_ylim(y_min, max_annotation_height + (y_max - y_min) * 0.05)
@@ -307,10 +303,11 @@ def plot_repeated_measures_violins(df, color_vector=None, figsize=(15, 8),
     ax.set_ylabel('Value', fontsize=10)
     
     # Rotate x-axis labels for better readability
-    plt.xticks(rotation=45, ha='right')
+    ax.tick_params(axis='x', rotation=45)
+    ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha='right')
     
     # Add colorbar if color_vector is provided
-    if color_vector is not None:
+    if color_vector is not None and add_colorbar:
         # Create a mappable for the colorbar
         sm = plt.cm.ScalarMappable(cmap=cmap, 
                                   norm=plt.Normalize(vmin=min(color_vector), 
@@ -319,22 +316,20 @@ def plot_repeated_measures_violins(df, color_vector=None, figsize=(15, 8),
         cbar = plt.colorbar(sm, ax=ax, shrink=0.8)
         cbar.set_label('Color vector', fontsize=10)
     
-    # Adjust layout to prevent label cutoff
-    plt.tight_layout()
-    
     # Add grid for better readability
     ax.grid(True, alpha=0.3, axis='y')
     
-    return fig, ax
+    return ax
 
 
-def plot_subject_level_violins(df, observation_indices, figsize=(15, 8), 
-                               violin_alpha=0.7, point_alpha=0.6, point_size=3,
+def plot_subject_level_violins(df, ax, observation_indices, 
+                               violin_alpha=0.5, point_alpha=0.5, point_size=1,
                                show_points=True, point_jitter=0.02,
-                               show_lines=False, line_alpha=0.3, line_width=0.5,
+                               show_lines=False, line_alpha=0.25, line_width=0.5,
                                show_violins=True, line_color_by='subject', ylim=None,
-                               fit_trends=False, trend_line_width=3, trend_alpha=0.9,
-                               hide_legend=False):
+                               fit_trends=False, trend_line_width=1, trend_alpha=1,
+                               hide_legend=False, sort_by_median=False,
+                               add_colorbar=True):
     """
     Create violin plots showing subject-level variation for selected regions.
     Each region index gets its own violin per condition.
@@ -344,10 +339,10 @@ def plot_subject_level_violins(df, observation_indices, figsize=(15, 8),
     df : pandas.DataFrame
         DataFrame containing the repeated measures data with 'subject' column
         Expected structure: 400 rows per subject, with subjects stacked
+    ax : matplotlib.axes.Axes
+        Axes object to plot on
     observation_indices : list or array-like
         List of region indices to include (0-399)
-    figsize : tuple, default (15, 8)
-        Figure size (width, height)
     violin_alpha : float, default 0.7
         Transparency for violin plots
     point_alpha : float, default 0.6
@@ -377,10 +372,16 @@ def plot_subject_level_violins(df, observation_indices, figsize=(15, 8),
         Width of trend lines
     trend_alpha : float, default 0.9
         Transparency of trend lines
+    hide_legend : bool, default False
+        Whether to hide the legend
+    sort_by_median : bool, default False
+        Whether to sort x-axis (conditions) by median value in descending order
+    add_colorbar : bool, default True
+        Whether to add a colorbar when line_color_by='subject'
         
     Returns:
     --------
-    fig, ax : matplotlib figure and axes objects
+    ax : matplotlib axes object
     trend_results : dict, optional
         Dictionary containing trend fitting results if fit_trends=True
     """
@@ -414,6 +415,21 @@ def plot_subject_level_violins(df, observation_indices, figsize=(15, 8),
     print(f"Filtered data shape: {df_filtered.shape}")
     print(f"Expected rows: {n_subjects * len(observation_indices)}")
     
+    # Calculate medians and sort conditions if requested
+    if sort_by_median:
+        condition_medians = {}
+        for condition in condition_cols:
+            # Get all values for this condition across all subjects and selected regions
+            all_values = df_filtered[condition].values
+            condition_medians[condition] = np.median(all_values)
+        
+        # Sort conditions by median in descending order
+        condition_cols = sorted(condition_cols, key=lambda x: condition_medians[x], reverse=True)
+        
+        print(f"Sorted conditions by median (descending):")
+        for condition in condition_cols:
+            print(f"  {condition}: median = {condition_medians[condition]:.4f}")
+    
     # Reshape data from wide to long format
     df_long = pd.melt(df_filtered, 
                       id_vars=['subject', 'obs_index'], 
@@ -424,8 +440,8 @@ def plot_subject_level_violins(df, observation_indices, figsize=(15, 8),
     # Create region labels for better readability
     df_long['Region'] = 'Region_' + df_long['obs_index'].astype(str)
     
-    # Create the plot
-    fig, ax = plt.subplots(figsize=figsize)
+    # Convert Condition to categorical with specified order to maintain sort order
+    df_long['Condition'] = pd.Categorical(df_long['Condition'], categories=condition_cols, ordered=True)
     
     # Get colors for different regions - soft orange to purple gradient
     n_obs = len(observation_indices)
@@ -479,9 +495,7 @@ def plot_subject_level_violins(df, observation_indices, figsize=(15, 8),
             means = condition_means[condition]
             x_data = np.array(range(len(observation_indices)))  # Use position as x-axis
             
-            # Fit polynomial trends of degrees 1, 2, and 3
-            # degrees = [1, 2, 3]
-            # degree_names = ['Linear', 'Quadratic', 'Cubic']
+            # Fit polynomial trends of degrees 1 and 2
             degrees = [1, 2]
             degree_names = ['Linear', 'Quadratic']
             r2_scores = []
@@ -675,7 +689,7 @@ def plot_subject_level_violins(df, observation_indices, figsize=(15, 8),
     ax.grid(True, alpha=0.3, axis='y')
     
     # Add colorbar for subject coloring if applicable
-    if show_lines and line_color_by == 'subject':
+    if show_lines and line_color_by == 'subject' and add_colorbar:
         # Create a mappable for the colorbar
         sm = plt.cm.ScalarMappable(cmap=subject_cmap, 
                                   norm=plt.Normalize(vmin=0, vmax=n_subjects-1))
@@ -695,13 +709,10 @@ def plot_subject_level_violins(df, observation_indices, figsize=(15, 8),
     if ylim is not None:
         ax.set_ylim(ylim)
     
-    # Adjust layout
-    plt.tight_layout()
-    
     if fit_trends:
-        return fig, ax, trend_results
+        return ax, trend_results
     else:
-        return fig, ax
+        return ax
 
 
 def plot_correlation(x, y, x_label=None, y_label=None, title=None, 
