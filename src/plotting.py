@@ -20,35 +20,6 @@ from nilearn.image import new_img_like
 from nilearn.surface import load_surf_data, vol_to_surf
 
 
-def create_sydnor_sa_colormap():
-    """
-    Create a custom colormap that transitions from yellow/orange (sensorimotor pole, low rank) 
-    through white at the center to purple (association pole, high rank).
-    
-    Returns:
-        matplotlib.colors.LinearSegmentedColormap: The custom colormap
-    """
-    
-    # Define the colors for the colormap
-    # Format: (position, (R, G, B))
-    colors = [
-        (0.0, '#FFA500'),   # Orange/yellow (sensorimotor pole, low rank)
-        (0.5, "#FFFFFF"),   # White (middle, 0 point)
-        (1.0, '#8A2BE2')    # Purple (association pole, high rank)
-    ]
-    
-    # Create the colormap
-    sydnor_sa = mcolors.LinearSegmentedColormap.from_list('sydnor_sa', colors, N=256)
-    
-    # Register the colormap with matplotlib so it can be used by name
-    try:
-        plt.colormaps.register(cmap=sydnor_sa, name='sydnor_sa')
-    except:
-        pass
-    
-    return sydnor_sa
-
-
 def plot_autocorrelation_analysis(autocorr_raw, autocorr_resid, zero_crossings_raw, zero_crossings_resid, tr,
                                   max_lag=None, n_example_voxels=5, figsize=(12.5, 5), save_path=None, dpi=300):
     """
@@ -165,338 +136,323 @@ def plot_autocorrelation_analysis(autocorr_raw, autocorr_resid, zero_crossings_r
 
 
 def plot_repeated_measures_violins(df, ax, color_vector=None, colormap='viridis',
-                                   alpha_points=1, alpha_lines=1, violin_alpha=0.5, line_width=0.5, point_size=1, 
+                                   point_alpha=1, line_alpha=1, violin_alpha=0.5, 
+                                   point_size=1, line_width=0.5, 
                                    correlation_method=None, add_colorbar=True):
     """
     Create violin plots for repeated measures data with connecting lines.
     
-    Parameters:
-    -----------
+    Each row represents one observation measured across multiple conditions.
+    Violin plots show the distribution of values for each condition, with
+    individual observations connected by lines.
+    
+    Parameters
+    ----------
     df : pandas.DataFrame
-        DataFrame containing the repeated measures data
+        DataFrame containing repeated measures data. Each row is one observation,
+        each column is one condition.
     ax : matplotlib.axes.Axes
-        Axes object to plot on
+        Axes object to plot on.
     color_vector : array-like, optional
-        Vector of integers (length equal to number of rows) for coloring observations
-    alpha_points : float, default 0.6
-        Transparency for individual data points
-    alpha_lines : float, default 0.3
-        Transparency for connecting lines
-    violin_alpha : float, default 0.7
-        Transparency for violin plots
-    colormap : str, default 'viridis'
-        Colormap name for coloring points when color_vector is provided
-    line_width : float, default 0.5
-        Width of connecting lines
-    point_size : float, default 2
-        Size of individual data points
-    correlation_method : str, default 'pearson'
-        Correlation method to use: 'pearson' or 'spearman'
-    add_colorbar : bool, default True
-        Whether to add a colorbar when color_vector is provided
+        Vector of values (length = n_rows) for coloring observations.
+        If provided, points and lines are colored by this vector.
+    colormap : str, default='viridis'
+        Matplotlib colormap name for coloring when color_vector is provided.
+    point_alpha : float, default=1
+        Transparency for individual data points (0-1).
+    line_alpha : float, default=1
+        Transparency for connecting lines (0-1).
+    violin_alpha : float, default=0.5
+        Transparency for violin plots (0-1).
+    point_size : float, default=1
+        Size of individual data points.
+    line_width : float, default=0.5
+        Width of connecting lines.
+    correlation_method : str or None, default=None
+        Correlation method for annotations: 'pearson', 'spearman', or None.
+        If provided, correlations between color_vector and each condition are annotated.
+    add_colorbar : bool, default=True
+        Whether to add colorbar when color_vector is provided.
         
-    Returns:
-    --------
-    ax : matplotlib axes object
+    Returns
+    -------
+    ax : matplotlib.axes.Axes
+        The axes object with the plot.
     """
     
-    # Drop the first column if it's just an index
-    if df.columns[0] in ['', 'Unnamed: 0'] or df.iloc[:, 0].dtype in ['int64', 'int32']:
-        df = df.iloc[:, 1:]
+    # Prepare data
+    df_clean = _drop_index_column(df.copy())
+    n_observations = len(df_clean)
+    condition_names = df_clean.columns.tolist()
+    n_conditions = len(condition_names)
     
-    # Get condition names (column names)
-    conditions = df.columns.tolist()
-    n_conditions = len(conditions)
-    n_observations = len(df)
+    print(f"Data shape: {df_clean.shape}")
+    print(f"Conditions: {condition_names}")
     
-    print(f"Data shape: {df.shape}")
-    print(f"Conditions: {conditions}")
-    
-    # Reshape data from wide to long format for seaborn
-    df_long = pd.melt(df.reset_index(), id_vars=['index'], 
-                      value_vars=conditions, 
-                      var_name='Condition', value_name='Value')
+    # Reshape to long format for seaborn
+    df_long = pd.melt(df_clean.reset_index(), 
+                      id_vars=['index'], 
+                      value_vars=condition_names, 
+                      var_name='Condition', 
+                      value_name='Value')
     df_long.rename(columns={'index': 'Subject'}, inplace=True)
     
     # Create violin plots
     sns.violinplot(data=df_long, x='Condition', y='Value', color='gray',
                    ax=ax, alpha=violin_alpha, inner=None)
     
-    # Prepare colors for points if color_vector is provided
+    # Prepare colors
     if color_vector is not None:
         if len(color_vector) != n_observations:
-            raise ValueError(f"Color vector length ({len(color_vector)}) must match number of observations ({n_observations})")
-        
-        # Create colormap
-        cmap = plt.cm.get_cmap(colormap)
-        unique_colors = np.unique(color_vector)
-        colors = [cmap(i / (len(unique_colors) - 1)) for i in range(len(unique_colors))]
-        color_dict = dict(zip(unique_colors, colors))
-        point_colors = [color_dict[val] for val in color_vector]
+            raise ValueError(
+                f"Color vector length ({len(color_vector)}) must match "
+                f"number of observations ({n_observations})"
+            )
+        point_colors, cmap = _create_color_mapping(color_vector, colormap)
     else:
         point_colors = ['black'] * n_observations
+        cmap = None
     
-    # Add individual data points and connecting lines
-    x_positions = range(n_conditions)
+    # Plot lines and points for each observation
+    x_positions = np.arange(n_conditions)
     
     for i in range(n_observations):
-        # Get y-values for this subject across all conditions
-        y_values = df.iloc[i, :].values
+        y_values = df_clean.iloc[i, :].values
         
-        # Add small random jitter to x-positions for better visibility
-        jitter = np.random.normal(0, 0.05, n_conditions)
-        x_jittered = np.array(x_positions) + jitter
+        # Add jitter to x-positions
+        x_jitter = np.random.normal(0, 0.05, n_conditions)
+        x_jittered = x_positions + x_jitter
         
-        # Plot connecting lines
+        # Plot connecting line
+        line_color = point_colors[i] if color_vector is not None else 'gray'
         ax.plot(x_jittered, y_values, 
-               color=point_colors[i] if color_vector is not None else 'gray',
-               alpha=alpha_lines, linewidth=line_width, zorder=1)
+                color=line_color, alpha=line_alpha, linewidth=line_width, zorder=1)
         
-        # Plot individual points
+        # Plot points
         ax.scatter(x_jittered, y_values, 
-                  color=point_colors[i], alpha=alpha_points, 
-                  s=point_size, zorder=2)
+                   color=point_colors[i], alpha=point_alpha, 
+                   s=point_size, zorder=2)
     
-    # Compute and annotate correlations if color_vector is provided
-    if color_vector is not None:
-        # Get overall y-axis limits for final adjustment
+    # Add correlation annotations if requested
+    if color_vector is not None and correlation_method is not None:
         y_min, y_max = ax.get_ylim()
-        condition_range = y_max - y_min
-
-        for i, condition in enumerate(conditions):
-            # Get data values for this condition
-            condition_values = df[condition].values
+        
+        for i, condition in enumerate(condition_names):
+            condition_values = df_clean[condition].values
+            valid_mask = ~df_clean[condition].isnull().values
             
-            # Create mask for valid (non-NaN) values
-            valid_mask = ~df[condition].isnull().values
-            
-            # Compute correlation using only valid data
-            if correlation_method is None:
-                pass
-            elif correlation_method.lower() == 'pearson':
-                correlation, _ = pearsonr(condition_values[valid_mask], color_vector[valid_mask])
+            # Compute correlation
+            if correlation_method.lower() == 'pearson':
+                corr_value, _ = pearsonr(condition_values[valid_mask], 
+                                        color_vector[valid_mask])
             elif correlation_method.lower() == 'spearman':
-                correlation, _ = spearmanr(condition_values[valid_mask], color_vector[valid_mask])
+                corr_value, _ = spearmanr(condition_values[valid_mask], 
+                                         color_vector[valid_mask])
             else:
                 raise ValueError("correlation_method must be 'pearson' or 'spearman'")
             
-            # Find the maximum value for this specific distribution
-            condition_max = np.max(condition_values)
-            
-            # Set annotation height relative to this distribution's maximum
-            annotation_height = condition_max + condition_range * 0.05  # 5% above this distribution's max
-            
-            # Annotate correlation above this specific violin
-            if correlation_method is not None:
-                ax.text(i, annotation_height, f'r={correlation:.2f}', 
-                        ha='center', va='bottom', fontsize=5)
+            # Position annotation
+            annotation_y = _calculate_annotation_height(condition_values, y_min, y_max)
+            ax.text(i, annotation_y, f'r={corr_value:.2f}', 
+                    ha='center', va='bottom', fontsize=5)
         
-        # Adjust y-axis limits to accommodate the highest annotation
+        # Adjust y-axis to accommodate annotations
         ax.set_ylim(y_min, y_max + (y_max - y_min) * 0.1)
     
-    # Customize the plot
+    # Customize plot appearance
     ax.set_xlabel('Condition', fontsize=10)
     ax.set_ylabel('Value', fontsize=10)
-    
-    # Rotate x-axis labels for better readability
     ax.tick_params(axis='x', rotation=45)
-    ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha='right')
-    
-    # Add colorbar if color_vector is provided
-    if color_vector is not None and add_colorbar:
-        # Create a mappable for the colorbar
-        sm = plt.cm.ScalarMappable(cmap=cmap, 
-                                  norm=plt.Normalize(vmin=min(color_vector), 
-                                                   vmax=max(color_vector)))
-        sm.set_array([])
-        cbar = plt.colorbar(sm, ax=ax, shrink=0.8)
-        cbar.set_label('Color vector', fontsize=10)
-    
-    # Add grid for better readability
+    ax.set_xticklabels(ax.get_xticklabels(), rotation=0, ha='center')
     ax.grid(True, alpha=0.3, axis='y')
+    
+    # Add colorbar if requested
+    if color_vector is not None and add_colorbar and cmap is not None:
+        _add_colorbar(ax, cmap, min(color_vector), max(color_vector), 
+                     'Color vector', shrink=0.8)
     
     return ax
 
 
 def plot_subject_level_violins(df, ax, observation_indices, 
                                violin_alpha=0.5, point_alpha=0.5, point_size=1,
+                               line_alpha=0.25, line_width=0.5,
                                show_points=True, point_jitter=0.02,
-                               show_lines=False, line_alpha=0.25, line_width=0.5,
-                               show_violins=True, line_color_by='subject', ylim=None,
+                               show_lines=False, show_violins=True, 
+                               line_color_by='subject', ylim=None,
                                fit_trends=False, trend_line_width=1, trend_alpha=1,
                                hide_legend=False, sort_by_median=False,
                                add_colorbar=True, show_r2_annotation=False):
     """
     Create violin plots showing subject-level variation for selected regions.
-    Each region index gets its own violin per condition.
     
-    Parameters:
-    -----------
+    Each observation index (typically a brain region) gets its own violin per condition.
+    Data is expected to have multiple subjects, each with measurements across
+    all observation indices (e.g., 400 brain regions).
+    
+    Parameters
+    ----------
     df : pandas.DataFrame
-        DataFrame containing the repeated measures data with 'subject' column
-        Expected structure: 400 rows per subject, with subjects stacked
+        DataFrame with 'subject' column and condition columns.
+        Expected structure: N observations per subject, with subjects stacked.
     ax : matplotlib.axes.Axes
-        Axes object to plot on
+        Axes object to plot on.
     observation_indices : list or array-like
-        List of region indices to include (0-399)
-    violin_alpha : float, default 0.7
-        Transparency for violin plots
-    point_alpha : float, default 0.6
-        Transparency for individual subject points
-    point_size : float, default 3
-        Size of individual subject points
-    show_points : bool, default True
-        Whether to show individual subject points
-    point_jitter : float, default 0.02
-        Amount of jitter for point positions
-    show_lines : bool, default False
-        Whether to show connecting lines across conditions for each subject
-    line_alpha : float, default 0.3
-        Transparency for connecting lines
-    line_width : float, default 0.5
-        Width of connecting lines
-    show_violins : bool, default True
-        Whether to show violin plots (distributions)
-    line_color_by : str, default 'subject'
-        How to color the connecting lines: 'subject' (orange-purple gradient across subjects) 
-        or 'region' (same color as violins for each region)
-    ylim : tuple or None, default None
-        Y-axis limits as (ymin, ymax). If None, uses automatic limits
-    fit_trends : bool, default False
-        Whether to fit polynomial trends to distribution means within each condition
-    trend_line_width : float, default 3
-        Width of trend lines
-    trend_alpha : float, default 0.9
-        Transparency of trend lines
-    hide_legend : bool, default False
-        Whether to hide the legend
-    sort_by_median : bool, default False
-        Whether to sort x-axis (conditions) by median value in descending order
-    add_colorbar : bool, default True
-        Whether to add a colorbar when line_color_by='subject'
-    show_r2_annotation : bool, default False
-        Whether to show R² values from best fitting trend above each condition
-        (only applicable when fit_trends=True). Displays to 2 decimal places.
-    r2_fontsize : int, default 8
-        Font size for R² annotations
+        List of observation indices to include (e.g., region indices 0-399).
+    violin_alpha : float, default=0.5
+        Transparency for violin plots (0-1).
+    point_alpha : float, default=0.5
+        Transparency for individual subject points (0-1).
+    point_size : float, default=1
+        Size of individual subject points.
+    line_alpha : float, default=0.25
+        Transparency for connecting lines (0-1).
+    line_width : float, default=0.5
+        Width of connecting lines.
+    show_points : bool, default=True
+        Whether to show individual subject points.
+    point_jitter : float, default=0.02
+        Amount of jitter for point positions.
+    show_lines : bool, default=False
+        Whether to show connecting lines across conditions for each subject.
+    show_violins : bool, default=True
+        Whether to show violin plots (distributions).
+    line_color_by : str, default='subject'
+        How to color connecting lines: 'subject' (gradient across subjects) 
+        or 'region' (same color as violins for each region).
+    ylim : tuple or None, default=None
+        Y-axis limits as (ymin, ymax). If None, uses automatic limits.
+    fit_trends : bool, default=False
+        Whether to fit polynomial trends to distribution means within each condition.
+    trend_line_width : float, default=1
+        Width of trend lines.
+    trend_alpha : float, default=1
+        Transparency of trend lines (0-1).
+    hide_legend : bool, default=False
+        Whether to hide the legend.
+    sort_by_median : bool, default=False
+        Whether to sort x-axis (conditions) by median value in descending order.
+    add_colorbar : bool, default=True
+        Whether to add colorbar when line_color_by='subject'.
+    show_r2_annotation : bool, default=False
+        Whether to show R² values above each condition (only when fit_trends=True).
         
-    Returns:
-    --------
-    ax : matplotlib axes object
+    Returns
+    -------
+    ax : matplotlib.axes.Axes
+        The axes object with the plot.
     trend_results : dict, optional
-        Dictionary containing trend fitting results if fit_trends=True
+        Dictionary containing trend fitting results if fit_trends=True.
     """
     
-    # Make a copy to avoid modifying original data
-    df_work = df.copy()
-    
-    # Drop the first column if it's just an index
-    if df_work.columns[0] in ['', 'Unnamed: 0'] or df_work.iloc[:, 0].dtype in ['int64', 'int32']:
-        df_work = df_work.iloc[:, 1:]
+    # Prepare data
+    df_clean = _drop_index_column(df.copy())
     
     # Ensure observation_indices is a list
     if not isinstance(observation_indices, (list, np.ndarray)):
         observation_indices = [observation_indices]
     
-    # Get unique subjects and conditions
-    subjects = df_work['subject'].unique()
-    condition_cols = [col for col in df_work.columns if col != 'subject']
-    n_subjects = len(subjects)
+    # Identify subjects and conditions
+    subject_ids = df_clean['subject'].unique()
+    n_subjects = len(subject_ids)
+    condition_names = [col for col in df_clean.columns if col != 'subject']
     
     print(f"Number of subjects: {n_subjects}")
     print(f"Selected regions: {observation_indices}")
-    print(f"Conditions: {condition_cols}")
+    print(f"Conditions: {condition_names}")
     
     # Create observation index within each subject
-    df_work['obs_index'] = df_work.groupby('subject').cumcount()
+    df_clean['obs_index'] = df_clean.groupby('subject').cumcount()
     
     # Filter for selected observations
-    df_filtered = df_work[df_work['obs_index'].isin(observation_indices)].copy()
+    df_filtered = df_clean[df_clean['obs_index'].isin(observation_indices)].copy()
     
     print(f"Filtered data shape: {df_filtered.shape}")
     print(f"Expected rows: {n_subjects * len(observation_indices)}")
     
-    # Calculate medians and sort conditions if requested
+    # Sort conditions by median if requested
     if sort_by_median:
-        condition_medians = {}
-        for condition in condition_cols:
-            # Get all values for this condition across all subjects and selected regions
-            all_values = df_filtered[condition].values
-            condition_medians[condition] = np.median(all_values)
+        condition_medians = {
+            cond: np.median(df_filtered[cond].values) 
+            for cond in condition_names
+        }
+        condition_names = sorted(condition_names, 
+                                key=lambda x: condition_medians[x], 
+                                reverse=True)
         
-        # Sort conditions by median in descending order
-        condition_cols = sorted(condition_cols, key=lambda x: condition_medians[x], reverse=True)
-        
-        print(f"Sorted conditions by median (descending):")
-        for condition in condition_cols:
-            print(f"  {condition}: median = {condition_medians[condition]:.4f}")
+        print("Sorted conditions by median (descending):")
+        for cond in condition_names:
+            print(f"  {cond}: median = {condition_medians[cond]:.4f}")
     
-    # Reshape data from wide to long format
+    # Reshape to long format
     df_long = pd.melt(df_filtered, 
                       id_vars=['subject', 'obs_index'], 
-                      value_vars=condition_cols,
+                      value_vars=condition_names,
                       var_name='Condition', 
                       value_name='Value')
     
-    # Create region labels for better readability
+    # Create region labels
     df_long['Region'] = 'Region_' + df_long['obs_index'].astype(str)
     
-    # Convert Condition to categorical with specified order to maintain sort order
-    df_long['Condition'] = pd.Categorical(df_long['Condition'], categories=condition_cols, ordered=True)
+    # Convert Condition to categorical to maintain sort order
+    df_long['Condition'] = pd.Categorical(df_long['Condition'], 
+                                          categories=condition_names, 
+                                          ordered=True)
     
-    # Get colors for different regions - soft orange to purple gradient
-    n_obs = len(observation_indices)
-    if n_obs == 1:
-        obs_colors = ['#FFA500']  # Soft orange
+    # Prepare colors for observations (regions)
+    n_observations = len(observation_indices)
+    if n_observations == 1:
+        observation_colors = ['#FFA500']  # Soft orange
     else:
         sydnor_sa_cmap = create_sydnor_sa_colormap()
-        # Sample colors evenly across the gradient
-        obs_colors = [sydnor_sa_cmap(i / (n_obs - 1)) for i in range(n_obs)]
+        observation_colors = [
+            sydnor_sa_cmap(i / (n_observations - 1)) 
+            for i in range(n_observations)
+        ]
     
-    # Create subject colors for lines if needed
+    # Prepare colors for subjects (for line coloring)
     if line_color_by == 'subject':
-        # Use viridis colormap for subject coloring
         subject_cmap = plt.cm.get_cmap('viridis')
-        
-        # Create colors for all subjects
-        n_subjects = len(subjects)
-        subject_colors = {subj: subject_cmap(i / max(1, n_subjects - 1)) 
-                         for i, subj in enumerate(subjects)}
+        subject_colors = {
+            subj: subject_cmap(i / max(1, n_subjects - 1)) 
+            for i, subj in enumerate(subject_ids)
+        }
     else:
         subject_colors = None
     
-    # Create violin plots split by region (optional)
+    # Create violin plots
     if show_violins:
         sns.violinplot(data=df_long, x='Condition', y='Value', hue='Region',
                        ax=ax, alpha=violin_alpha, inner=None, 
-                       palette=obs_colors)
+                       palette=observation_colors)
     
-    # Calculate means for trend fitting if requested
+    # Fit trends if requested
     trend_results = {}
-    if fit_trends and len(observation_indices) >= 3:  # Need at least 3 points for trend fitting
+    if fit_trends and n_observations >= 3:
         print("Fitting polynomial trends to distribution means...")
         
-        # Set up trend color (soft grey for all trends)
         trend_color = "#3B3B3B"  # Soft grey
+        n_conditions = len(condition_names)
+        violin_width = 0.8
+        violin_spacing = violin_width / n_observations
         
         # Calculate means for each condition and region
         condition_means = {}
-        for condition in condition_cols:
+        for cond in condition_names:
             region_means = []
             for obs_idx in observation_indices:
-                condition_region_data = df_long[
-                    (df_long['Condition'] == condition) & 
-                    (df_long['obs_index'] == obs_idx)
-                ]['Value']
-                region_means.append(np.mean(condition_region_data))
-            condition_means[condition] = np.array(region_means)
+                mask = ((df_long['Condition'] == cond) & 
+                       (df_long['obs_index'] == obs_idx))
+                region_data = df_long[mask]['Value']
+                region_means.append(np.mean(region_data))
+            condition_means[cond] = np.array(region_means)
         
         # Fit trends for each condition
-        for cond_idx, condition in enumerate(condition_cols):
-            means = condition_means[condition]
-            x_data = np.array(range(len(observation_indices)))  # Use position as x-axis
+        for cond_idx, cond in enumerate(condition_names):
+            means = condition_means[cond]
+            x_data = np.arange(len(observation_indices))
             
-            # Fit polynomial trends of degrees 1 and 2
+            # Fit polynomial trends (linear and quadratic)
             degrees = [1, 2]
             degree_names = ['Linear', 'Quadratic']
             r2_scores = []
@@ -504,7 +460,6 @@ def plot_subject_level_violins(df, ax, observation_indices,
             
             for degree in degrees:
                 try:
-                    # Fit polynomial
                     coeffs = np.polyfit(x_data, means, degree)
                     poly_func = np.poly1d(coeffs)
                     
@@ -528,7 +483,7 @@ def plot_subject_level_violins(df, ax, observation_indices,
             best_poly = fitted_polys[best_idx]
             
             # Store results
-            trend_results[condition] = {
+            trend_results[cond] = {
                 'means': means,
                 'x_data': x_data,
                 'r2_scores': dict(zip(degree_names, r2_scores)),
@@ -540,104 +495,88 @@ def plot_subject_level_violins(df, ax, observation_indices,
             
             # Plot best fitting trend
             if best_poly is not None and best_r2 > 0:
-                # Calculate positions for trend line
-                n_conditions = len(condition_cols)
-                width = 0.8  # Default violin width in seaborn
-                spacing = width / n_obs
-                
                 # Create smooth x values for trend line
                 x_smooth = np.linspace(0, len(observation_indices) - 1, 100)
                 y_smooth = best_poly(x_smooth)
                 
-                # Convert to actual x positions on plot
+                # Convert to plot positions
                 x_plot_smooth = []
                 for x_val in x_smooth:
-                    # Interpolate position within the condition
-                    if n_obs == 1:
+                    if n_observations == 1:
                         x_plot_pos = cond_idx
                     else:
-                        # Map x_val to actual violin positions
                         obs_idx_float = x_val
-                        x_offset = (obs_idx_float - (n_obs - 1) / 2) * spacing
+                        x_offset = (obs_idx_float - (n_observations - 1) / 2) * violin_spacing
                         x_plot_pos = cond_idx + x_offset
                     x_plot_smooth.append(x_plot_pos)
                 
                 # Plot trend line
                 ax.plot(x_plot_smooth, y_smooth, 
                        color=trend_color, linewidth=trend_line_width, 
-                       alpha=trend_alpha, linestyle='-', 
-                       zorder=10)
+                       alpha=trend_alpha, linestyle='-', zorder=10)
             
-            print(f"  {condition}: Best fit = {degree_names[best_idx]} (R² = {best_r2:.3f})")
+            print(f"  {cond}: Best fit = {degree_names[best_idx]} (R² = {best_r2:.3f})")
     
-    # Add connecting lines for each subject if requested
+    # Add connecting lines if requested
     if show_lines:
-        # Get x positions for conditions
-        n_conditions = len(condition_cols)
+        n_conditions = len(condition_names)
+        violin_width = 0.8
+        violin_spacing = violin_width / n_observations
         
-        # Calculate positions for each observation within each condition
-        width = 0.8  # Default violin width in seaborn
-        spacing = width / n_obs
-        
-        # For each subject, draw connecting lines for each region
-        for subject in subjects:
+        for subject in subject_ids:
             for obs_idx, obs_val in enumerate(observation_indices):
-                # Get data for this subject and region across all conditions
-                subject_obs_data = df_filtered[(df_filtered['subject'] == subject) & 
-                                              (df_filtered['obs_index'] == obs_val)]
+                # Get data for this subject and observation
+                mask = ((df_filtered['subject'] == subject) & 
+                       (df_filtered['obs_index'] == obs_val))
+                subject_obs_data = df_filtered[mask]
                 
                 if len(subject_obs_data) > 0:
-                    # Get y-values for this subject/region across conditions
+                    # Get y-values and x-positions across conditions
                     y_values = []
                     x_positions = []
                     
-                    for cond_idx, condition in enumerate(condition_cols):
-                        if condition in subject_obs_data.columns:
-                            y_val = subject_obs_data[condition].iloc[0]
+                    for cond_idx, cond in enumerate(condition_names):
+                        if cond in subject_obs_data.columns:
+                            y_val = subject_obs_data[cond].iloc[0]
                             y_values.append(y_val)
                             
-                            # Calculate x position for this region's violin center
-                            if n_obs == 1:
+                            # Calculate x position for this observation's violin
+                            if n_observations == 1:
                                 x_pos = cond_idx
                             else:
-                                x_offset = (obs_idx - (n_obs - 1) / 2) * spacing
+                                x_offset = (obs_idx - (n_observations - 1) / 2) * violin_spacing
                                 x_pos = cond_idx + x_offset
                             x_positions.append(x_pos)
                     
-                    # Draw connecting line for this subject/region
-                    if len(y_values) > 1:  # Only draw if we have multiple points
-                        # Choose line color based on line_color_by parameter
+                    # Draw connecting line
+                    if len(y_values) > 1:
                         if line_color_by == 'subject':
                             line_color = subject_colors[subject]
                         else:  # line_color_by == 'region'
-                            line_color = obs_colors[obs_idx]
+                            line_color = observation_colors[obs_idx]
                             
                         ax.plot(x_positions, y_values, 
-                               color=line_color, 
-                               alpha=line_alpha, 
-                               linewidth=line_width, 
-                               zorder=1)
+                               color=line_color, alpha=line_alpha, 
+                               linewidth=line_width, zorder=1)
     
     # Add individual subject points if requested
     if show_points:
-        # Calculate positions for each region within each condition
-        # This accounts for the spacing seaborn uses for grouped violins
-        width = 0.8  # Default violin width in seaborn
-        spacing = width / n_obs
+        violin_width = 0.8
+        violin_spacing = violin_width / n_observations
         
-        for cond_idx, condition in enumerate(condition_cols):
+        for cond_idx, cond in enumerate(condition_names):
             for obs_idx, obs_val in enumerate(observation_indices):
-                # Filter data for this condition and region
-                mask = ((df_long['Condition'] == condition) & 
+                # Filter data for this condition and observation
+                mask = ((df_long['Condition'] == cond) & 
                        (df_long['obs_index'] == obs_val))
                 data_subset = df_long[mask]
                 
                 if len(data_subset) > 0:
-                    # Calculate x position for this region's violin
-                    if n_obs == 1:
+                    # Calculate x position
+                    if n_observations == 1:
                         x_pos = cond_idx
                     else:
-                        x_offset = (obs_idx - (n_obs - 1) / 2) * spacing
+                        x_offset = (obs_idx - (n_observations - 1) / 2) * violin_spacing
                         x_pos = cond_idx + x_offset
                     
                     # Add jitter
@@ -645,93 +584,73 @@ def plot_subject_level_violins(df, ax, observation_indices,
                     
                     # Plot points
                     ax.scatter(x_jittered, data_subset['Value'], 
-                             color=obs_colors[obs_idx], 
-                             alpha=point_alpha, 
-                             s=point_size, 
-                             zorder=3)
-    
-    # Customize the plot
-    ax.set_xlabel('Condition', fontsize=10)
-    ax.set_ylabel('Value', fontsize=10)
-    
-    # Ensure condition labels are always shown
-    ax.set_xticks(range(len(condition_cols)))
-    ax.set_xticklabels(condition_cols, rotation=45, ha='right')
+                             color=observation_colors[obs_idx], 
+                             alpha=point_alpha, s=point_size, zorder=3)
     
     # Add R² annotations if requested
     if show_r2_annotation and fit_trends and trend_results:
-        # Get overall y-axis limits for final adjustment
         y_min, y_max = ax.get_ylim()
-        condition_range = y_max - y_min
-
-        for cond_idx, condition in enumerate(condition_cols):
-            # Get R² value for this condition
-            if condition in trend_results:
-                r2_value = trend_results[condition]['best_r2']
+        
+        for cond_idx, cond in enumerate(condition_names):
+            if cond in trend_results:
+                r2_value = trend_results[cond]['best_r2']
                 
-                # Find the maximum value in this condition's distribution
-                condition_data = df_long[df_long['Condition'] == condition]['Value']
-                condition_max = condition_data.max()
+                # Find maximum value in this condition's distribution
+                condition_data = df_long[df_long['Condition'] == cond]['Value']
+                annotation_y = _calculate_annotation_height(condition_data.values, 
+                                                           y_min, y_max)
                 
-                # Set annotation height relative to this distribution's maximum
-                annotation_height = condition_max + condition_range * 0.05  # 5% above this distribution's max
-                
-                # Format the annotation text (hardcoded to 2 decimal places)
-                annotation_text = f"R²={r2_value:.2f}"
-                
-                # Place annotation above the condition
-                ax.text(cond_idx, annotation_height, annotation_text,
-                        ha='center', va='bottom', fontsize=5)
-
-        # Adjust y-axis limits to accommodate the highest annotation
+                # Place annotation
+                ax.text(cond_idx, annotation_y, f"R²={r2_value:.2f}",
+                       ha='center', va='bottom', fontsize=5)
+        
+        # Adjust y-axis to accommodate annotations
         ax.set_ylim(y_min, y_max + (y_max - y_min) * 0.1)
-
+    
+    # Customize plot appearance
+    ax.set_xlabel('Condition', fontsize=10)
+    ax.set_ylabel('Value', fontsize=10)
+    ax.set_xticks(range(len(condition_names)))
+    ax.set_xticklabels(condition_names, rotation=0, ha='center')
+    ax.grid(True, alpha=0.3, axis='y')
+    
     # Create legend
     legend_handles = []
     legend_labels = []
     
-    # Add region legends if multiple regions
-    if len(observation_indices) > 1:
+    if n_observations > 1:
         if show_violins:
-            # Use legend from violin plots
             handles, labels = ax.get_legend_handles_labels()
             region_handles = [h for h, l in zip(handles, labels) if 'Region_' in l]
             region_labels = [f'Index {idx+1}' for idx in observation_indices]
             legend_handles.extend(region_handles)
             legend_labels.extend(region_labels)
         else:
-            # Create custom legend for points/lines when no violins
             from matplotlib.patches import Patch
-            region_elements = [Patch(facecolor=obs_colors[i], label=f'Index {idx}') 
-                              for i, idx in enumerate(observation_indices)]
+            region_elements = [
+                Patch(facecolor=observation_colors[i], label=f'Index {idx}') 
+                for i, idx in enumerate(observation_indices)
+            ]
             legend_handles.extend(region_elements)
             legend_labels.extend([f'Index {idx+1}' for idx in observation_indices])
     
-    # Set legend if we have elements
+    # Set legend
     if legend_handles and not hide_legend:
         ax.legend(handles=legend_handles, labels=legend_labels, 
-                 title='Group Index', 
-                 loc='upper right', bbox_to_anchor=(1, 1), 
-                 fontsize=9)
-    
-    # Add grid for better readability
-    ax.grid(True, alpha=0.3, axis='y')
+                 title='Group Index', loc='upper right', 
+                 bbox_to_anchor=(1, 1), fontsize=9)
     
     # Add colorbar for subject coloring if applicable
     if show_lines and line_color_by == 'subject' and add_colorbar:
-        # Create a mappable for the colorbar
-        sm = plt.cm.ScalarMappable(cmap=subject_cmap, 
-                                  norm=plt.Normalize(vmin=0, vmax=n_subjects-1))
-        sm.set_array([])
-        cbar = plt.colorbar(sm, ax=ax, shrink=0.8)
-        cbar.set_label('Subject Index', fontsize=10)
+        _add_colorbar(ax, subject_cmap, 0, n_subjects - 1, 
+                     'Subject Index', shrink=0.8)
         
-        # Set colorbar ticks to show meaningful subject indices
+        # Set colorbar ticks
+        cbar = ax.figure.axes[-1]  # Get the colorbar axes
         if n_subjects <= 10:
             cbar.set_ticks(range(n_subjects))
         else:
-            # For many subjects, show fewer ticks
-            tick_indices = np.linspace(0, n_subjects-1, 5, dtype=int)
+            tick_indices = np.linspace(0, n_subjects - 1, 5, dtype=int)
             cbar.set_ticks(tick_indices)
     
     # Set y-axis limits if specified
@@ -1887,3 +1806,72 @@ def plot_hierarchy_correlation(brain_map, data_dict, which_moment='var', yeo_sys
     fig.tight_layout()
     
     return fig, axes
+
+
+# ==================== Support Utility Functions ====================
+def create_sydnor_sa_colormap():
+    """
+    Create a custom colormap that transitions from yellow/orange (sensorimotor pole, low rank) 
+    through white at the center to purple (association pole, high rank).
+    
+    Returns:
+        matplotlib.colors.LinearSegmentedColormap: The custom colormap
+    """
+    
+    # Define the colors for the colormap
+    # Format: (position, (R, G, B))
+    colors = [
+        (0.0, '#FFA500'),   # Orange/yellow (sensorimotor pole, low rank)
+        (0.5, "#FFFFFF"),   # White (middle, 0 point)
+        (1.0, '#8A2BE2')    # Purple (association pole, high rank)
+    ]
+    
+    # Create the colormap
+    sydnor_sa = mcolors.LinearSegmentedColormap.from_list('sydnor_sa', colors, N=256)
+    
+    # Register the colormap with matplotlib so it can be used by name
+    try:
+        plt.colormaps.register(cmap=sydnor_sa, name='sydnor_sa')
+    except:
+        pass
+    
+    return sydnor_sa
+
+
+def _drop_index_column(df):
+    """Remove first column if it's just an index."""
+    if df.columns[0] in ['', 'Unnamed: 0'] or df.iloc[:, 0].dtype in ['int64', 'int32']:
+        return df.iloc[:, 1:]
+    return df
+
+
+def _create_color_mapping(color_vector, colormap):
+    """Create color mapping from color vector using specified colormap."""
+    cmap = plt.cm.get_cmap(colormap)
+    unique_values = np.unique(color_vector)
+    n_unique = len(unique_values)
+    
+    if n_unique == 1:
+        colors = [cmap(0.5)]
+    else:
+        colors = [cmap(i / (n_unique - 1)) for i in range(n_unique)]
+    
+    color_dict = dict(zip(unique_values, colors))
+    point_colors = [color_dict[val] for val in color_vector]
+    return point_colors, cmap
+
+
+def _add_colorbar(ax, cmap, vmin, vmax, label, shrink=0.8):
+    """Add colorbar to axes."""
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(vmin=vmin, vmax=vmax))
+    sm.set_array([])
+    cbar = plt.colorbar(sm, ax=ax, shrink=shrink)
+    cbar.set_label(label, fontsize=10)
+    return cbar
+
+
+def _calculate_annotation_height(data_values, y_min, y_max, offset_fraction=0.05):
+    """Calculate height for annotations above data."""
+    y_range = y_max - y_min
+    data_max = np.max(data_values)
+    return data_max + y_range * offset_fraction
