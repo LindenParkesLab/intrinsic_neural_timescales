@@ -261,8 +261,8 @@ def plot_repeated_measures_violins(df, ax, color_vector=None, colormap='viridis'
     if color_vector is not None:
         # Get overall y-axis limits for final adjustment
         y_min, y_max = ax.get_ylim()
-        max_annotation_height = y_min  # Track highest annotation for final y-limit adjustment
-        
+        condition_range = y_max - y_min
+
         for i, condition in enumerate(conditions):
             # Get data values for this condition
             condition_values = df[condition].values
@@ -284,19 +284,15 @@ def plot_repeated_measures_violins(df, ax, color_vector=None, colormap='viridis'
             condition_max = np.max(condition_values)
             
             # Set annotation height relative to this distribution's maximum
-            condition_range = y_max - y_min
             annotation_height = condition_max + condition_range * 0.05  # 5% above this distribution's max
-            
-            # Track the highest annotation
-            max_annotation_height = max(max_annotation_height, annotation_height)
             
             # Annotate correlation above this specific violin
             if correlation_method is not None:
-                ax.text(i, annotation_height, f'r={correlation:.3f}', 
-                    ha='center', va='bottom', fontsize=6, fontweight='bold')
+                ax.text(i, annotation_height, f'r={correlation:.2f}', 
+                        ha='center', va='bottom', fontsize=5)
         
         # Adjust y-axis limits to accommodate the highest annotation
-        ax.set_ylim(y_min, max_annotation_height + (y_max - y_min) * 0.05)
+        ax.set_ylim(y_min, y_max + (y_max - y_min) * 0.1)
     
     # Customize the plot
     ax.set_xlabel('Condition', fontsize=10)
@@ -329,7 +325,7 @@ def plot_subject_level_violins(df, ax, observation_indices,
                                show_violins=True, line_color_by='subject', ylim=None,
                                fit_trends=False, trend_line_width=1, trend_alpha=1,
                                hide_legend=False, sort_by_median=False,
-                               add_colorbar=True):
+                               add_colorbar=True, show_r2_annotation=False):
     """
     Create violin plots showing subject-level variation for selected regions.
     Each region index gets its own violin per condition.
@@ -378,6 +374,11 @@ def plot_subject_level_violins(df, ax, observation_indices,
         Whether to sort x-axis (conditions) by median value in descending order
     add_colorbar : bool, default True
         Whether to add a colorbar when line_color_by='subject'
+    show_r2_annotation : bool, default False
+        Whether to show R² values from best fitting trend above each condition
+        (only applicable when fit_trends=True). Displays to 2 decimal places.
+    r2_fontsize : int, default 8
+        Font size for R² annotations
         
     Returns:
     --------
@@ -657,6 +658,34 @@ def plot_subject_level_violins(df, ax, observation_indices,
     ax.set_xticks(range(len(condition_cols)))
     ax.set_xticklabels(condition_cols, rotation=45, ha='right')
     
+    # Add R² annotations if requested
+    if show_r2_annotation and fit_trends and trend_results:
+        # Get overall y-axis limits for final adjustment
+        y_min, y_max = ax.get_ylim()
+        condition_range = y_max - y_min
+
+        for cond_idx, condition in enumerate(condition_cols):
+            # Get R² value for this condition
+            if condition in trend_results:
+                r2_value = trend_results[condition]['best_r2']
+                
+                # Find the maximum value in this condition's distribution
+                condition_data = df_long[df_long['Condition'] == condition]['Value']
+                condition_max = condition_data.max()
+                
+                # Set annotation height relative to this distribution's maximum
+                annotation_height = condition_max + condition_range * 0.05  # 5% above this distribution's max
+                
+                # Format the annotation text (hardcoded to 2 decimal places)
+                annotation_text = f"R²={r2_value:.2f}"
+                
+                # Place annotation above the condition
+                ax.text(cond_idx, annotation_height, annotation_text,
+                        ha='center', va='bottom', fontsize=5)
+
+        # Adjust y-axis limits to accommodate the highest annotation
+        ax.set_ylim(y_min, y_max + (y_max - y_min) * 0.1)
+
     # Create legend
     legend_handles = []
     legend_labels = []
