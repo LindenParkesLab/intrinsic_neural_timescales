@@ -108,6 +108,9 @@ class DataLoader:
         'UCLA': {
             'MRI3T': 2.0
         },
+        'Penn_LEAD': {
+            'MRI3T': 0.8
+        },
     }
     
     # Map dataset names to base directories
@@ -118,6 +121,7 @@ class DataLoader:
         'PNC': '/mnt/storage_ssd_raid/research_data/RBC/PNC',
         'NKI': '/mnt/storage_ssd_raid/research_data/RBC/NKI',
         'UCLA': '/mnt/storage_ssd_raid/research_data/UCLA_CNP_LA5c',
+        'Penn_LEAD': '/mnt/storage_ssd_raid/research_data/Penn_LEAD',
     }
     
     # Map dataset names to base directories
@@ -129,6 +133,7 @@ class DataLoader:
         'PNC': os.path.join(BASE_PATHS['PNC'], 'bids'),
         'NKI': os.path.join(BASE_PATHS['NKI'], 'bids'),
         'UCLA': os.path.join(BASE_PATHS['UCLA'], 'bids'),
+        'Penn_LEAD': os.path.join(BASE_PATHS['Penn_LEAD'], 'bids'),
     }
     
     # Map dataset names to base directories
@@ -140,6 +145,7 @@ class DataLoader:
         'PNC': os.path.join(BASE_PATHS['PNC'], 'derivatives'),
         'NKI': os.path.join(BASE_PATHS['NKI'], 'derivatives'),
         'UCLA': os.path.join(BASE_PATHS['UCLA'], 'derivatives'),
+        'Penn_LEAD': os.path.join(BASE_PATHS['Penn_LEAD'], 'derivatives'),
     }
     
     # Subdirectory structure for different data types
@@ -163,6 +169,9 @@ class DataLoader:
         },
         'UCLA': {
             'MRI3T': {'fmri': os.path.join(DERIVDATA_PATHS['UCLA'], 'xcpd'),}
+        },
+        'Penn_LEAD': {
+            'MRI3T': {'fmri': os.path.join(DERIVDATA_PATHS['Penn_LEAD'], 'xcpd'),}
         },
     }
     
@@ -476,6 +485,9 @@ class DataLoader:
             elif modality == 'MRI3T' and self.dataset == 'NKI':
                 task_events_file_path = glob.glob(os.path.join(self.rawdata_dir, f'sub-{subject_id}', f'ses-{session}', 'func', f'sub-{subject_id}_ses-{session}_task-{task}_acq-1400*_events.tsv'))[0]
                 task_events = pd.read_csv(task_events_file_path, sep='\t')
+            elif modality == 'MRI3T' and self.dataset == 'Penn_LEAD':
+                task_events_file_path = glob.glob(os.path.join(self.rawdata_dir, f'sub-{subject_id}', f'ses-{session}', 'func', f'sub-{subject_id}_ses-{session}_task-{task}_run-01_events.tsv'))[0]
+                task_events = pd.read_csv(task_events_file_path, sep='\t')
             elif modality == 'MRI7T':
                 movie_metadata_dir = os.path.join(self.output_dir, 'supporting_data', 'movie_data')
                 
@@ -542,23 +554,26 @@ class DataLoader:
             fileext = ".tsv"
 
         # Construct filename
-        if scan.rbc is False and scan.session is None:
-            filename = f"sub-{scan.subject_id}_task-{scan.task}_space-{scan.space}_seg-{scan.seg}_stat-mean_timeseries{fileext}"
-            filename_full = subject_dir / filename
-        elif scan.rbc is False and scan.session is not None:
-            filename = f"sub-{scan.subject_id}_ses-{scan.session}_task-{scan.task}_space-{scan.space}_seg-{scan.seg}_stat-mean_timeseries{fileext}"
-            filename_full = subject_dir / filename
-        elif scan.rbc is True and self.dataset == 'PNC':
+        if self.dataset == 'PNC':
             filename = f"sub-{scan.subject_id}_ses-{scan.session}_task-{scan.task}_atlas-{scan.seg}_space-{scan.space}_reg-36Parameter_desc-Mean_timeseries{fileext}"
             filename_full = subject_dir / filename
             if not filename_full.exists():
                 filename = f"sub-{scan.subject_id}_ses-{scan.session}_task-{scan.task}_acq-singleband_atlas-{scan.seg}_space-{scan.space}_reg-36Parameter_desc-Mean_timeseries{fileext}"
                 filename_full = subject_dir / filename
-        elif scan.rbc is True and self.dataset == 'NKI':
+        elif self.dataset == 'NKI':
             filename = f"sub-{scan.subject_id}_ses-{scan.session}_task-{scan.task}_acq-1400*_atlas-{scan.seg}_space-{scan.space}_reg-36Parameter_desc-Mean_timeseries{fileext}"
             filename_full = str(subject_dir / filename)
             filename_full = glob.glob(filename_full)[0]
             filename_full = Path(filename_full)
+        elif self.dataset == 'Penn_LEAD':
+            filename = f"sub-{scan.subject_id}_ses-{scan.session}_task-{scan.task}_run-01_space-{scan.space}_seg-{scan.seg}_stat-mean_timeseries{fileext}"
+            filename_full = subject_dir / filename
+        elif scan.rbc is False and scan.session is None:
+            filename = f"sub-{scan.subject_id}_task-{scan.task}_space-{scan.space}_seg-{scan.seg}_stat-mean_timeseries{fileext}"
+            filename_full = subject_dir / filename
+        elif scan.rbc is False and scan.session is not None:
+            filename = f"sub-{scan.subject_id}_ses-{scan.session}_task-{scan.task}_space-{scan.space}_seg-{scan.seg}_stat-mean_timeseries{fileext}"
+            filename_full = subject_dir / filename
 
         return filename_full
     
