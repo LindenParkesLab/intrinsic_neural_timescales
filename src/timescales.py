@@ -197,6 +197,7 @@ class Timescales(DataLoader):
         use_fft: bool = False,
         force_recompute: bool = False,
         save_outputs: bool = True,
+        suffix: str = None,
         use_residuals: bool = False,
         lowpass_cutoff: float = None,
         verbose: bool = True
@@ -215,6 +216,8 @@ class Timescales(DataLoader):
             output_type = 'autocorr'
         else:
             output_type = f'autocorr_lp-{lowpass_cutoff}hz'
+        if suffix:
+            output_type = f'{output_type}_{suffix}'
         if use_residuals:
             output_type = output_type + '_resids'
 
@@ -543,12 +546,12 @@ class Timescales(DataLoader):
         auc = np.zeros(n_parcels)
         
         for i in range(n_parcels):
-            if max_lag is None:
-                max_lag_i = np.where(acf[i] < 0)[0][0]
-            else:
-                max_lag_i = max_lag
-
             try:
+                if max_lag is None:
+                    max_lag_i = np.where(acf[i] < 0)[0][0]
+                else:
+                    max_lag_i = max_lag
+
                 auc[i] = np.trapz(acf[i, :max_lag_i], dx=tr)
             except:
                 auc[i] = np.nan
@@ -579,20 +582,24 @@ class Timescales(DataLoader):
         B = np.zeros(n_parcels)
         
         for i in range(n_parcels):
-            if version == 'loglin':
-                tau[i], A = fit_tau(acf[i], delta=tr)
-            elif version == 'murray':
-                # tau[i], B[i], A = fit_tau_murray(acf[i], delta=tr)
-                if n_lags > 1000:
-                    negative_indices = np.where(acf[i] < 0)[0]
-                    if len(negative_indices) > 0:
-                        time_window = negative_indices[0] + (negative_indices[0] * 0.5)
-                        max_lag = get_acf_time_index(time_window=time_window, tr=tr)
-                        tau[i], B[i], A = fit_tau_murray(acf[i, :max_lag], delta=tr)
+            try:
+                if version == 'loglin':
+                    tau[i], A = fit_tau(acf[i], delta=tr)
+                elif version == 'murray':
+                    # tau[i], B[i], A = fit_tau_murray(acf[i], delta=tr)
+                    if n_lags > 1000:
+                        negative_indices = np.where(acf[i] < 0)[0]
+                        if len(negative_indices) > 0:
+                            time_window = negative_indices[0] + (negative_indices[0] * 0.5)
+                            max_lag = get_acf_time_index(time_window=time_window, tr=tr)
+                            tau[i], A, B[i] = fit_tau_murray(acf[i, :max_lag], delta=tr)
+                        else:
+                            tau[i], A, B[i] = fit_tau_murray(acf[i], delta=tr)
                     else:
-                        tau[i], B[i], A = fit_tau_murray(acf[i], delta=tr)
-                else:
-                    tau[i], B[i], A = fit_tau_murray(acf[i], delta=tr)
+                        tau[i], A, B[i] = fit_tau_murray(acf[i], delta=tr)
+            except:
+                tau[i] = np.nan
+                B[i] = np.nan
 
         if version == 'murray':
             return tau, B
@@ -800,6 +807,10 @@ def fit_tau_murray(acf, delta):
     Fit intrinsic timescale (tau) using Murray et al. 2014 approach.
     
     Fits: R(kΔ) = A[exp(-kΔ/τ) + B]
+    which expands to: R(kΔ) = A·exp(-kΔ/τ) + A·B
+    
+    Following Murray et al. 2014, fitting starts at the time lag with maximum 
+    decrease to avoid refractoriness/negative adaptation at short lags.
     
     Parameters
     ----------
@@ -812,37 +823,69 @@ def fit_tau_murray(acf, delta):
     -------
     tau : float
         Intrinsic timescale
-    B : float
-        Offset (reflects long timescales)
     A : float
-        Amplitude
+        Amplitude parameter
+    B : float
+        Offset scaling factor (additive offset in model is A·B)
+    
+    Raises
+    ------
+    RuntimeError
+        If curve fitting fails to converge
+    ValueError
+        If ACF is too short or invalid
     """
+    if len(acf) < 2:
+        raise ValueError("ACF must have at least 2 points")
+    
     def murray_model(k, A, tau, B):
         return A * (np.exp(-k * delta / tau) + B)
     
-    k = np.arange(len(acf))
+    # Find time lag with maximum decrease (Murray et al. 2014)
+    # Maximum decrease = most negative gradient
+    acf_diff = np.diff(acf)
+    start_idx = np.argmin(acf_diff)  # Index with steepest negative slope
     
-    # Smarter initialization
-    # Tau: find where ACF drops to ~0.4
-    tau_init_idx = np.where(acf < 0.4)[0]
+    # Subset ACF from start_idx onward
+    acf_subset = acf[start_idx:]
+    k = np.arange(start_idx, start_idx + len(acf_subset))
+    
+    # Initialize parameters
+    # Tau: find where ACF drops to ~0.4 in the subset
+    tau_init_idx = np.where(acf_subset < 0.4)[0]
     if len(tau_init_idx) > 0:
         tau_init = tau_init_idx[0] * delta
     else:
-        tau_init = len(acf) * delta / 4
+        tau_init = len(acf_subset) * delta / 4
     
-    # A: approximate from ACF[0]
-    A_init = acf[0] / (1 + 0.1)  # assume B ~ 0.1
+    # Ensure tau_init is reasonable
+    tau_init = max(tau_init, delta)  # At least one time bin
+    
+    # A: approximate from ACF at start (assuming small B)
+    A_init = acf_subset[0] / (1 + 0.1)
+    A_init = max(A_init, 0.1)  # Ensure positive
     
     # B: small positive value
     B_init = 0.1
     
     p0 = [A_init, tau_init, B_init]
-    bounds = ([0, 0, -0.5], [2, np.inf, 0.5])
+    bounds = ([0, delta/10, -0.5], [2, np.inf, 0.5])
     
-    popt, _ = curve_fit(murray_model, k, acf, p0=p0, bounds=bounds, maxfev=5000)
-    
-    A, tau, B = popt
-    return tau, B, A
+    try:
+        popt, _ = curve_fit(
+            murray_model, k, acf_subset, 
+            p0=p0, bounds=bounds, maxfev=5000
+        )
+        A, tau, B = popt
+        return tau, A, B
+        
+    except (RuntimeError, ValueError) as e:
+        raise RuntimeError(
+            f"Failed to fit Murray model: {str(e)}. "
+            f"ACF range: [{acf.min():.3f}, {acf.max():.3f}], "
+            f"Start index: {start_idx}/{len(acf)}, "
+            f"Initial params: A={A_init:.3f}, tau={tau_init:.3f}, B={B_init:.3f}"
+        )
 
 def get_acf_time_index(time_window=25, tr=None):
     """
@@ -1142,40 +1185,70 @@ def compute_deflections(rest_timescales, task_timescales, nuisance_regression=Fa
     
     return int_deflections[:, 0]
 
-def filter_data_dict(data_dict, data_dict_residuals=None):
+def filter_data_dict(data_dict, data_dict_residuals=None, remove_subject_level=True):
+    """
+    Filter data dictionary by removing scans with missing or problematic data.
+    
+    Parameters
+    ----------
+    data_dict : dict
+        Dictionary of scan data
+    data_dict_residuals : dict, optional
+        Dictionary of residualized data to replace task scans
+    remove_subject_level : bool, default=True
+        If True, remove all scans for a subject if any scan has issues.
+        If False, only remove the specific problematic scan.
+    
+    Returns
+    -------
+    data_dict : dict
+        Filtered data dictionary
+    data_dict_residuals : dict, optional
+        Only returned if data_dict_residuals was provided
+    """
     
     remove_these_keys = []
+    
+    # Check for None values
     for scan_key in data_dict.keys():
         if data_dict[scan_key] is None:
-            sub_key = scan_key.split('_')[0]
-            remove_these_keys.append([k for k, v in data_dict.items() if sub_key in k])
-
+            if remove_subject_level:
+                sub_key = scan_key.split('_')[0]
+                remove_these_keys.append([k for k in data_dict.keys() if sub_key in k])
+            else:
+                remove_these_keys.append([scan_key])
+    
+    # Optionally replace task data with residualized data
     if data_dict_residuals is not None:
         for scan_key in data_dict.keys():
             if 'condition-task' in scan_key:
                 try:
                     data_dict[scan_key] = data_dict_residuals[scan_key].copy()
-                except:
-                    sub_key = scan_key.split('_')[0]
-                    remove_these_keys.append([k for k, v in data_dict.items() if sub_key in k])
-
-    remove_these_keys = [item for sublist in remove_these_keys for item in sublist]
+                except KeyError:
+                    print(f"Warning: Key '{scan_key}' not found in data_dict_residuals")
+                    if remove_subject_level:
+                        sub_key = scan_key.split('_')[0]
+                        remove_these_keys.append([k for k in data_dict.keys() if sub_key in k])
+                    else:
+                        remove_these_keys.append([scan_key])
+    
+    # Flatten list and remove duplicates
+    remove_these_keys = list(set([item for sublist in remove_these_keys for item in sublist]))
+    
+    # Remove marked keys
     for remove_key in remove_these_keys:
-        try:
+        if remove_key in data_dict:
             del data_dict[remove_key]
-        except:
-            pass
-
+    
     if data_dict_residuals is None:
         return data_dict
     else:
         return data_dict, data_dict_residuals
 
 def create_ints_dataframe_custom_grouping(data_dict, n_regions=400,
-                                          average_3t_rest=False, average_3t_task_pairs=False, 
-                                          average_3t_tasks=False,
-                                          average_7t_rest=False, average_7t_movies=False,
-                                          average_all_rest=False,
+                                          average_3t_rest=False, average_7t_rest=False, average_all_rest=False, 
+                                          average_7t_movies=False,
+                                          average_3t_task_pairs=False, average_3t_tasks=False, 
                                           average_meg_rest=False, average_meg_task=False,
                                           sort_by_median=False):
     """
@@ -1198,15 +1271,15 @@ def create_ints_dataframe_custom_grouping(data_dict, n_regions=400,
         If True, average 3T task LR/RL pairs (e.g., tfMRIWMLR + tfMRIWMRL)
         Cannot be True if average_3t_tasks is True
     average_3t_tasks : bool, default False
-        If True, average ALL 3T task scans (all tfMRI scans except 7T movies) into "TASK3T"
+        If True, average ALL 3T task scans (all tfMRI scans except 7T movies) into "Tasks"
         Cannot be True if average_3t_task_pairs is True
     average_7t_rest : bool, default False
         If True, average 7T rest scans (rfMRIREST17TPA, rfMRIREST27TAP, etc.) into "REST_7T"
         Cannot be True if average_all_rest is True
     average_7t_movies : bool, default False
-        If True, average 7T movie scans (tfMRIMOVIE17TAP, tfMRIMOVIE27TPA, etc.) into "MOVIE"
+        If True, average 7T movie scans (tfMRIMOVIE17TAP, tfMRIMOVIE27TPA, etc.) into "Movies"
     average_all_rest : bool, default False
-        If True, average ALL rest scans (both 3T and 7T) into "RESTALL"
+        If True, average ALL rest scans (both 3T and 7T) into "Rest"
         Cannot be True if average_3t_rest or average_7t_rest is True
     sort_by_median : bool, default False
         If True, sort columns by their median INT values in descending order
@@ -1278,8 +1351,8 @@ def create_ints_dataframe_custom_grouping(data_dict, n_regions=400,
         
         if all_rest_data:
             all_rest_mean = np.nanmean(np.stack(all_rest_data, axis=0), axis=0)
-            averaged_data['task-RESTALL'] = all_rest_mean
-            print(f"  Averaged {len(all_rest_data)} rest scans (3T and 7T) into: scan-RESTALL")
+            averaged_data['Rest'] = all_rest_mean
+            print(f"  Averaged {len(all_rest_data)} rest scans (3T and 7T) into: Rest")
 
     # Average 3T rest scans  
     if average_3t_rest:
@@ -1294,7 +1367,7 @@ def create_ints_dataframe_custom_grouping(data_dict, n_regions=400,
         
         if rest_3t_data:
             rest_3t_mean = np.nanmean(np.stack(rest_3t_data, axis=0), axis=0)
-            averaged_data['task-REST3T'] = rest_3t_mean
+            averaged_data['Rest-3T'] = rest_3t_mean
             print(f"  Averaged {len(rest_3t_data)} 3T rest scans into: scan-REST3T")
     
     # Average ALL 3T task scans (excluding 7T movies)
@@ -1308,8 +1381,8 @@ def create_ints_dataframe_custom_grouping(data_dict, n_regions=400,
         
         if task_3t_data:
             task_3t_mean = np.nanmean(np.stack(task_3t_data, axis=0), axis=0)
-            averaged_data['task-TASK3T'] = task_3t_mean
-            print(f"  Averaged {len(task_3t_data)} 3T task scans into: scan-TASK3T")
+            averaged_data['Tasks'] = task_3t_mean
+            print(f"  Averaged {len(task_3t_data)} 3T task scans into: Tasks")
     
     # Average 3T task LR/RL pairs
     if average_3t_task_pairs:
@@ -1351,7 +1424,7 @@ def create_ints_dataframe_custom_grouping(data_dict, n_regions=400,
         
         if rest_7t_data:
             rest_7t_mean = np.nanmean(np.stack(rest_7t_data, axis=0), axis=0)
-            averaged_data['task-REST7T'] = rest_7t_mean
+            averaged_data['Rest-7T'] = rest_7t_mean
             print(f"  Averaged {len(rest_7t_data)} 7T rest scans into: scan-REST7T")
     
     # Average 7T movie scans
@@ -1366,8 +1439,8 @@ def create_ints_dataframe_custom_grouping(data_dict, n_regions=400,
         
         if movie_7t_data:
             movie_7t_mean = np.nanmean(np.stack(movie_7t_data, axis=0), axis=0)
-            averaged_data['task-MOVIE'] = movie_7t_mean
-            print(f"  Averaged {len(movie_7t_data)} 7T movie scans into: scan-MOVIE")
+            averaged_data['Movies'] = movie_7t_mean
+            print(f"  Averaged {len(movie_7t_data)} 7T movie scans into: Movies")
             
     # Average MEG rest scans
     if average_meg_rest:
@@ -1381,7 +1454,7 @@ def create_ints_dataframe_custom_grouping(data_dict, n_regions=400,
         
         if rest_meg_data:
             rest_meg_mean = np.nanmean(np.stack(rest_meg_data, axis=0), axis=0)
-            averaged_data['task-RESTMEG'] = rest_meg_mean
+            averaged_data['Rest-MEG'] = rest_meg_mean
             print(f"  Averaged {len(rest_meg_data)} MEG rest scans into: scan-RESTMEG")
 
     # Average MEG task scans
@@ -1396,13 +1469,14 @@ def create_ints_dataframe_custom_grouping(data_dict, n_regions=400,
         
         if task_meg_data:
             task_meg_mean = np.nanmean(np.stack(task_meg_data, axis=0), axis=0)
-            averaged_data['task-TASKMEG'] = task_meg_mean
+            averaged_data['Task-MEG'] = task_meg_mean
             print(f"  Averaged {len(task_meg_data)} MEG task scans into: scan-TASKMEG")
 
     # Create DataFrame
     df_ints = pd.DataFrame(averaged_data)
     df_ints.index.name = 'brain_region'
     df_ints.index = range(n_regions)
+    df_ints.columns = df_ints.columns.str.replace('task-', '', regex=False)
     
     # Sort columns by median if requested
     if sort_by_median:
@@ -1474,12 +1548,12 @@ def average_data_dict_converted(data_dict_converted, average_7t_rest=False, aver
         If True, average 3T task LR/RL pairs (e.g., tfMRIWMLR + tfMRIWMRL)
         Cannot be True if average_3t_tasks is True
     average_3t_tasks : bool, default False
-        If True, average ALL 3T task scans (all tfMRI scans except 7T movies) into "TASK3T"
+        If True, average ALL 3T task scans (all tfMRI scans except 7T movies) into "Tasks"
         Cannot be True if average_3t_task_pairs is True
     average_7t_movies : bool, default False
         If True, average 7T movie scans (tfMRIMOVIE17TAP, tfMRIMOVIE27TPA, etc.) into "MOVIE"
     average_all_rest : bool, default False
-        If True, average ALL rest scans (both 3T and 7T) into "RESTALL"
+        If True, average ALL rest scans (both 3T and 7T) into "Rest"
         Cannot be True if average_3t_rest or average_7t_rest is True
     average_meg_rest : bool, default False
         If True, average MEG rest scans into "RESTMEG"
@@ -1518,8 +1592,8 @@ def average_data_dict_converted(data_dict_converted, average_7t_rest=False, aver
         
         if all_rest_data:
             all_rest_mean = np.nanmean(np.stack(all_rest_data, axis=0), axis=0)
-            averaged_dict['RESTALL'] = all_rest_mean
-            print(f"  Averaged {len(all_rest_data)} rest scans (3T and 7T) into: RESTALL")
+            averaged_dict['Rest'] = all_rest_mean
+            print(f"  Averaged {len(all_rest_data)} rest scans (3T and 7T) into: Rest")
             print(f"    Shape: {all_rest_mean.shape}")
     
     # 2. Average 7T rest scans
@@ -1535,7 +1609,7 @@ def average_data_dict_converted(data_dict_converted, average_7t_rest=False, aver
         if rest_7t_data:
             # Average across the different 7T rest scans (axis=0 combines scans)
             rest_7t_mean = np.nanmean(np.stack(rest_7t_data, axis=0), axis=0)
-            averaged_dict['REST7T'] = rest_7t_mean
+            averaged_dict['Rest-7T'] = rest_7t_mean
             print(f"  Averaged {len(rest_7t_data)} 7T rest scans into: REST7T")
             print(f"    Shape: {rest_7t_mean.shape}")
     
@@ -1552,7 +1626,7 @@ def average_data_dict_converted(data_dict_converted, average_7t_rest=False, aver
         
         if rest_3t_data:
             rest_3t_mean = np.nanmean(np.stack(rest_3t_data, axis=0), axis=0)
-            averaged_dict['REST3T'] = rest_3t_mean
+            averaged_dict['Rest-3T'] = rest_3t_mean
             print(f"  Averaged {len(rest_3t_data)} 3T rest scans into: REST3T")
             print(f"    Shape: {rest_3t_mean.shape}")
     
@@ -1567,8 +1641,8 @@ def average_data_dict_converted(data_dict_converted, average_7t_rest=False, aver
         
         if task_3t_data:
             task_3t_mean = np.nanmean(np.stack(task_3t_data, axis=0), axis=0)
-            averaged_dict['TASK3T'] = task_3t_mean
-            print(f"  Averaged {len(task_3t_data)} 3T task scans into: TASK3T")
+            averaged_dict['Tasks'] = task_3t_mean
+            print(f"  Averaged {len(task_3t_data)} 3T task scans into: Tasks")
             print(f"    Shape: {task_3t_mean.shape}")
     
     # 5. Average 3T task LR/RL pairs
@@ -1612,8 +1686,8 @@ def average_data_dict_converted(data_dict_converted, average_7t_rest=False, aver
         
         if movie_7t_data:
             movie_7t_mean = np.nanmean(np.stack(movie_7t_data, axis=0), axis=0)
-            averaged_dict['MOVIE'] = movie_7t_mean
-            print(f"  Averaged {len(movie_7t_data)} 7T movie scans into: MOVIE")
+            averaged_dict['Movies'] = movie_7t_mean
+            print(f"  Averaged {len(movie_7t_data)} 7T movie scans into: Movies")
             print(f"    Shape: {movie_7t_mean.shape}")
     
     # 7. Average MEG rest scans
@@ -1628,7 +1702,7 @@ def average_data_dict_converted(data_dict_converted, average_7t_rest=False, aver
         
         if rest_meg_data:
             rest_meg_mean = np.nanmean(np.stack(rest_meg_data, axis=0), axis=0)
-            averaged_dict['RESTMEG'] = rest_meg_mean
+            averaged_dict['Rest-MEG'] = rest_meg_mean
             print(f"  Averaged {len(rest_meg_data)} MEG rest scans into: RESTMEG")
             print(f"    Shape: {rest_meg_mean.shape}")
     
@@ -1644,7 +1718,7 @@ def average_data_dict_converted(data_dict_converted, average_7t_rest=False, aver
         
         if task_meg_data:
             task_meg_mean = np.nanmean(np.stack(task_meg_data, axis=0), axis=0)
-            averaged_dict['TASKMEG'] = task_meg_mean
+            averaged_dict['Task-MEG'] = task_meg_mean
             print(f"  Averaged {len(task_meg_data)} MEG task scans into: TASKMEG")
             print(f"    Shape: {task_meg_mean.shape}")
     
