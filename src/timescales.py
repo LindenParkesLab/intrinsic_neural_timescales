@@ -11,6 +11,7 @@ from pyfftw.interfaces.numpy_fft import rfft, irfft
 from scipy.optimize import curve_fit
 from statsmodels.tsa.stattools import acf
 from collections import defaultdict
+from joblib import Parallel, delayed
 
 from src.data import DataLoader, parse_scan_string, build_scan_string
 
@@ -388,6 +389,12 @@ class Timescales(DataLoader):
                 elif method == 'B_murray':
                     # Compute B for each parcel using Murray et al. 2014
                     _, timescales = self._compute_tau_from_acf(acf, tr, version='murray')
+                elif method == 'tau_murray_par':
+                    # Compute tau for each parcel using Murray et al. 2014
+                    timescales, _ = self._compute_tau_murray_parallel(acf, tr, int(os.cpu_count() / 2))
+                elif method == 'B_murray_par':
+                    # Compute B for each parcel using Murray et al. 2014
+                    _, timescales = self._compute_tau_murray_parallel(acf, tr, int(os.cpu_count() / 2))
                 else:
                     raise ValueError(f"Unknown method: {method}")
                 
@@ -587,7 +594,7 @@ class Timescales(DataLoader):
                     tau[i], A = fit_tau(acf[i], delta=tr)
                 elif version == 'murray':
                     # tau[i], B[i], A = fit_tau_murray(acf[i], delta=tr)
-                    if n_lags > 1000:
+                    if n_lags > 10000:
                         negative_indices = np.where(acf[i] < 0)[0]
                         if len(negative_indices) > 0:
                             time_window = negative_indices[0] + (negative_indices[0] * 0.5)
@@ -605,6 +612,43 @@ class Timescales(DataLoader):
             return tau, B
         else:
             return tau
+
+    def _compute_tau_murray_parallel(self, acf: np.ndarray, tr: float, n_jobs=-1):
+        """
+        Parallel CPU version using scipy.
+        
+        Parameters
+        ----------
+        acf : np.ndarray
+            Shape (n_regions, n_lags)
+        tr : float
+            Repetition time
+        n_jobs : int
+            Number of parallel jobs (-1 = all CPUs)
+        
+        Returns
+        -------
+        tau : np.ndarray
+            Shape (n_regions,)
+        B : np.ndarray
+            Shape (n_regions,)
+        """
+        
+        def fit_single_region(acf_single):
+            try:
+                tau, A, B = fit_tau_murray(acf_single, delta=tr)
+                return tau, B
+            except Exception as e:
+                return np.nan, np.nan
+        
+        results = Parallel(n_jobs=n_jobs)(
+            delayed(fit_single_region)(acf[i]) for i in range(len(acf))
+        )
+        
+        tau = np.array([r[0] for r in results])
+        B = np.array([r[1] for r in results])
+        
+        return tau, B
 
     # ==================== Deconfounding Functions ====================
     def regress_task_structure(self):
@@ -1135,37 +1179,6 @@ def calculate_tsnr(timeseries_matrix):
     
     return tsnr
 
-    """
-    Estimate tau and B using optimal max_lag found by stability analysis
-    """
-    # Find optimal max_lag
-    optimal_max_lag, sweep_data = find_optimal_max_lag(ts, fs,
-                                                       max_lag_range=max_lag_range, stability_threshold=stability_threshold)
-    
-    # Use optimal max_lag for final estimation
-    r = acf(ts, nlags=optimal_max_lag, fft=True)
-    # r = compute_acf(ts, use_fft=True)[0, :optimal_max_lag]
-    ks = np.arange(len(r))
-    
-    # Better initialization
-    tau_init_idx = np.where(r < 0.4)[0]
-    if len(tau_init_idx) > 0:
-        tau_init = tau_init_idx[0] / fs
-    else:
-        tau_init = 2.0
-        
-    p0 = (tau_init, 0.0)
-    bounds = ((0.1, -0.5), (100.0, 0.5))
-    
-    try:
-        popt, _ = curve_fit(lambda k, tau, B: offset_exp_steps(k, tau, B, fs), 
-                            ks, r, p0=p0, bounds=bounds)
-        tau_final, B_final = popt
-    except:
-        tau_final, B_final = np.nan, np.nan
-    
-    return tau_final, B_final, r, sweep_data
-
 # ==================== Standalone Utility Functions (for use in notebooks) ====================
 def compute_deflections(rest_timescales, task_timescales, nuisance_regression=False):
     rest_timescales = rest_timescales.reshape(-1, 1)
@@ -1224,8 +1237,7 @@ def filter_data_dict(data_dict, data_dict_residuals=None, remove_subject_level=T
             if 'condition-task' in scan_key:
                 try:
                     data_dict[scan_key] = data_dict_residuals[scan_key].copy()
-                except KeyError:
-                    print(f"Warning: Key '{scan_key}' not found in data_dict_residuals")
+                except:
                     if remove_subject_level:
                         sub_key = scan_key.split('_')[0]
                         remove_these_keys.append([k for k in data_dict.keys() if sub_key in k])
