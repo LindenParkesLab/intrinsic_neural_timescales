@@ -1266,6 +1266,209 @@ def calculate_tsnr(timeseries_matrix):
     
     return tsnr
 
+def fit_acf_exp(acf_vals, tr,
+                a_const=False, b_const=False,
+                exclude_negative=True, exclude_inf=True,
+                max_fit_lag=None, n_over_10_cap=True,
+                start_lag=False,
+                p0=(2.0, 1.0, 0.0),     # (tau0, A0, B0)
+                bounds=None,
+                maxfev=20000):
+    """
+    Murray-style intrinsic timescale fit.
+
+    Model (Murray form):
+        R(kΔ) = A * (exp(-kΔ / tau) + B)
+
+    Notes
+    -----
+    - Δ is TR in seconds.
+    - k is the (ABSOLUTE) lag index: k = start_idx, start_idx+1, ...
+      (This matches your original Murray implementation.)
+    - Returned B is Murray's B (inside parentheses). Additive offset is A*B.
+
+    start_lag:
+      - False: start at lag 1
+      - True : start_idx = argmin(diff(acf))  (Murray-style heuristic; matches your code)
+      - int  : explicit start lag index
+
+
+        Parameters
+    ----------
+    acf_vals : array-like
+        1D array of ACF values, where acf_vals[0] should be ~1 (normalized).
+    fs : float
+        Sampling frequency in Hz (fs = 1/TR).
+    a_const : bool
+        If True, fix A = 1 and do not fit it.
+    b_const : bool
+        If True, fix B = 0 and do not fit it.
+    exclude_negative : bool
+        If True, exclude lags with acf <= 0 (or truncate at first non-positive).
+    exclude_inf : bool
+        If True, exclude non-finite acf values (nan/inf).
+    max_fit_lag : int | None
+        If provided, fit only up to this lag (inclusive). Lag 0 is always excluded.
+    n_over_10_cap : bool
+        If True, additionally cap fit lags to N//10 (common stability heuristic).
+    p0 : tuple
+        Initial guesses in the order (tau, A, B). Ignored for fixed parameters.
+    bounds : tuple | None
+        Bounds for parameters passed to curve_fit. If None, reasonable defaults used.
+    maxfev : int
+        Max function evaluations for curve_fit.
+
+    Returns
+    -------
+    result : dict
+        {
+          "tau": float,
+          "A": float,
+          "B": float,
+          "success": bool,
+          "n_points": int,
+          "lags_used": np.ndarray,
+          "acf_used": np.ndarray
+        }
+    """
+    acf = np.asarray(acf_vals, dtype=float)
+    if acf.ndim != 1 or acf.size < 2:
+        return {"tau": np.nan, "A": np.nan, "B": np.nan, "success": False,
+                "start_idx": None, "n_points": 0, "lags_used": np.array([]), "acf_used": np.array([])}
+
+    delta = float(tr)
+
+    # --- start index selection ---
+    if start_lag is True:
+        start_idx = int(np.argmin(np.diff(acf)))   # exactly your Murray start rule
+    elif start_lag is False or start_lag is None:
+        start_idx = 1
+    else:
+        start_idx = int(start_lag)
+
+    start_idx = max(0, start_idx)
+    if start_idx >= acf.size:
+        return {"tau": np.nan, "A": np.nan, "B": np.nan, "success": False,
+                "start_idx": start_idx, "n_points": 0, "lags_used": np.array([]), "acf_used": np.array([])}
+
+    # --- subset and ABSOLUTE k (Murray baseline) ---
+    acf_subset = acf[start_idx:].copy()
+    k = np.arange(start_idx, start_idx + acf_subset.size, dtype=float)
+
+    # --- optional cleaning ---
+    if exclude_negative:
+        bad = np.where(acf_subset <= 0)[0]
+        if bad.size > 0:
+            cut = int(bad[0])
+            if cut == 0:
+                return {"tau": np.nan, "A": np.nan, "B": np.nan, "success": False,
+                        "start_idx": start_idx, "n_points": 0,
+                        "lags_used": np.array([]), "acf_used": np.array([])}
+            acf_subset = acf_subset[:cut]
+            k = k[:cut]
+
+    if exclude_inf:
+        m = np.isfinite(acf_subset)
+        acf_subset = acf_subset[m]
+        k = k[m]
+
+    if acf_subset.size < 3:
+        return {"tau": np.nan, "A": np.nan, "B": np.nan, "success": False,
+                "start_idx": start_idx, "n_points": int(acf_subset.size),
+                "lags_used": k, "acf_used": acf_subset}
+
+    # --- optional cap on fit length (relative to chosen start) ---
+    N = acf.size - 1
+    cap_points = None
+
+    if max_fit_lag is not None:
+        cap_points = max(2, int(max_fit_lag) + 1)  # keep at least 2 points
+
+    if n_over_10_cap:
+        cap_n10 = max(2, (N // 10) + 1)
+        cap_points = cap_n10 if cap_points is None else min(cap_points, cap_n10)
+
+    if cap_points is not None and acf_subset.size > cap_points:
+        acf_subset = acf_subset[:cap_points]
+        k = k[:cap_points]
+
+    # --- initial guesses ---
+    tau0, A0, B0 = p0
+
+    # --- default bounds (Murray-style) ---
+    if bounds is None:
+        tau_lo = delta / 10.0
+        if (not a_const) and (not b_const):
+            bounds_use = ([0.0, tau_lo, -0.5], [2.0, np.inf, 0.5])   # (A, tau, B)
+        elif a_const and (not b_const):
+            bounds_use = ([tau_lo, -0.5], [np.inf, 0.5])            # (tau, B)
+        elif (not a_const) and b_const:
+            bounds_use = ([0.0, tau_lo], [2.0, np.inf])             # (A, tau)
+        else:
+            bounds_use = ([tau_lo], [np.inf])                       # (tau)
+    else:
+        bounds_use = bounds
+
+    try:
+        if (not a_const) and (not b_const):
+            def model(k, A, tau, B):
+                return A * (np.exp(-k * delta / tau) + B)
+
+            # curve_fit parameter order must be (A, tau, B) to match bounds
+            p0_use = [A0, tau0, B0]
+            popt, _ = curve_fit(model, k, acf_subset, p0=p0_use, bounds=bounds_use, maxfev=maxfev)
+            A_hat, tau_hat, B_hat = popt
+
+        elif a_const and (not b_const):
+            def model(k, tau, B):
+                return (np.exp(-k * delta / tau) + B)  # A fixed to 1
+
+            p0_use = [tau0, B0]
+            popt, _ = curve_fit(model, k, acf_subset, p0=p0_use, bounds=bounds_use, maxfev=maxfev)
+            tau_hat, B_hat = popt
+            A_hat = 1.0
+
+        elif (not a_const) and b_const:
+            def model(k, A, tau):
+                return A * np.exp(-k * delta / tau)  # B fixed to 0
+
+            p0_use = [A0, tau0]
+            popt, _ = curve_fit(model, k, acf_subset, p0=p0_use, bounds=bounds_use, maxfev=maxfev)
+            A_hat, tau_hat = popt
+            B_hat = 0.0
+
+        else:
+            def model(k, tau):
+                return np.exp(-k * delta / tau)  # A=1, B=0
+
+            p0_use = [tau0]
+            popt, _ = curve_fit(model, k, acf_subset, p0=p0_use, bounds=bounds_use, maxfev=maxfev)
+            tau_hat = popt[0]
+            A_hat, B_hat = 1.0, 0.0
+
+        return {
+            "tau": float(tau_hat),
+            "A": float(A_hat),
+            "B": float(B_hat),
+            "success": True,
+            "start_idx": start_idx,
+            "n_points": int(acf_subset.size),
+            "lags_used": k,
+            "acf_used": acf_subset
+        }
+
+    except Exception:
+        return {
+            "tau": np.nan,
+            "A": (1.0 if a_const else np.nan),
+            "B": (0.0 if b_const else np.nan),
+            "success": False,
+            "start_idx": start_idx,
+            "n_points": int(acf_subset.size),
+            "lags_used": k,
+            "acf_used": acf_subset
+        }
+
 # ==================== Standalone Utility Functions (for use in notebooks) ====================
 def compute_deflections(rest_timescales, task_timescales, nuisance_regression=False):
     rest_timescales = rest_timescales.reshape(-1, 1)
