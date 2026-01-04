@@ -395,6 +395,21 @@ class Timescales(DataLoader):
                 elif method == 'B_murray_par':
                     # Compute B for each parcel using Murray et al. 2014
                     _, timescales = self._compute_tau_murray_parallel(acf, tr, int(os.cpu_count() / 2))
+                elif method == 'B_murray_par_lag3mins':
+                    # Compute B for each parcel using Murray et al. 2014
+                    n_seconds = int(3 * 60)
+                    n_timepoints = int(n_seconds / tr)
+                    _, timescales = self._compute_tau_murray_parallel(acf[:, :n_timepoints], tr, int(os.cpu_count() / 2))
+                elif method == 'B_murray_par_lag4mins':
+                    # Compute B for each parcel using Murray et al. 2014
+                    n_seconds = int(4 * 60)
+                    n_timepoints = int(n_seconds / tr)
+                    _, timescales = self._compute_tau_murray_parallel(acf[:, :n_timepoints], tr, int(os.cpu_count() / 2))
+                elif method == 'B_murray_par_lag5mins':
+                    # Compute B for each parcel using Murray et al. 2014
+                    n_seconds = int(5 * 60)
+                    n_timepoints = int(n_seconds / tr)
+                    _, timescales = self._compute_tau_murray_parallel(acf[:, :n_timepoints], tr, int(os.cpu_count() / 2))
                 else:
                     raise ValueError(f"Unknown method: {method}")
                 
@@ -767,6 +782,78 @@ class Timescales(DataLoader):
             data_dict[scan_key] = loaded_data
             
         self.data_dict = data_dict
+
+    # ==================== Utility Functions ====================
+    def get_min_scan_length_per_subject(self):
+        """
+        Parse timeseries data to find the shortest scan length for each subject.
+        
+        This method examines all scans in timeseries_data, extracts the number of
+        timepoints (frames) for each scan, and identifies the minimum scan length
+        for each subject. Useful for determining truncation length for analyses
+        requiring equal-length timeseries.
+        
+        Stores:
+        -------
+        self.scan_lengths_df : pd.DataFrame
+            Full scan length information with columns: ['scan_key', 'subject_id', 
+            'task', 'modality', 'condition', 'n_frames'] for all scans
+        self.min_scan_lengths : pd.Series
+            Series indexed by subject_id containing minimum scan length in frames
+        """
+        if len(self.timeseries_data) == 0:
+            raise ValueError("timeseries_data is empty.")
+        
+        # Collect scan length information
+        scan_info = []
+        
+        for scan_key, timeseries in self.timeseries_data.items():
+            # Parse scan key to extract metadata
+            kv_dict = self._parse_scan_string(scan_key)
+            
+            subject_id = kv_dict.get('sub', '')
+            task = kv_dict.get('task', '')
+            modality = kv_dict.get('modality', '')
+            condition = kv_dict.get('condition', '')
+            
+            # Determine number of frames
+            if timeseries is None:
+                n_frames = None
+            else:
+                try:
+                    if timeseries.ndim == 2:
+                        # Standard format: (n_regions, n_timepoints)
+                        n_frames = timeseries.shape[1]
+                    elif timeseries.ndim == 1:
+                        # Single timeseries: (n_timepoints,)
+                        n_frames = timeseries.shape[0]
+                    else:
+                        # Unexpected dimensionality
+                        n_frames = None
+                except Exception:
+                    n_frames = None
+            
+            scan_info.append({
+                'scan_key': scan_key,
+                'subject_id': subject_id,
+                'task': task,
+                'modality': modality,
+                'condition': condition,
+                'n_frames': n_frames
+            })
+        
+        # Create DataFrame
+        self.scan_lengths_df = pd.DataFrame(scan_info)
+        
+        # Remove scans with None n_frames for aggregation
+        valid_scans = self.scan_lengths_df[self.scan_lengths_df['n_frames'].notna()].copy()
+        
+        if len(valid_scans) == 0:
+            raise ValueError("No valid scans found with determinable lengths.")
+        
+        # Find minimum scan length per subject
+        self.min_scan_lengths = valid_scans.groupby('subject_id')['n_frames'].min()
+        self.min_scan_lengths.name = 'min_n_frames'
 
 # ==================== Standalone Functions ====================
 def compute_acf(
