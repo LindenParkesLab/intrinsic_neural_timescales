@@ -4,15 +4,18 @@ import scipy as sp
 import pandas as pd
 import nibabel as nib
 from tqdm import tqdm
+from scipy.spatial import distance
 
 sys.path.extend([r'/mnt/storage_ssd_raid/research_projects/snaplab_tools'])
 sys.path.extend([r'/mnt/storage_ssd_raid/research_projects/nctpy/src'])
 
 from src.timescales import Timescales
 from src.timescales import filter_data_dict
-from src.data import load_supporting_data
 from src.plotting import create_sydnor_sa_colormap
+
 from snaplab_tools.topology import threshold_adjacency_consistency, volume_normalize_adjacency
+from snaplab_tools.utils import normalize_x
+from snaplab_tools.decomposition import pca_with_nan_handling
 from nctpy.utils import matrix_normalization
 
 
@@ -174,3 +177,107 @@ def load_notebook_data(dataset='HCP-YA', which_modality='FMRI',
         pass
     
     return notebook_data
+
+
+# ==================== Standalone Utility Functions (for use in notebooks) ====================
+def load_supporting_data(in_dir):
+    
+    sa_axis_file = os.path.join(in_dir, 'schaefer400-7_sa-axis.npy')
+    sa_axis = np.load(sa_axis_file)
+    sa_axis = sp.stats.rankdata(sa_axis)
+
+    sf_axis_file = os.path.join(in_dir, 'schaefer400-7_cyto.npy')
+    sf_axis = np.load(sf_axis_file)
+    # sf_axis = sp.stats.rankdata(sf_axis)
+    
+    micro_file = os.path.join(in_dir, 'schaefer400-7_micro.npy')
+    micro_axis = np.load(micro_file)
+    # micro_axis = sp.stats.rankdata(micro_axis)
+
+    # Load parcellation data
+    parc_file = os.path.join(in_dir, 'Schaefer2018_400Parcels_7Networks_order_FSLMNI152_1mm.Centroid_RAS.csv')
+    parc = pd.read_csv(parc_file, header=0, names=['ROI_Label', 'ROI_Name', 'R', 'A', 'S'], index_col=0)
+    n_regions = parc.shape[0]
+
+    distance_matrix = distance.pdist(
+        parc[['R', 'A', 'S']], "euclidean"
+    )  # get euclidean distances between nodes
+    distance_matrix = distance.squareform(distance_matrix)  # reshape to square matrix
+    distance_matrix_norm = normalize_x(distance_matrix)
+    # distance_matrix_norm = np.abs(normalize_x(distance_matrix) - 1)
+
+    # Extract Yeo systems
+    yeo_systems = parc['ROI_Name']
+    yeo_systems = yeo_systems.str.replace('7Networks_LH_', '')
+    yeo_systems = yeo_systems.str.replace('7Networks_RH_', '')
+    yeo_systems = [i.split('_')[0] for i in yeo_systems]
+    yeo_systems = [i.split(' ')[1] for i in yeo_systems]
+    n_systems = len(np.unique(yeo_systems))
+
+    # Load Allen Human Brain Atlas (AHBA) gene expression
+    gene_expression = pd.read_csv(os.path.join(in_dir, 'expression_schaefer400-7.csv'), index_col=0)
+    # imputer = SimpleImputer(missing_values=np.nan, strategy='median')
+    # gene_expression = pd.DataFrame(data=imputer.fit_transform(gene_expression.values), columns=gene_expression.columns, index=gene_expression.index)
+    gao_brain_genes = np.loadtxt(os.path.join(in_dir, 'gao_brain_genes.txt'), dtype=str)
+    existing_columns = list(set(gao_brain_genes) & set(gene_expression.columns))
+    gene_expression_brain = gene_expression[existing_columns]
+    gene_expression_nanmask = np.isnan(gene_expression.values).sum(axis=1) != gene_expression.shape[1]
+
+    # Cell Types
+    Jorstad_schaefer400 = pd.read_csv(os.path.join(in_dir, 'cell_maps_Zhang2024', 'schaeffer_Jorstad_FullCombinedFullCombined_400_7Net_expr_mat_new_NormZscore0.3.csv'), header=0, index_col=-1)
+    Jorstad_schaefer400 = Jorstad_schaefer400.transpose()
+    # Jorstad_schaefer400.replace(0, 0.0001, inplace=True)
+
+    # combine into dictionary
+    dict_neuro = dict()
+    dict_neuro['SA_Axis'] = sa_axis
+    dict_neuro['SF_Axis'] = sf_axis
+    dict_neuro['Micro_Axis'] = micro_axis
+
+    # PCA of brain-related genes
+    results = pca_with_nan_handling(gene_expression_brain.values, n_components=2, standardize=True, impute=True)
+    # print(results.keys())
+    # print(results['explained_variance_ratio'])
+
+    # df_neuro['Gene (PC1)'] = sp.stats.zscore(results['scores'][:, 0])
+    # df_neuro['Gene (PC1)'] = results['scores'][:, 0]
+    dict_neuro['Gene (PC1)'] = results['scores'][:, 0]
+
+    # Create data frame for gene maps
+    gene_list = ['GRIA1', 'GRIN1', 'GRIN2A', 'GRIN2B',
+                'GABRA1', 'GABRA2', 'GABRA3', 'GABRA4', 'GABRA5',
+                'PVALB', 'SST', 'PRR5', 'KCNA3']
+    # gene_list = ['GRIN2B', 'GRIN2A', 'GABRA3', 'GABRA1', 'PVALB', 'PRR5', 'KCNA3']
+    # gene_list = [ampa + nmda + gaba + ['PVALB', 'PRR5', 'KCNA3']][0]
+    for gene in gene_list:
+        dict_neuro[f'Gene_{gene}'] = gene_expression[gene].values
+
+    ampa = ['GRIA1', 'GRIA2', 'GRIA3', 'GRIA4']
+    nmda = ['GRIN1', 'GRIN2A', 'GRIN2B', 'GRIN2C']
+    gaba = ['GABRA1', 'GABRA2', 'GABRA3', 'GABRA4', 'GABRA5',
+            'GABRB1', 'GABRB2', 'GABRB3', 'GABRG1', 'GABRG2', 'GABRG3']
+    # excitation = gene_expression.loc[:, nmda].mean(axis=1).values
+    excitation = gene_expression.loc[:, ampa + nmda].mean(axis=1).values
+    inhibition = gene_expression.loc[:, gaba].mean(axis=1).values
+    # inhibition = gene_expression.loc[:, 'PVALB'].values
+    ei_gene = (normalize_x(excitation)+1) / (normalize_x(inhibition)+1)
+    dict_neuro['Gene_EI_ratio'] = ei_gene
+
+    supporting_data = {
+        # 'sa_axis': sa_axis,
+        # 'sf_axis': sf_axis,
+        # 'micro_axis': micro_axis,
+        'parc': parc,
+        'n_regions': n_regions,
+        'distance_matrix': distance_matrix,
+        'distance_matrix_norm': distance_matrix_norm,
+        'yeo_systems': yeo_systems,
+        'n_systems': n_systems,
+        'dict_neuro': dict_neuro,
+        'gene_expression_nanmask': gene_expression_nanmask
+        # 'gene_expression': gene_expression,
+        # 'gene_expression_brain': gene_expression_brain,
+        # 'Jorstad_schaefer400': Jorstad_schaefer400,
+    }
+    
+    return supporting_data
