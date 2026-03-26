@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 from dataclasses import dataclass, field
 from sklearn.linear_model import LinearRegression
+from collections import defaultdict
 
 import warnings
 warnings.simplefilter(action='ignore', category=FutureWarning)
@@ -111,6 +112,9 @@ class DataLoader:
         'Penn_LEAD': {
             'MRI3T': 0.8
         },
+        'HBN': {
+            'MRI3T': 0.8
+        },
     }
     
     # Map dataset names to base directories
@@ -123,6 +127,7 @@ class DataLoader:
         'NKI': '/mnt/lindenmp_bignas/lindenmp/research_data/RBC/NKI',
         'UCLA': '/mnt/lindenmp_bignas/lindenmp/research_data/UCLA_CNP_LA5c',
         'Penn_LEAD': '/mnt/lindenmp_bignas/lindenmp/research_data/Penn_LEAD',
+        'HBN': '/mnt/storage_ssd_raid/research_data/RBC/HBN',
     }
     
     # Map dataset names to base directories
@@ -134,6 +139,7 @@ class DataLoader:
         'NKI': os.path.join(BASE_PATHS['NKI'], 'bids'),
         'UCLA': os.path.join(BASE_PATHS['UCLA'], 'bids'),
         'Penn_LEAD': os.path.join(BASE_PATHS['Penn_LEAD'], 'bids'),
+        'HBN': os.path.join(BASE_PATHS['HBN'], 'bids'),
     }
     
     # Map dataset names to base directories
@@ -145,6 +151,7 @@ class DataLoader:
         'NKI': os.path.join(BASE_PATHS['NKI'], 'derivatives'),
         'UCLA': os.path.join(BASE_PATHS['UCLA'], 'derivatives'),
         'Penn_LEAD': os.path.join(BASE_PATHS['Penn_LEAD'], 'derivatives'),
+        'HBN': os.path.join(BASE_PATHS['HBN'], 'derivatives'),
     }
     
     # Subdirectory structure for different data types
@@ -171,6 +178,9 @@ class DataLoader:
         },
         'Penn_LEAD': {
             'MRI3T': {'fmri': os.path.join(DERIVDATA_PATHS['Penn_LEAD'], 'xcpd'),}
+        },
+        'HBN': {
+            'MRI3T': {'fmri': os.path.join(DERIVDATA_PATHS['HBN'], 'rbc_cpac', 'cpac_RBCv0'),}
         },
     }
     
@@ -265,7 +275,7 @@ class DataLoader:
             List of registered ScanInfo objects
         """
         tr = self.get_tr(modality=modality)
-        if self.dataset == 'PNC' or self.dataset == 'NKI':
+        if self.dataset == 'PNC' or self.dataset == 'NKI' or self.dataset == 'HBN':
             rbc = True
         else:
             rbc = False
@@ -385,6 +395,64 @@ class DataLoader:
                 print(f"  Incomplete subjects removed: {len(removed_subjects)} subjects")
                 print(f"    Additional scans removed: {len(existing_scans) - len(self.scan_registry)} scans")
             print(f"  Final registry: {len(self.scan_registry)} scans")
+            
+            # Add task-specific missing data report
+            if missing_scans or existing_scans:
+                print(f"\nMissing data by task:")
+                
+                task_missing_subjects = defaultdict(set)  # task -> set of subject_ids with missing data
+                task_existing_subjects = defaultdict(set)  # task -> set of subject_ids with existing data
+                
+                # Collect missing subjects per task
+                for scan, _ in missing_scans:
+                    task_missing_subjects[scan.task].add(scan.subject_id)
+                
+                # Collect existing subjects per task
+                for scan in existing_scans:
+                    task_existing_subjects[scan.task].add(scan.subject_id)
+                
+                # Get all unique tasks
+                all_tasks = set(task_missing_subjects.keys()) | set(task_existing_subjects.keys())
+                
+                # Print report for each task
+                for task in sorted(all_tasks):
+                    n_missing = len(task_missing_subjects[task])
+                    n_existing = len(task_existing_subjects[task])
+                    n_total = n_missing + n_existing
+                    
+                    if n_total > 0:
+                        pct_missing = (n_missing / n_total) * 100
+                        print(f"  {task}: {n_missing}/{n_total} subjects missing ({pct_missing:.1f}%)")
+                
+                # Report uniquely missing subjects per task
+                # (subjects missing only for that task but present in all others)
+                print(f"\nUniquely missing subjects by task:")
+                
+                for task in sorted(all_tasks):
+                    if task not in task_missing_subjects:
+                        continue
+                        
+                    # Get other tasks
+                    other_tasks = all_tasks - {task}
+                    
+                    # Find subjects missing for this task
+                    missing_for_this_task = task_missing_subjects[task]
+                    
+                    # Find subjects that are uniquely missing (exist in ALL other tasks)
+                    uniquely_missing = set()
+                    for subject in missing_for_this_task:
+                        # Check if this subject exists in all other tasks
+                        exists_in_all_others = all(
+                            subject in task_existing_subjects[other_task] 
+                            for other_task in other_tasks
+                        )
+                        if exists_in_all_others:
+                            uniquely_missing.add(subject)
+                    
+                    if len(uniquely_missing) > 0:
+                        print(f"  {task}: {len(uniquely_missing)} subjects missing only for this task")
+                        if len(uniquely_missing) <= 5:  # Show subject IDs if 5 or fewer
+                            print(f"    Subject IDs: {sorted(list(uniquely_missing))}")
         
         return {
             'existing': existing_scans,
@@ -416,14 +484,72 @@ class DataLoader:
                 for word in words_to_convert:
                     new_columns = new_columns.str.replace(word, word.upper(), regex=False)
                 df_behavior.columns = new_columns
+            elif self.dataset == 'HCP-D':
+                behavior_path = self.base_dir / 'behavior' / 'socdem01.txt'
+
+                df_behavior = pd.read_csv(behavior_path, skiprows=[1], delimiter='\t')
+                df_behavior = df_behavior.loc[:, ['src_subject_id', 'interview_age', 'sex']]
+                df_behavior.rename(columns={"src_subject_id": "subject_id", "interview_age": "age"}, inplace=True)
+                df_behavior['subject_id'] = [f'{subj_id}V1MR' for subj_id in df_behavior.loc[:, 'subject_id']]
+                df_behavior['age'] = df_behavior['age'] / 12
+                df_behavior['sex'] = df_behavior['sex'] == 'M'
+                df_behavior['sex'] = df_behavior['sex'].astype(int)
+                df_behavior.set_index('subject_id', inplace=True)
             elif self.dataset == 'PNC':
                 behavior_path = self.base_dir / 'study-PNC_desc-participants.tsv'
+                functionalqc_path = self.base_dir / 'study-PNC_desc-functional_qc.tsv'
                 
+                # load in behavioral data
                 df_behavior = pd.read_csv(behavior_path, index_col=0, delimiter='\t')
                 df_behavior['sex'] = df_behavior['sex'] == 'Male'
                 df_behavior['sex'] = df_behavior['sex'].astype(int)
                 df_behavior.index = df_behavior.index.astype(str)
                 df_behavior.index.name = 'subject_id'
+
+                # load in motion data and filter out subjects using RBC criteria
+                df_qc = pd.read_csv(functionalqc_path, sep="\t", dtype={"participant_id": str})
+                df_qc = df_qc[df_qc["task"] != "idemo"]
+                exclude_cols = ["normCrossCorrExclude", "motionExclude", "fmriExclude"]
+                mask = (df_qc[exclude_cols] == 0).all(axis=1)
+                df_qc = df_qc.loc[mask]
+                has_rest = set(df_qc.loc[df_qc["task"] == "rest", "participant_id"])
+                has_frac2back = set(df_qc.loc[df_qc["task"] == "frac2back", "participant_id"])
+                passing_ids = has_rest & has_frac2back
+
+                df_qc = df_qc[df_qc["participant_id"].isin(passing_ids)]
+                df_qc = df_qc.groupby(["participant_id", "task"])["meanFD"].mean().reset_index()
+
+                rest_fd = df_qc[df_qc["task"] == "rest"].set_index("participant_id")["meanFD"].rename("meanFD_rest")
+                frac2back_fd = df_qc[df_qc["task"] == "frac2back"].set_index("participant_id")["meanFD"].rename("meanFD_frac2back")
+
+                df_qc_final = pd.concat([rest_fd, frac2back_fd], axis=1)
+                # df_qc_final.index = "sub-" + df_qc_final.index
+                df_qc_final.index.name = "subject_id"
+                
+                # filter behavioral data to match qc data
+                df_behavior = df_behavior.loc[df_qc_final.index]
+                df_behavior = pd.merge(df_behavior, df_qc_final, left_index=True, right_index=True)
+            elif self.dataset == 'Penn_LEAD':
+                behavior_path = self.base_dir / 'participants.tsv'
+
+                df_behavior = pd.read_csv(behavior_path, delimiter='\t')
+                df_behavior = df_behavior.loc[:, ['participant_id', 'age_months', 'sex']]
+                df_behavior.rename(columns={"participant_id": "subject_id", "age_months": "age"}, inplace=True)
+                df_behavior['subject_id'] = [subj_id.split('-')[1] for subj_id in df_behavior.loc[:, 'subject_id']]
+                df_behavior['age'] = df_behavior['age'] / 12
+                df_behavior['sex'] = df_behavior['sex'] == 'M'
+                df_behavior['sex'] = df_behavior['sex'].astype(int)
+                df_behavior.set_index('subject_id', inplace=True)
+            elif self.dataset == 'HBN':
+                behavior_path = self.base_dir / 'study-HBN_desc-participants.tsv'
+
+                # load in behavioral data
+                df_behavior = pd.read_csv(behavior_path, index_col=0, delimiter='\t')
+                df_behavior['sex'] = df_behavior['sex'] == 'Male'
+                df_behavior['sex'] = df_behavior['sex'].astype(int)
+                df_behavior.index = df_behavior.index.astype(str)
+                df_behavior.index.name = 'subject_id'
+
             self.df_behavior = df_behavior
         except:
             print(f"Warning: Could not find behavior csv at expected location")
@@ -572,6 +698,9 @@ class DataLoader:
             filename_full = Path(filename_full)
         elif self.dataset == 'Penn_LEAD':
             filename = f"sub-{scan.subject_id}_ses-{scan.session}_task-{scan.task}_run-01_space-{scan.space}_seg-{scan.seg}_stat-mean_timeseries{fileext}"
+            filename_full = subject_dir / filename
+        elif self.dataset == 'HBN':
+            filename = f"sub-{scan.subject_id}_ses-{scan.session}_task-{scan.task}_run-1_atlas-{scan.seg}_space-{scan.space}_reg-36Parameter_desc-Mean_timeseries{fileext}"
             filename_full = subject_dir / filename
         elif scan.rbc is False and scan.session is None:
             filename = f"sub-{scan.subject_id}_task-{scan.task}_space-{scan.space}_seg-{scan.seg}_stat-mean_timeseries{fileext}"
