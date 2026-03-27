@@ -1,4 +1,4 @@
-import os, glob, pickle, pyfftw
+import os, sys, glob, pickle, pyfftw
 import numpy as np
 import scipy as sp
 import pandas as pd
@@ -12,8 +12,9 @@ from scipy.optimize import curve_fit
 from statsmodels.tsa.stattools import acf
 from collections import defaultdict
 from joblib import Parallel, delayed
+from scipy.optimize import curve_fit, OptimizeWarning
 
-from src.data import DataLoader, parse_scan_string, build_scan_string
+from src.data import DataLoader, ScanInfo, parse_scan_string, build_scan_string
 
 class Timescales(DataLoader):
     def __init__(
@@ -369,20 +370,32 @@ class Timescales(DataLoader):
                 if method == 'zero_crossing':
                     # Find first zero crossing for each parcel
                     timescales = self._compute_zero_crossing(acf) * tr
+                elif method == 'zero_crossing_robust_nc2':
+                    # Find first zero crossing for each parcel (robust)
+                    timescales = self._compute_zero_crossing_robust(acf, n_crossings=2) * tr
                 elif method == 'auc_zero_crossing':
                     # Area under curve
-                    timescales = self._compute_auc(acf, tr, max_lag=None)
+                    timescales = self._compute_auc(acf) * tr
+                elif method == 'auc_half_crossing':
+                    # Area under curve
+                    threshold = 0.5
+                    timescales = self._compute_auc(acf, tr, threshold=threshold)
                 elif method == 'decay_time_1e':
                     # Time to decay to 1/e
                     threshold = 1 / np.e
-                    timescales = self._compute_decay_time(acf, tr, threshold)
+                    timescales = self._compute_decay_time(acf, tr, threshold=threshold)
                 elif method == 'decay_time_half':
-                    # Time to decay to 1/e
+                    # Time to decay to 0.5
                     threshold = 0.5
-                    timescales = self._compute_decay_time(acf, tr, threshold)
+                    timescales = self._compute_decay_time(acf, tr, threshold=threshold)
+                elif method == 'lag_one':
+                    timescales = acf[:, 1]
                 elif method == 'tau':
                     # Compute tau for each parcel
                     timescales = self._compute_tau_from_acf(acf, tr, version='loglin')
+                elif method == 'tau_howell':
+                    # Compute tau for each parcel
+                    timescales = self._compute_tau_from_acf(acf, tr, version='howell')
                 elif method == 'tau_murray':
                     # Compute tau for each parcel using Murray et al. 2014
                     timescales, _ = self._compute_tau_from_acf(acf, tr, version='murray')
@@ -561,20 +574,78 @@ class Timescales(DataLoader):
                 zero_crossings[i] = np.nan
         
         return zero_crossings
+
+    def _compute_zero_crossing_robust(self, acf: np.ndarray,
+                                      n_crossings: int = 3,
+                                      max_gap: int = 20,
+                                      aggregation: str = 'mean') -> np.ndarray:
+        """Find first N zero crossings for each parcel and aggregate.
+        
+        Only includes crossings that are close together (quick oscillations).
+        Stops including crossings once a gap larger than max_gap is encountered.
+        
+        Parameters
+        ----------
+        acf : np.ndarray
+            Autocorrelation function, shape (n_parcels, n_lags)
+        n_crossings : int, default=3
+            Maximum number of early zero crossings to sample
+        max_gap : int, default=20
+            Maximum allowed gap (in lags) between consecutive crossings.
+            Stops including crossings once gap exceeds this threshold.
+        aggregation : str, default='mean'
+            Aggregation method: 'mean' or 'median'
+
+        Returns
+        -------
+        np.ndarray
+            Aggregated zero crossing lag for each parcel, shape (n_parcels,)
+        """
+        n_parcels = acf.shape[0]
+        zero_crossings_agg = np.zeros(n_parcels)
+        
+        for i in range(n_parcels):
+            # Find all negative indices
+            negative_indices = np.where(acf[i] < 0)[0]
+            
+            if len(negative_indices) == 0:
+                zero_crossings_agg[i] = np.nan
+            else:
+                # Select crossings that are close together
+                selected_crossings = [negative_indices[0]]  # Always include first crossing
+                
+                for j in range(1, min(len(negative_indices), n_crossings)):
+                    gap = negative_indices[j] - negative_indices[j-1]
+                    if gap <= max_gap:
+                        selected_crossings.append(negative_indices[j])
+                    else:
+                        # Gap too large, stop collecting
+                        break
+                
+                # Aggregate
+                if aggregation == 'mean':
+                    zero_crossings_agg[i] = np.mean(selected_crossings)
+                elif aggregation == 'median':
+                    zero_crossings_agg[i] = np.median(selected_crossings)
+                else:
+                    raise ValueError(f"aggregation must be 'mean' or 'median', got '{aggregation}'")
+        
+        return zero_crossings_agg
     
-    def _compute_auc(self, acf: np.ndarray, tr: float, max_lag: int = None) -> np.ndarray:
+    def _compute_auc(self, acf: np.ndarray, max_lag: int = None, threshold: float = 0) -> np.ndarray:
         """Compute area under curve up to some max lag (or zero crossing)."""
         n_parcels = acf.shape[0]
         auc = np.zeros(n_parcels)
         
         for i in range(n_parcels):
             try:
-                if max_lag is None:
-                    max_lag_i = np.where(acf[i] < 0)[0][0]
-                else:
+                if max_lag is not None:
                     max_lag_i = max_lag
+                else:
+                    max_lag_i = np.where(acf[i] < threshold)[0][0]
 
-                auc[i] = np.trapz(acf[i, :max_lag_i], dx=tr)
+                # auc[i] = np.trapezoid(acf[i, :max_lag_i], dx=tr)
+                auc[i] = np.sum(acf[i, :max_lag_i])
             except:
                 auc[i] = np.nan
         
@@ -584,7 +655,6 @@ class Timescales(DataLoader):
         """Find time when ACF decays to 1/e."""
         n_parcels = acf.shape[0]
         decay_times = np.zeros(n_parcels)
-        # threshold = 1.0 / np.e
         
         for i in range(n_parcels):
             # Find where ACF drops below threshold
@@ -607,6 +677,12 @@ class Timescales(DataLoader):
             try:
                 if version == 'loglin':
                     tau[i], A = fit_tau(acf[i], delta=tr)
+                elif version == 'howell':
+                    results = fit_acf_exp(acf[i], tr=tr,
+                                          start_lag=True, exclude_negative=False, exclude_inf=False,
+                                          n_over_10_cap=False, max_fit_lag=None,
+                                          a_const=True, b_const=True, maxfev=20000)
+                    tau[i] = results['tau']
                 elif version == 'murray':
                     # tau[i], B[i], A = fit_tau_murray(acf[i], delta=tr)
                     if n_lags > 10000:
@@ -691,8 +767,19 @@ class Timescales(DataLoader):
                         hrf_model = 'glover'
                         drift_model = 'cosine'
 
+                    # Reconstruct ScanInfo so get_task_events receives the correct type.
+                    scan_info = ScanInfo(
+                        subject_id=kv_dict.get('sub', ''),
+                        task=kv_dict.get('task', ''),
+                        space=kv_dict.get('space', ''),
+                        seg=kv_dict.get('seg', ''),
+                        modality=modality,
+                        tr=float(tr) if tr else 0.0,
+                        session=kv_dict.get('ses'),
+                        run=kv_dict.get('run'),
+                    )
                     # Create design matrix using nilearn
-                    tsk_evnts = self.get_task_events(scan_key)
+                    tsk_evnts = self.get_task_events(scan_info)
                     # replace all trials with a single trial types
                     # tsk_evnts['trial_type'] = 'trial'
                     design_matrix = create_design_matrix_nilearn(tsk_evnts, n_timepoints, tr, 
@@ -728,13 +815,10 @@ class Timescales(DataLoader):
     
     # ==================== Analysis Functions ====================        
     def match_registry_to_behavior(self):
-        if not hasattr(self, 'scan_registry') or self.scan_registry is None:
-            self.scan_registry = self.list_registered_scans()
-
         df_behavior_matched = pd.DataFrame(columns=self.df_behavior.columns)
         df_behavior_matched.index.name = 'subject_id'
         
-        for subject_id in self.scan_registry['sub'].unique():
+        for subject_id in {scan.subject_id for scan in self.scan_registry}:
             subject_id = str(subject_id)
             if subject_id in self.df_behavior.index and subject_id not in df_behavior_matched.index:
                 df_behavior_matched.loc[subject_id] = self.df_behavior.loc[subject_id]
@@ -756,12 +840,9 @@ class Timescales(DataLoader):
         Returns:
             Dictionary of measures for each scan
         """
-        if not hasattr(self, 'scan_registry') or self.scan_registry is None:
-            self.scan_registry = self.list_registered_scans()
-
         data_dict = {}
-        
-        for scan_key in tqdm(self.scan_registry['scan_string'], desc=f"Loading {output_type}"):
+
+        for scan_key in tqdm([str(scan) for scan in self.scan_registry], desc=f"Loading {output_type}"):
             # Parse scan key
             kv_dict = self._parse_scan_string(scan_key)
             
@@ -1269,53 +1350,50 @@ def calculate_tsnr(timeseries_matrix):
 def fit_acf_exp(acf_vals, tr,
                 a_const=False, b_const=False,
                 exclude_negative=True, exclude_inf=True,
-                max_fit_lag=None, n_over_10_cap=True,
-                start_lag=False,
-                p0=(2.0, 1.0, 0.0),     # (tau0, A0, B0)
-                bounds=None,
-                maxfev=20000):
+                max_fit_lag=None, n_over_10_cap=False, start_lag=False,
+                p0=(2.0, 1.0, 0.0),
+                bounds=None, maxfev=20000):
     """
     Murray-style intrinsic timescale fit.
 
     Model (Murray form):
         R(kΔ) = A * (exp(-kΔ / tau) + B)
 
-    Notes
-    -----
-    - Δ is TR in seconds.
-    - k is the (ABSOLUTE) lag index: k = start_idx, start_idx+1, ...
-      (This matches your original Murray implementation.)
-    - Returned B is Murray's B (inside parentheses). Additive offset is A*B.
+    where:
+        - Δ is TR in seconds
+        - k is the absolute lag index: k = start_idx, start_idx+1, ...
+        - B is Murray's B (inside parentheses); additive offset is A*B
 
-    start_lag:
-      - False: start at lag 1
-      - True : start_idx = argmin(diff(acf))  (Murray-style heuristic; matches your code)
-      - int  : explicit start lag index
-
-
-        Parameters
+    Parameters
     ----------
     acf_vals : array-like
         1D array of ACF values, where acf_vals[0] should be ~1 (normalized).
-    fs : float
-        Sampling frequency in Hz (fs = 1/TR).
-    a_const : bool
+    tr : float
+        Repetition time in seconds (Δ in the model equation).
+    a_const : bool, default=False
         If True, fix A = 1 and do not fit it.
-    b_const : bool
+    b_const : bool, default=False
         If True, fix B = 0 and do not fit it.
-    exclude_negative : bool
-        If True, exclude lags with acf <= 0 (or truncate at first non-positive).
-    exclude_inf : bool
+    exclude_negative : bool, default=True
+        If True, truncate at first lag with acf <= 0.
+    exclude_inf : bool, default=True
         If True, exclude non-finite acf values (nan/inf).
-    max_fit_lag : int | None
-        If provided, fit only up to this lag (inclusive). Lag 0 is always excluded.
-    n_over_10_cap : bool
-        If True, additionally cap fit lags to N//10 (common stability heuristic).
-    p0 : tuple
-        Initial guesses in the order (tau, A, B). Ignored for fixed parameters.
-    bounds : tuple | None
+    max_fit_lag : int, optional
+        If provided, fit only up to this absolute lag index (inclusive).
+        E.g., max_fit_lag=20 means fit through lag 20 regardless of start_lag.
+    n_over_10_cap : bool, default=True
+        If True, additionally cap fit to N//10 lags (stability heuristic),
+        where N = len(acf_vals) - 1.
+    start_lag : bool or int, default=False
+        Starting lag index for fit:
+        - False or None: start at lag 1
+        - True: start_idx = argmin(diff(acf)) (Murray heuristic)
+        - int: explicit start lag index
+    p0 : tuple, default=(2.0, 1.0, 0.0)
+        Initial guesses in order (tau, A, B). Ignored for fixed parameters.
+    bounds : tuple, optional
         Bounds for parameters passed to curve_fit. If None, reasonable defaults used.
-    maxfev : int
+    maxfev : int, default=20000
         Max function evaluations for curve_fit.
 
     Returns
@@ -1326,80 +1404,103 @@ def fit_acf_exp(acf_vals, tr,
           "A": float,
           "B": float,
           "success": bool,
+          "start_idx": int,
           "n_points": int,
           "lags_used": np.ndarray,
           "acf_used": np.ndarray
         }
     """
+    # Input validation
     acf = np.asarray(acf_vals, dtype=float)
     if acf.ndim != 1 or acf.size < 2:
-        return {"tau": np.nan, "A": np.nan, "B": np.nan, "success": False,
-                "start_idx": None, "n_points": 0, "lags_used": np.array([]), "acf_used": np.array([])}
+        return {
+            "tau": np.nan, "A": np.nan, "B": np.nan, "success": False,
+            "start_idx": None, "n_points": 0, 
+            "lags_used": np.array([]), "acf_used": np.array([])
+        }
+    
+    tr = float(tr)
+    if tr <= 0:
+        raise ValueError(f"tr must be positive, got {tr}")
 
-    delta = float(tr)
-
-    # --- start index selection ---
+    # Determine start index
     if start_lag is True:
-        start_idx = int(np.argmin(np.diff(acf)))   # exactly your Murray start rule
+        start_idx = int(np.argmin(np.diff(acf)))
     elif start_lag is False or start_lag is None:
         start_idx = 1
     else:
-        start_idx = int(start_lag)
+        start_idx = max(0, int(start_lag))
 
-    start_idx = max(0, start_idx)
     if start_idx >= acf.size:
-        return {"tau": np.nan, "A": np.nan, "B": np.nan, "success": False,
-                "start_idx": start_idx, "n_points": 0, "lags_used": np.array([]), "acf_used": np.array([])}
+        return {
+            "tau": np.nan, "A": np.nan, "B": np.nan, "success": False,
+            "start_idx": start_idx, "n_points": 0,
+            "lags_used": np.array([]), "acf_used": np.array([])
+        }
 
-    # --- subset and ABSOLUTE k (Murray baseline) ---
+    # Extract subset starting from start_idx with absolute lag indices
     acf_subset = acf[start_idx:].copy()
     k = np.arange(start_idx, start_idx + acf_subset.size, dtype=float)
 
-    # --- optional cleaning ---
+    # Clean: exclude negative values
     if exclude_negative:
         bad = np.where(acf_subset <= 0)[0]
         if bad.size > 0:
             cut = int(bad[0])
             if cut == 0:
-                return {"tau": np.nan, "A": np.nan, "B": np.nan, "success": False,
-                        "start_idx": start_idx, "n_points": 0,
-                        "lags_used": np.array([]), "acf_used": np.array([])}
+                return {
+                    "tau": np.nan, "A": np.nan, "B": np.nan, "success": False,
+                    "start_idx": start_idx, "n_points": 0,
+                    "lags_used": np.array([]), "acf_used": np.array([])
+                }
             acf_subset = acf_subset[:cut]
             k = k[:cut]
 
+    # Clean: exclude non-finite values
     if exclude_inf:
         m = np.isfinite(acf_subset)
         acf_subset = acf_subset[m]
         k = k[m]
 
     if acf_subset.size < 3:
-        return {"tau": np.nan, "A": np.nan, "B": np.nan, "success": False,
-                "start_idx": start_idx, "n_points": int(acf_subset.size),
-                "lags_used": k, "acf_used": acf_subset}
+        return {
+            "tau": np.nan, "A": np.nan, "B": np.nan, "success": False,
+            "start_idx": start_idx, "n_points": int(acf_subset.size),
+            "lags_used": k, "acf_used": acf_subset
+        }
 
-    # --- optional cap on fit length (relative to chosen start) ---
-    N = acf.size - 1
+    # Apply fitting caps
     cap_points = None
 
+    # Cap based on absolute max_fit_lag
     if max_fit_lag is not None:
-        cap_points = max(2, int(max_fit_lag) + 1)  # keep at least 2 points
+        max_fit_lag = int(max_fit_lag)
+        if max_fit_lag < start_idx:
+            # max_fit_lag is before our start point - no data to fit
+            return {
+                "tau": np.nan, "A": np.nan, "B": np.nan, "success": False,
+                "start_idx": start_idx, "n_points": 0,
+                "lags_used": np.array([]), "acf_used": np.array([])
+            }
+        # Convert absolute lag to number of points from start_idx
+        cap_points = max(2, max_fit_lag - start_idx + 1)
 
+    # Cap based on N//10 heuristic (total ACF length)
     if n_over_10_cap:
+        N = acf.size - 1
         cap_n10 = max(2, (N // 10) + 1)
         cap_points = cap_n10 if cap_points is None else min(cap_points, cap_n10)
 
+    # Apply the cap
     if cap_points is not None and acf_subset.size > cap_points:
         acf_subset = acf_subset[:cap_points]
         k = k[:cap_points]
 
-    # --- initial guesses ---
-    tau0, A0, B0 = p0
-
-    # --- default bounds (Murray-style) ---
+    # Prepare bounds
     if bounds is None:
-        tau_lo = delta / 10.0
+        tau_lo = tr / 10.0
         if (not a_const) and (not b_const):
-            bounds_use = ([0.0, tau_lo, -0.5], [2.0, np.inf, 0.5])   # (A, tau, B)
+            bounds_use = ([0.0, tau_lo, -0.5], [2.0, np.inf, 0.5])  # (A, tau, B)
         elif a_const and (not b_const):
             bounds_use = ([tau_lo, -0.5], [np.inf, 0.5])            # (tau, B)
         elif (not a_const) and b_const:
@@ -1409,40 +1510,42 @@ def fit_acf_exp(acf_vals, tr,
     else:
         bounds_use = bounds
 
+    # Fit the model
+    tau0, A0, B0 = p0
+
     try:
         if (not a_const) and (not b_const):
             def model(k, A, tau, B):
-                return A * (np.exp(-k * delta / tau) + B)
-
-            # curve_fit parameter order must be (A, tau, B) to match bounds
+                return A * (np.exp(-k * tr / tau) + B)
             p0_use = [A0, tau0, B0]
-            popt, _ = curve_fit(model, k, acf_subset, p0=p0_use, bounds=bounds_use, maxfev=maxfev)
+            popt, _ = curve_fit(model, k, acf_subset, p0=p0_use, 
+                               bounds=bounds_use, maxfev=maxfev)
             A_hat, tau_hat, B_hat = popt
 
         elif a_const and (not b_const):
             def model(k, tau, B):
-                return (np.exp(-k * delta / tau) + B)  # A fixed to 1
-
+                return (np.exp(-k * tr / tau) + B)
             p0_use = [tau0, B0]
-            popt, _ = curve_fit(model, k, acf_subset, p0=p0_use, bounds=bounds_use, maxfev=maxfev)
+            popt, _ = curve_fit(model, k, acf_subset, p0=p0_use, 
+                               bounds=bounds_use, maxfev=maxfev)
             tau_hat, B_hat = popt
             A_hat = 1.0
 
         elif (not a_const) and b_const:
             def model(k, A, tau):
-                return A * np.exp(-k * delta / tau)  # B fixed to 0
-
+                return A * np.exp(-k * tr / tau)
             p0_use = [A0, tau0]
-            popt, _ = curve_fit(model, k, acf_subset, p0=p0_use, bounds=bounds_use, maxfev=maxfev)
+            popt, _ = curve_fit(model, k, acf_subset, p0=p0_use, 
+                               bounds=bounds_use, maxfev=maxfev)
             A_hat, tau_hat = popt
             B_hat = 0.0
 
-        else:
+        else:  # Both A and B constant
             def model(k, tau):
-                return np.exp(-k * delta / tau)  # A=1, B=0
-
+                return np.exp(-k * tr / tau)
             p0_use = [tau0]
-            popt, _ = curve_fit(model, k, acf_subset, p0=p0_use, bounds=bounds_use, maxfev=maxfev)
+            popt, _ = curve_fit(model, k, acf_subset, p0=p0_use, 
+                               bounds=bounds_use, maxfev=maxfev)
             tau_hat = popt[0]
             A_hat, B_hat = 1.0, 0.0
 
@@ -1457,7 +1560,7 @@ def fit_acf_exp(acf_vals, tr,
             "acf_used": acf_subset
         }
 
-    except Exception:
+    except (RuntimeError, ValueError, OptimizeWarning):
         return {
             "tau": np.nan,
             "A": (1.0 if a_const else np.nan),
@@ -1470,22 +1573,49 @@ def fit_acf_exp(acf_vals, tr,
         }
 
 # ==================== Standalone Utility Functions (for use in notebooks) ====================
-def compute_deflections(rest_timescales, task_timescales, nuisance_regression=False):
-    rest_timescales = rest_timescales.reshape(-1, 1)
-    task_timescales = task_timescales.reshape(-1, 1)
+def compute_deflections(rest_timescales, task_timescales, nuisance_regression=False, standardize=False, absolute=False):
+    if isinstance(rest_timescales, pd.Series):
+        rest_timescales = rest_timescales.to_numpy()
+    if isinstance(task_timescales, pd.Series):
+        task_timescales = task_timescales.to_numpy()
+
+    rest_timescales = np.asarray(rest_timescales, dtype=float)
+    task_timescales = np.asarray(task_timescales, dtype=float)
+
+    if rest_timescales.ndim == 1:
+        rest_timescales = rest_timescales.reshape(-1, 1)
+    if task_timescales.ndim == 1:
+        task_timescales = task_timescales.reshape(-1, 1)
+
+    if standardize is True or standardize == 'separate':
+        rest_timescales = (rest_timescales - np.nanmean(rest_timescales)) / np.nanstd(rest_timescales)
+        task_timescales = (task_timescales - np.nanmean(task_timescales)) / np.nanstd(task_timescales)
+    elif standardize == 'pooled':
+        pooled = np.concatenate([rest_timescales, task_timescales])
+        pooled_mean = np.nanmean(pooled)
+        pooled_std = np.nanstd(pooled)
+        rest_timescales = (rest_timescales - pooled_mean) / pooled_std
+        task_timescales = (task_timescales - pooled_mean) / pooled_std
+    elif standardize is not False:
+        raise ValueError(f"standardize must be False, True, 'separate', or 'pooled'; got '{standardize}'")
 
     int_deflections = task_timescales - rest_timescales
-    
+
     if nuisance_regression:
-        deflections_mean = np.mean(int_deflections)
-        
-        X = np.concatenate((rest_timescales, np.ones((rest_timescales.shape[0], 1))), axis=1)
-        beta = np.dot(np.linalg.pinv(X), int_deflections)
-        predicted = np.dot(X, beta)
+        valid_mask = ~(np.isnan(rest_timescales[:, 0]) | np.isnan(int_deflections[:, 0]))
+        X_full = np.concatenate((rest_timescales, np.ones((rest_timescales.shape[0], 1))), axis=1)
+
+        X_valid = X_full[valid_mask]
+        y_valid = int_deflections[valid_mask]
+
+        beta = np.dot(np.linalg.pinv(X_valid), y_valid)
+        predicted = np.dot(X_full, beta)
+
         int_deflections = int_deflections - predicted
-        # print(int_deflections.shape, predicted.shape)
-        int_deflections += deflections_mean
-    
+
+    if absolute:
+        int_deflections = np.abs(int_deflections)
+
     return int_deflections[:, 0]
 
 def filter_data_dict(data_dict, data_dict_residuals=None, remove_subject_level=True):
@@ -1810,11 +1940,11 @@ def sort_and_group_timescales(timescales, brain_map, ntile=10):
     return timescales_sorted_dec
 
 def convert_data_dict(data_dict, scan_registry, brain_map=None, verbose=True):
-    data_dict_converted = dict().fromkeys(scan_registry['task'].unique())
+    unique_tasks = list(dict.fromkeys(scan.task for scan in scan_registry))
+    data_dict_converted = dict.fromkeys(unique_tasks)
 
     for task in data_dict_converted.keys():
-        task_filter = scan_registry['task'] == task
-        sub_list = list(scan_registry.loc[task_filter, 'scan_string'])
+        sub_list = [str(scan) for scan in scan_registry if scan.task == task]
         extracted_data = {key: data_dict[key] for key in sub_list if key in data_dict}
         extracted_data = np.array(list(extracted_data.values()))
 
