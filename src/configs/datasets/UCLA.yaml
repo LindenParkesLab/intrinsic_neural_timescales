@@ -1,0 +1,20 @@
+name: UCLA
+paths:
+  base: /mnt/lindenmp_bignas/lindenmp/research_data/UCLA_CNP_LA5c
+  rawdata_subdir: bids
+  derivatives_subdir: derivatives
+modalities:
+  MRI3T:
+    tr: 2.0
+    data_subdir: xcpd
+    # No session level in this dataset.
+    dir_template: "sub-{subject_id}/func"
+    filename_template: "sub-{subject_id}_task-{task}_space-{space}_seg-{seg}_stat-mean_timeseries{ext}"
+    file_ext: .tsv
+    task_events_handler: ucla_bids_tsv
+    task_events_file_template: "sub-{subject_id}_task-{task}*_events.tsv"
+    task_events_use_glob: true
+behavior:
+  handler: null
+rbc: false
+subject_id_rawdata_transform: null

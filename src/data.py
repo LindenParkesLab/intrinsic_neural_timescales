@@ -1,10 +1,14 @@
-import os, sys, glob, re
+import os
+import glob
+import re
+import logging
 import numpy as np
 import scipy as sp
 import pandas as pd
 import nibabel as nib
+import yaml
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional
 from dataclasses import dataclass, field
 from sklearn.linear_model import LinearRegression
 from collections import defaultdict
@@ -12,250 +16,529 @@ from collections import defaultdict
 import warnings
 warnings.simplefilter(action='ignore', category=FutureWarning)
 
-# Enhanced ScanInfo dataclass that matches HCP conventions
+logger = logging.getLogger(__name__)
+
+_CONFIG_DIR = Path(__file__).parent / 'configs' / 'datasets'
+
+
+def _find_project_root() -> Path:
+    """Walk up from cwd looking for setup.py as a project root marker."""
+    for parent in [Path.cwd(), *Path.cwd().parents]:
+        if (parent / 'setup.py').exists():
+            return parent
+    return Path.cwd()
+
+
+# ==============================================================================
+# Config dataclasses
+# ==============================================================================
+
+@dataclass
+class ModalityConfig:
+    """Per-modality settings loaded from a dataset YAML config."""
+    tr: float
+    data_subdir: str
+    dir_template: str
+    filename_template: str
+    file_ext: str
+    task_events_handler: Optional[str] = None
+    task_events_file_template: Optional[str] = None
+    task_events_use_glob: bool = False
+    use_glob: bool = False
+    filename_template_fallbacks: List[str] = field(default_factory=list)
+
+
+@dataclass
+class DatasetConfig:
+    """Top-level dataset configuration loaded from a YAML file."""
+    name: str
+    base_path: Path
+    rawdata_subdir: str
+    derivatives_subdir: str
+    modalities: Dict[str, ModalityConfig]
+    behavior_handler: Optional[str] = None
+    rbc: bool = False
+    subject_id_rawdata_transform: Optional[str] = None
+
+
+def load_dataset_config(dataset_name: str) -> DatasetConfig:
+    """Load a DatasetConfig from the corresponding YAML file in configs/datasets/."""
+    config_path = _CONFIG_DIR / f'{dataset_name}.yaml'
+    if not config_path.exists():
+        available = [p.stem for p in _CONFIG_DIR.glob('*.yaml')]
+        raise FileNotFoundError(
+            f"No config found for dataset '{dataset_name}'. "
+            f"Expected: {config_path}\n"
+            f"Available datasets: {available}"
+        )
+
+    with open(config_path) as f:
+        raw = yaml.safe_load(f)
+
+    modalities = {}
+    for mod_name, mod_raw in raw['modalities'].items():
+        modalities[mod_name] = ModalityConfig(
+            tr=float(mod_raw['tr']),
+            data_subdir=mod_raw['data_subdir'],
+            dir_template=mod_raw['dir_template'],
+            filename_template=mod_raw['filename_template'],
+            file_ext=mod_raw['file_ext'],
+            task_events_handler=mod_raw.get('task_events_handler'),
+            task_events_file_template=mod_raw.get('task_events_file_template'),
+            task_events_use_glob=bool(mod_raw.get('task_events_use_glob', False)),
+            use_glob=bool(mod_raw.get('use_glob', False)),
+            filename_template_fallbacks=mod_raw.get('filename_template_fallbacks') or [],
+        )
+
+    return DatasetConfig(
+        name=raw['name'],
+        base_path=Path(raw['paths']['base']),
+        rawdata_subdir=raw['paths']['rawdata_subdir'],
+        derivatives_subdir=raw['paths']['derivatives_subdir'],
+        modalities=modalities,
+        behavior_handler=(raw.get('behavior') or {}).get('handler'),
+        rbc=bool(raw.get('rbc', False)),
+        subject_id_rawdata_transform=raw.get('subject_id_rawdata_transform'),
+    )
+
+
+# ==============================================================================
+# ScanInfo
+# ==============================================================================
+
 @dataclass
 class ScanInfo:
     """Container for preprocessed scan metadata matching BIDS naming conventions.
-    
-    Example filename:
+
+    Example filenames:
         sub-100206_ses-01_task-rfMRIREST1LR_space-fsLR_seg-Schaefer4007_stat-mean_timeseries.ptseries.nii
-        sub-100206_ses-01_task-tfMRIWMRL_space-fsLR_seg-Schaefer4007_stat-mean_timeseries.ptseries.nii
         sub-00395_ses-03_task-reversallearning_space-MNI152NLin2009cAsym_seg-Schaefer4007_stat-mean_timeseries.tsv
     """
     subject_id: str
-    task: str  # e.g., 'rest', 'reversallearning', 'nback'
-    space: str  # e.g., 'MNI152NLin2009cAsym', 'fsLR'
-    seg: str  # segmentation, e.g., 'Schaefer4007', 'Glasser360'
+    task: str
+    space: str
+    seg: str
     modality: str
     tr: float
-    
-    # Optional fields
-    session: Optional[str] = None  # e.g., '01', '02', '03'
-    stat: Optional[str] = 'mean'  # Usually 'mean' for timeseries
-    run: Optional[str] = None  # e.g., '01', '02' for multiple runs of same task
-    desc: Optional[str] = None  # Optional description field
-    den: Optional[str] = None  # Density for surface data, e.g., '91k', '32k'
+
+    # Optional BIDS fields
+    session: Optional[str] = None
+    stat: Optional[str] = 'mean'
+    run: Optional[str] = None
+    desc: Optional[str] = None
+    den: Optional[str] = None
     rbc: Optional[bool] = False
-    
+
     def __post_init__(self):
-        if 'rest' in self.task.lower():
-            self.condition = 'rest'
-        else:
-            self.condition = 'task'
-    
+        self.condition = 'rest' if 'rest' in self.task.lower() else 'task'
+
     def __str__(self):
-        """Get string version of scan"""
         entities = [
             f"sub-{self.subject_id}",
             f"task-{self.task}",
             f"space-{self.space}",
-            f"seg-{self.seg}"
+            f"seg-{self.seg}",
         ]
-            
         if self.session is not None:
             entities.append(f"ses-{self.session}")
-
         entities.append(f"modality-{self.modality}")
         entities.append(f"tr-{self.tr}")
         entities.append(f"condition-{self.condition}")
-        
         if self.run is not None:
             entities.append(f"run-{self.run}")
-        
         if self.den is not None:
             entities.append(f"den-{self.den}")
-        
         if self.desc is not None:
             entities.append(f"desc-{self.desc}")
-        
         return "_".join(entities)
-        
+
+    def to_dict(self) -> dict:
+        """Serialize to a flat dictionary suitable for CSV export."""
+        return {
+            'sub': self.subject_id,
+            'ses': self.session,
+            'task': self.task,
+            'space': self.space,
+            'seg': self.seg,
+            'modality': self.modality,
+            'tr': self.tr,
+            'condition': self.condition,
+            'run': self.run,
+            'desc': self.desc,
+            'den': self.den,
+            'rbc': self.rbc,
+            'stat': self.stat,
+            'scan_string': str(self),
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> 'ScanInfo':
+        """Reconstruct a ScanInfo from a dict (e.g. a CSV row).
+
+        Safe against both numeric NaN (float) and the string 'nan' that pandas
+        produces when a column is read with dtype=str and the cell was empty.
+        Also handles bool fields correctly when they arrive as strings ('True'/'False').
+        """
+        def _opt(val) -> Optional[str]:
+            """Return None for any flavour of missing, else the string value."""
+            if val is None:
+                return None
+            try:
+                if pd.isna(val):
+                    return None
+            except (TypeError, ValueError):
+                pass
+            s = str(val)
+            return None if s in ('nan', 'None', '') else s
+
+        def _bool(val) -> bool:
+            """Parse bool fields that may arrive as Python bool or as strings."""
+            if isinstance(val, bool):
+                return val
+            if isinstance(val, str):
+                return val.strip().lower() == 'true'
+            try:
+                if pd.isna(val):
+                    return False
+            except (TypeError, ValueError):
+                pass
+            return bool(val)
+
+        return cls(
+            subject_id=str(d['sub']),
+            task=str(d['task']),
+            space=str(d['space']),
+            seg=str(d['seg']),
+            modality=str(d['modality']),
+            tr=float(d['tr']),
+            session=_opt(d.get('ses')),
+            stat=_opt(d.get('stat')) or 'mean',
+            run=_opt(d.get('run')),
+            desc=_opt(d.get('desc')),
+            den=_opt(d.get('den')),
+            rbc=_bool(d.get('rbc', False)),
+        )
+
+
+# ==============================================================================
+# Behavior handlers
+# ==============================================================================
+
+def _behavior_hcp_unrestricted_restricted(loader: 'DataLoader') -> pd.DataFrame:
+    base = loader.config.base_path
+    unrest_files = list(base.glob('unrestricted_*.csv'))
+    rest_files = list(base.glob('RESTRICTED_*.csv'))
+    if not unrest_files:
+        raise FileNotFoundError(f"No unrestricted behavior CSV found in {base}")
+    if not rest_files:
+        raise FileNotFoundError(f"No restricted behavior CSV found in {base}")
+
+    df_u = pd.read_csv(unrest_files[0], index_col=0)
+    df_r = pd.read_csv(rest_files[0], index_col=0)
+    df = pd.merge(df_u, df_r, left_index=True, right_index=True)
+    df['age'] = df['Age_in_Yrs']
+    df['sex'] = (df['Gender'] == 'M').astype(int)
+    df.index = df.index.astype(str)
+    df.index.name = 'subject_id'
+    words_to_convert = ['Emotion', 'Gambling', 'Language', 'Relational', 'Social']
+    new_columns = df.columns.to_series()
+    for word in words_to_convert:
+        new_columns = new_columns.str.replace(word, word.upper(), regex=False)
+    df.columns = new_columns
+    return df
+
+
+def _behavior_hcp_d_socdem(loader: 'DataLoader') -> pd.DataFrame:
+    path = loader.config.base_path / 'behavior' / 'socdem01.txt'
+    df = pd.read_csv(path, skiprows=[1], delimiter='\t')
+    df = df[['src_subject_id', 'interview_age', 'sex']]
+    df.rename(columns={'src_subject_id': 'subject_id', 'interview_age': 'age'}, inplace=True)
+    df['subject_id'] = [f'{s}V1MR' for s in df['subject_id']]
+    df['age'] = df['age'] / 12
+    df['sex'] = (df['sex'] == 'M').astype(int)
+    df.set_index('subject_id', inplace=True)
+    return df
+
+
+def _behavior_pnc_rbc(loader: 'DataLoader') -> pd.DataFrame:
+    base = loader.config.base_path
+    df = pd.read_csv(base / 'study-PNC_desc-participants.tsv', index_col=0, delimiter='\t')
+    df['sex'] = (df['sex'] == 'Male').astype(int)
+    df.index = df.index.astype(str)
+    df.index.name = 'subject_id'
+
+    df_qc = pd.read_csv(base / 'study-PNC_desc-functional_qc.tsv', sep='\t', dtype={'participant_id': str})
+    df_qc = df_qc[df_qc['task'] != 'idemo']
+    exclude_cols = ['normCrossCorrExclude', 'motionExclude', 'fmriExclude']
+    df_qc = df_qc.loc[(df_qc[exclude_cols] == 0).all(axis=1)]
+    has_rest = set(df_qc.loc[df_qc['task'] == 'rest', 'participant_id'])
+    has_frac2back = set(df_qc.loc[df_qc['task'] == 'frac2back', 'participant_id'])
+    passing_ids = has_rest & has_frac2back
+
+    df_qc = df_qc[df_qc['participant_id'].isin(passing_ids)]
+    df_qc = df_qc.groupby(['participant_id', 'task'])['meanFD'].mean().reset_index()
+    rest_fd = df_qc[df_qc['task'] == 'rest'].set_index('participant_id')['meanFD'].rename('meanFD_rest')
+    frac2back_fd = df_qc[df_qc['task'] == 'frac2back'].set_index('participant_id')['meanFD'].rename('meanFD_frac2back')
+    df_qc_final = pd.concat([rest_fd, frac2back_fd], axis=1)
+    df_qc_final.index.name = 'subject_id'
+
+    df = df.loc[df_qc_final.index]
+    return pd.merge(df, df_qc_final, left_index=True, right_index=True)
+
+
+def _behavior_penn_lead(loader: 'DataLoader') -> pd.DataFrame:
+    df = pd.read_csv(loader.config.base_path / 'participants.tsv', delimiter='\t')
+    df = df[['participant_id', 'age_months', 'sex']]
+    df.rename(columns={'participant_id': 'subject_id', 'age_months': 'age'}, inplace=True)
+    df['subject_id'] = [s.split('-')[1] for s in df['subject_id']]
+    df['age'] = df['age'] / 12
+    df['sex'] = (df['sex'] == 'M').astype(int)
+    df.set_index('subject_id', inplace=True)
+    return df
+
+
+def _behavior_hbn_rbc(loader: 'DataLoader') -> pd.DataFrame:
+    df = pd.read_csv(
+        loader.config.base_path / 'study-HBN_desc-participants.tsv',
+        index_col=0, delimiter='\t'
+    )
+    df['sex'] = (df['sex'] == 'Male').astype(int)
+    df.index = df.index.astype(str)
+    df.index.name = 'subject_id'
+    return df
+
+
+BEHAVIOR_HANDLERS = {
+    'hcp_unrestricted_restricted': _behavior_hcp_unrestricted_restricted,
+    'hcp_d_socdem': _behavior_hcp_d_socdem,
+    'pnc_rbc': _behavior_pnc_rbc,
+    'penn_lead': _behavior_penn_lead,
+    'hbn_rbc': _behavior_hbn_rbc,
+}
+
+
+# ==============================================================================
+# Task events handlers
+# ==============================================================================
+
+def _rawdata_subject_id(loader: 'DataLoader', subject_id: str) -> str:
+    """Apply the rawdata subject ID transform configured for this dataset."""
+    if loader.config.subject_id_rawdata_transform == 'split_hcpd':
+        return split_hcpd_string(subject_id)
+    return subject_id
+
+
+def _events_hcp_fmri(loader: 'DataLoader', scan: ScanInfo) -> pd.DataFrame:
+    subject_id = _rawdata_subject_id(loader, scan.subject_id)
+    rawdata_dir = loader.config.base_path / loader.config.rawdata_subdir
+    results_dir = rawdata_dir / subject_id / 'MNINonLinear' / 'Results'
+
+    contents = os.listdir(str(results_dir))
+    contents_joined = [''.join(c.split('_')) for c in contents]
+    try:
+        idx = contents_joined.index(scan.task)
+    except ValueError:
+        raise FileNotFoundError(
+            f"Task directory for '{scan.task}' not found in {results_dir}"
+        )
+    ev_dir = results_dir / contents[idx] / 'EVs'
+    return get_task_events_fmri(str(ev_dir))
+
+
+def _events_hcp_meg(loader: 'DataLoader', scan: ScanInfo) -> pd.DataFrame:
+    rawdata_dir = loader.config.base_path / loader.config.rawdata_subdir
+    task = scan.task
+    subdir_str = f'{task[:1]}-{task[1:]}'
+    pattern = str(
+        rawdata_dir / scan.subject_id / 'unprocessed' / 'MEG'
+        / subdir_str / 'EPRIME'
+        / f'{scan.subject_id}_*_{task[1:]}_*.xlsx'
+    )
+    matches = glob.glob(pattern)
+    if not matches:
+        raise FileNotFoundError(f"MEG task events file not found: {pattern}")
+    events = get_task_events_meg(matches[0], verbose=False)
+    return events[['onset', 'duration', 'trial_type']]
+
+
+def _events_hcp_7t_movie(loader: 'DataLoader', scan: ScanInfo) -> pd.DataFrame:
+    movie_dir = loader.output_dir / 'data' / 'supporting_data' / 'movie_data'
+    timing_map = {
+        'MOVIE1': '7T_MOVIE1_CC1_v2_Video_Timing.csv',
+        'MOVIE2': '7T_MOVIE2_HO1_v2_Video_Timing.csv',
+        'MOVIE3': '7T_MOVIE3_CC2_v2_Video_Timing.csv',
+        'MOVIE4': '7T_MOVIE4_HO2_v2_Video_Timing.csv',
+    }
+    timing_file = next((v for k, v in timing_map.items() if k in scan.task), None)
+    if timing_file is None:
+        raise ValueError(f"Unknown 7T movie task: '{scan.task}'")
+
+    block_design = pd.read_csv(movie_dir / timing_file)
+    block_design = block_design.loc[block_design['movie.block'] != 0.0]
+    return pd.DataFrame({
+        'onset': block_design['block_start_time'],
+        'duration': block_design['block_duration'],
+        'trial_type': 'movie',
+    }).dropna().sort_values('onset').reset_index(drop=True)
+
+
+def _events_bids_tsv(loader: 'DataLoader', scan: ScanInfo) -> pd.DataFrame:
+    """Generic BIDS events TSV loader driven by the modality config template."""
+    mod_config = loader.config.modalities[scan.modality]
+    rawdata_dir = loader.config.base_path / loader.config.rawdata_subdir
+
+    func_dir = rawdata_dir / f'sub-{scan.subject_id}'
+    if scan.session is not None:
+        func_dir = func_dir / f'ses-{scan.session}'
+    func_dir = func_dir / 'func'
+
+    filename = mod_config.task_events_file_template.format(
+        subject_id=scan.subject_id,
+        session=scan.session,
+        task=scan.task,
+    )
+
+    if mod_config.task_events_use_glob:
+        matches = glob.glob(str(func_dir / filename))
+        if not matches:
+            raise FileNotFoundError(
+                f"No events file matched: {func_dir / filename}"
+            )
+        return pd.read_csv(matches[0], sep='\t')
+    else:
+        return pd.read_csv(func_dir / filename, sep='\t')
+
+
+def _events_ucla_bids_tsv(loader: 'DataLoader', scan: ScanInfo) -> pd.DataFrame:
+    """UCLA events loader with task-specific post-processing for stopsignal and bart."""
+    mod_config = loader.config.modalities[scan.modality]
+    rawdata_dir = loader.config.base_path / loader.config.rawdata_subdir
+    func_dir = rawdata_dir / f'sub-{scan.subject_id}' / 'func'
+
+    filename = mod_config.task_events_file_template.format(
+        subject_id=scan.subject_id,
+        task=scan.task,
+    )
+    matches = glob.glob(str(func_dir / filename))
+    if not matches:
+        raise FileNotFoundError(f"No events file matched: {func_dir / filename}")
+
+    df = pd.read_csv(matches[0], sep='\t')
+
+    if scan.task == 'stopsignal':
+        return df[['onset', 'duration', 'trial_type']].loc[df['trial_type'].notna()]
+    elif scan.task == 'bart':
+        rows = []
+        for _, trial in df[['onset', 'duration', 'trial_type', 'trial_number']].groupby('trial_number'):
+            trial = trial.reset_index(drop=True)
+            rows.append({
+                'onset': trial['onset'].iloc[0],
+                'duration': trial['duration'].sum(),
+                'trial_type': trial['trial_type'].iloc[0],
+            })
+        return pd.DataFrame(rows)
+    else:
+        return df[['onset', 'duration', 'trial_type']]
+
+
+TASK_EVENTS_HANDLERS = {
+    'hcp_fmri': _events_hcp_fmri,
+    'hcp_meg': _events_hcp_meg,
+    'hcp_7t_movie': _events_hcp_7t_movie,
+    'bids_tsv': _events_bids_tsv,
+    'ucla_bids_tsv': _events_ucla_bids_tsv,
+}
+
+
+# ==============================================================================
+# DataLoader
+# ==============================================================================
+
 class DataLoader:
     """
-    Class for generating and analyzing neural timescales from preprocessed timeseries data.
-    
+    Loads and manages preprocessed neural timeseries data across multiple datasets.
+
+    Dataset-specific knowledge (file paths, naming conventions, TRs, behavior
+    and event file locations) lives in YAML configs under src/configs/datasets/.
+    This class is a generic engine that reads those configs.
+
     Attributes:
-        dataset (str): Name of the dataset (e.g., 'HCP-YA')
-        base_dir (Path): Base directory for all data
-        output_dir (Path): Directory for saving outputs
-        df_behavior (pd.DataFrame): Subject-level behavioral/demographic data
-        modality_params (dict): TR and other parameters for each modality
-        scan_registry (list): List of ScanInfo objects to track available scans
+        dataset (str): Name of the dataset (e.g. 'HCP-YA').
+        config (DatasetConfig): Parsed YAML configuration for this dataset.
+        base_dir (Path): Root data directory for this dataset.
+        rawdata_dir (Path): Raw BIDS data directory.
+        derivdata_dir (Path): Derivatives directory.
+        output_dir (Path): Directory for writing outputs.
+        df_behavior (pd.DataFrame | None): Subject-level behavioral/demographic data.
+        scan_registry (list[ScanInfo]): Registered scans available for loading.
     """
-    
-    # MEG sampling rate in Hz
-    HCPYA_MEG_SAMPLING_RATE = 508.63
-    
-    # Default TR values for common modalities (in seconds)
-    DEFAULT_TR = {
-        'HCP-YA': {
-            'MRI3T': 0.72,
-            'MRI7T': 1.0,
-            'MEG': 1 / HCPYA_MEG_SAMPLING_RATE
-        },
-        'HCP-D': {
-            'MRI3T': 0.80
-        },
-        'WAND': {
-            'MRI3T': 2.0
-        },
-        'PNC': {
-            'MRI3T': 3.0
-        },
-        'NKI': {
-            'MRI3T': 1.4
-            # 'MRI3T': 0.645
-        },
-        'UCLA': {
-            'MRI3T': 2.0
-        },
-        'Penn_LEAD': {
-            'MRI3T': 0.8
-        },
-        'HBN': {
-            'MRI3T': 0.8
-        },
-    }
-    
-    # Map dataset names to base directories
-    BASE_PATHS = {
-        'HCP-YA': '/mnt/lindenmp_bignas/lindenmp/research_data/HCP_YA',
-        'HCP-D': '/mnt/lindenmp_bignas/lindenmp/research_data/HCP_D',
-        'WAND': '/mnt/lindenmp_bignas/lindenmp/research_data/WAND',
-        # 'PNC': '/mnt/lindenmp_bignas/lindenmp/research_data/RBC/PNC',
-        'PNC': '/mnt/storage_ssd_raid/research_data/RBC/PNC',
-        'NKI': '/mnt/lindenmp_bignas/lindenmp/research_data/RBC/NKI',
-        'UCLA': '/mnt/lindenmp_bignas/lindenmp/research_data/UCLA_CNP_LA5c',
-        'Penn_LEAD': '/mnt/lindenmp_bignas/lindenmp/research_data/Penn_LEAD',
-        'HBN': '/mnt/storage_ssd_raid/research_data/RBC/HBN',
-    }
-    
-    # Map dataset names to base directories
-    RAWDATA_PATHS = {
-        'HCP-YA': os.path.join(BASE_PATHS['HCP-YA'], 'HCP_1200'),
-        'HCP-D': os.path.join(BASE_PATHS['HCP-D'], 'processed'),
-        'WAND': os.path.join(BASE_PATHS['WAND'], 'bids'),
-        'PNC': os.path.join(BASE_PATHS['PNC'], 'bids'),
-        'NKI': os.path.join(BASE_PATHS['NKI'], 'bids'),
-        'UCLA': os.path.join(BASE_PATHS['UCLA'], 'bids'),
-        'Penn_LEAD': os.path.join(BASE_PATHS['Penn_LEAD'], 'bids'),
-        'HBN': os.path.join(BASE_PATHS['HBN'], 'bids'),
-    }
-    
-    # Map dataset names to base directories
-    DERIVDATA_PATHS = {
-        'HCP-YA': os.path.join(BASE_PATHS['HCP-YA'], 'derivatives'),
-        'HCP-D': os.path.join(BASE_PATHS['HCP-D'], 'derivatives'),
-        'WAND': os.path.join(BASE_PATHS['WAND'], 'derivatives'),
-        'PNC': os.path.join(BASE_PATHS['PNC'], 'derivatives'),
-        'NKI': os.path.join(BASE_PATHS['NKI'], 'derivatives'),
-        'UCLA': os.path.join(BASE_PATHS['UCLA'], 'derivatives'),
-        'Penn_LEAD': os.path.join(BASE_PATHS['Penn_LEAD'], 'derivatives'),
-        'HBN': os.path.join(BASE_PATHS['HBN'], 'derivatives'),
-    }
-    
-    # Subdirectory structure for different data types
-    SUBDIR_MAP = {
-        'HCP-YA': {
-            'MRI3T': {'fmri': os.path.join(DERIVDATA_PATHS['HCP-YA'], 'parcellated_data'),},
-            'MRI7T': {'fmri': os.path.join(DERIVDATA_PATHS['HCP-YA'], 'parcellated_data_7T'),},
-            'MEG': {'meg': os.path.join(DERIVDATA_PATHS['HCP-YA'], 'parcellated_data_meg'),}
-        },
-        'HCP-D': {
-            'MRI3T': {'fmri': os.path.join(DERIVDATA_PATHS['HCP-D'], 'parcellated_data'),}
-        },
-        'WAND': {
-            'MRI3T': {'fmri': os.path.join(DERIVDATA_PATHS['WAND'], 'xcpd'),}
-        },
-        'PNC': {
-            'MRI3T': {'fmri': os.path.join(DERIVDATA_PATHS['PNC'], 'rbc_cpac', 'cpac_RBCv0'),}
-        },
-        'NKI': {
-            'MRI3T': {'fmri': os.path.join(DERIVDATA_PATHS['NKI'], 'rbc_cpac', 'cpac_RBCv0'),}
-        },
-        'UCLA': {
-            'MRI3T': {'fmri': os.path.join(DERIVDATA_PATHS['UCLA'], 'xcpd'),}
-        },
-        'Penn_LEAD': {
-            'MRI3T': {'fmri': os.path.join(DERIVDATA_PATHS['Penn_LEAD'], 'xcpd'),}
-        },
-        'HBN': {
-            'MRI3T': {'fmri': os.path.join(DERIVDATA_PATHS['HBN'], 'rbc_cpac', 'cpac_RBCv0'),}
-        },
-    }
-    
+
     def __init__(
         self,
         dataset: str,
-        base_dir: Optional[str] = None,
         output_dir: Optional[str] = None,
         load_behavior: bool = True,
-        verbose: bool = True
+        verbose: bool = True,
     ):
         """
-        Initialize the Timescales class for a specific dataset.
-        
+        Initialise DataLoader for a specific dataset.
+
         Args:
-            dataset: Name of the dataset (e.g., 'HCP-YA')
-            base_dir: Override the default base directory for this dataset
-            output_dir: Directory for saving outputs (default: ~/home/intrinsic_neural_timescales)
-            load_behavior: Whether to load the behavioral CSV on initialization
+            dataset: Name of the dataset (must match a YAML file in configs/datasets/).
+            output_dir: Directory for saving outputs.
+                        Defaults to the project root (parent of src/).
+            load_behavior: Whether to load behavioral/demographic data on init.
+            verbose: Print initialisation summary.
         """
         self.dataset = dataset
-        
-        # Set up base directory
-        if base_dir is not None:
-            self.base_dir = Path(base_dir)
-        elif dataset in self.BASE_PATHS:
-            self.base_dir = Path(self.BASE_PATHS[dataset])
-        else:
-            raise ValueError(f"Unknown dataset '{dataset}'. Please provide base_dir.")
-        
+        self.config = load_dataset_config(dataset)
+
+        self.base_dir = self.config.base_path
         if not self.base_dir.exists():
             raise FileNotFoundError(f"Base directory does not exist: {self.base_dir}")
-        
-        self.rawdata_dir = self.RAWDATA_PATHS[dataset]
-        self.derivdata_dir = self.DERIVDATA_PATHS[dataset]
-        
-        # Set up output directory
+
+        self.rawdata_dir = self.base_dir / self.config.rawdata_subdir
+        self.derivdata_dir = self.base_dir / self.config.derivatives_subdir
+
         if output_dir is not None:
             self.output_dir = Path(output_dir).expanduser()
         else:
-            self.output_dir = Path('/mnt/storage_ssd_raid/research_projects/intrinsic_neural_timescales')
-        
-        # Create output directory if it doesn't exist
+            self.output_dir = _find_project_root()
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Set up modality parameters (TR values)
-        self.modality_params = self.DEFAULT_TR[dataset].copy()
-        
-        # Initialize scan registry
-        self.scan_registry = []
-        
-        # Load behavioral data if requested
-        self.df_behavior = None
+
+        self.scan_registry: List[ScanInfo] = []
+        self.df_behavior: Optional[pd.DataFrame] = None
+        self._data_cache: Dict[str, np.ndarray] = {}
+
         if load_behavior:
             self.load_behavioral_data()
-        
-        # Initialize data cache (will store loaded timeseries)
-        self._data_cache = {}
-        
+
         if verbose:
             print(f"Initialized DataLoader for dataset: {dataset}")
-            print(f"Base directory: {self.base_dir}")
-            print(f"Raw data directory: {self.rawdata_dir}")
-            print(f"Derivatives data directory: {self.derivdata_dir}")
-            print(f"Output directory: {self.output_dir}")
+            print(f"  Base directory:        {self.base_dir}")
+            print(f"  Raw data directory:    {self.rawdata_dir}")
+            print(f"  Derivatives directory: {self.derivdata_dir}")
+            print(f"  Output directory:      {self.output_dir}")
             if self.df_behavior is not None:
-                print(f"Loaded behavioral data: {len(self.df_behavior)} subjects")
-                
-    def get_tr(self, modality: str) -> float:
-        """Get the TR for a given modality."""
-        if modality not in self.modality_params:
-            raise ValueError(f"Unknown modality: {modality}")
-        return self.modality_params[modality]
+                print(f"  Behavioral data:       {len(self.df_behavior)} subjects")
 
-    # ==================== Registration Methods ====================
+    # --------------------------------------------------------------------------
+    # Config helpers
+    # --------------------------------------------------------------------------
+
+    def get_tr(self, modality: str) -> float:
+        """Return the TR (seconds) for a given modality."""
+        if modality not in self.config.modalities:
+            raise ValueError(
+                f"Unknown modality '{modality}' for dataset '{self.dataset}'. "
+                f"Available: {list(self.config.modalities)}"
+            )
+        return self.config.modalities[modality].tr
+
+    # --------------------------------------------------------------------------
+    # Registration
+    # --------------------------------------------------------------------------
+
     def register_scans(
         self,
         subject_ids: List[str],
@@ -263,23 +546,23 @@ class DataLoader:
         tasks: List[str],
         space: str,
         seg: str,
-        modality: str
-    ) -> List['ScanInfo']:
+        modality: str,
+    ) -> List[ScanInfo]:
         """
-        Register XCP-D preprocessed scans for given subjects.
-        
+        Register scans for all combinations of subjects × sessions × tasks.
+
         Args:
-            subject_ids: List of subject IDs (e.g., ['00395', '00396'])
-        
+            subject_ids: Subject IDs (without 'sub-' prefix).
+            sessions: Session labels; use [None] for sessionless datasets.
+            tasks: Task names (BIDS task-entity values).
+            space: MNI/surface space label.
+            seg: Parcellation/segmentation label.
+            modality: One of the modalities defined in this dataset's config.
+
         Returns:
-            List of registered ScanInfo objects
+            List of newly registered ScanInfo objects.
         """
-        tr = self.get_tr(modality=modality)
-        if self.dataset == 'PNC' or self.dataset == 'NKI' or self.dataset == 'HBN':
-            rbc = True
-        else:
-            rbc = False
-        
+        tr = self.get_tr(modality)
         registered = []
         for subject_id in subject_ids:
             for session in sessions:
@@ -292,425 +575,298 @@ class DataLoader:
                         seg=seg,
                         modality=modality,
                         tr=tr,
-                        rbc=rbc
+                        rbc=self.config.rbc,
                     )
                     if scan not in self.scan_registry:
                         self.scan_registry.append(scan)
                     registered.append(scan)
-        
         return registered
 
+    # --------------------------------------------------------------------------
+    # Validation
+    # --------------------------------------------------------------------------
+
     def validate_scan_registry(
-        self, 
+        self,
         verbose: bool = True,
-        remove_incomplete_subjects: bool = False
+        remove_incomplete_subjects: bool = False,
     ) -> Dict[str, List]:
         """
-        Check which scans in the registry exist and automatically remove non-existent ones.
-        Optionally remove all scans for subjects with any missing data.
-        
+        Check which registered scans exist on disk and remove missing ones.
+
+        A scan is considered valid when:
+          - Its timeseries file exists, AND
+          - If the modality has a task_events_handler: task scans must have
+            event files; rest scans must not.
+          - If task_events_handler is null: only file existence is checked
+            (handles rest-only or events-unavailable datasets cleanly).
+
         Args:
-            verbose: Print detailed information
-            remove_incomplete_subjects: If True, remove all scans for any subject 
-                                    that had missing scans
-            
+            verbose: Print detailed validation report.
+            remove_incomplete_subjects: If True, remove all scans for any
+                subject that had at least one missing scan.
+
         Returns:
-            Dictionary with keys:
-                - 'existing': List of scans that exist
-                - 'missing': List of tuples (scan, filepath/error) for missing scans
-                - 'removed_subjects': List of subject IDs removed due to incomplete data
+            Dict with keys 'existing', 'missing', 'removed_subjects'.
         """
         if not self.scan_registry:
             if verbose:
                 print("Scan registry is empty.")
             return {'existing': [], 'missing': [], 'removed_subjects': []}
-        
+
         initial_count = len(self.scan_registry)
-        
         if verbose:
             print(f"Validating {initial_count} scans in registry...")
 
         existing_scans = []
         missing_scans = []
-        
-        # Check each scan in the registry
+
         for scan in self.scan_registry:
             try:
                 filepath = self.get_scan_filepath(scan)
+                mod_config = self.config.modalities[scan.modality]
+
+                if not filepath.exists():
+                    missing_scans.append((scan, filepath))
+                    if verbose:
+                        print(f"  Missing (file): {scan} -> {filepath}")
+                    continue
+
+                # If no event handler configured, file existence is sufficient.
+                if mod_config.task_events_handler is None:
+                    existing_scans.append(scan)
+                    continue
+
                 task_events = self.get_task_events(scan)
-                
-                if self.dataset == 'WAND' and filepath.exists():
+                if scan.condition == 'task' and task_events is not None:
                     existing_scans.append(scan)
-                elif filepath.exists() and scan.condition == 'task' and task_events is not None:
-                    existing_scans.append(scan)
-                elif filepath.exists() and scan.condition == 'rest' and task_events is None:
+                elif scan.condition == 'rest' and task_events is None:
                     existing_scans.append(scan)
                 else:
                     missing_scans.append((scan, filepath))
                     if verbose:
-                        print(f"  Missing: {scan} -> {filepath}")
+                        cond = scan.condition
+                        has_ev = task_events is not None
+                        print(
+                            f"  Missing (events): {scan} "
+                            f"[condition={cond}, has_events={has_ev}]"
+                        )
+
             except Exception as e:
                 missing_scans.append((scan, f"Error: {e}"))
                 if verbose:
-                    print(f"  Error checking {scan}: {e}")
-        
-        # Automatically remove all missing scans
+                    print(f"  Error: {scan} -> {e}")
+
+        # Remove missing scans from registry
         for scan, _ in missing_scans:
-            self.scan_registry.remove(scan)
-        
+            if scan in self.scan_registry:
+                self.scan_registry.remove(scan)
+
         removed_subjects = []
-        
-        # Optionally remove all scans for subjects with any missing data
         if remove_incomplete_subjects and missing_scans:
             if verbose:
-                print(f"\nRemoving all scans for subjects with incomplete data...")
-            
-            # Identify subjects that had missing scans
-            subjects_with_missing = set(scan.subject_id for scan, _ in missing_scans)
-            
-            # Remove all remaining scans for these subjects
+                print("\nRemoving all scans for subjects with incomplete data...")
+            subjects_with_missing = {scan.subject_id for scan, _ in missing_scans}
             scans_to_remove = [
-                scan for scan in self.scan_registry 
-                if scan.subject_id in subjects_with_missing
+                s for s in self.scan_registry
+                if s.subject_id in subjects_with_missing
             ]
-            
             for scan in scans_to_remove:
                 self.scan_registry.remove(scan)
                 if verbose:
                     print(f"  Removed: {scan} (subject {scan.subject_id} incomplete)")
-            
-            removed_subjects = sorted(list(subjects_with_missing))
-            
-            if verbose:
-                print(f"\nRemoved {len(scans_to_remove)} additional scans from "
-                    f"{len(removed_subjects)} subjects with incomplete data")
-        
-        # Summary
+            removed_subjects = sorted(subjects_with_missing)
+
         if verbose:
             print(f"\nValidation Summary:")
-            print(f"  Initially: {initial_count} scans")
-            print(f"  Existing: {len(existing_scans)}")
-            print(f"  Missing/Removed:  {len(missing_scans)} scans")
+            print(f"  Initially:             {initial_count} scans")
+            print(f"  Existing:              {len(existing_scans)}")
+            print(f"  Missing/Removed:       {len(missing_scans)} scans")
             if remove_incomplete_subjects:
-                print(f"  Incomplete subjects removed: {len(removed_subjects)} subjects")
-                print(f"    Additional scans removed: {len(existing_scans) - len(self.scan_registry)} scans")
-            print(f"  Final registry: {len(self.scan_registry)} scans")
-            
-            # Add task-specific missing data report
+                print(f"  Incomplete subjects:   {len(removed_subjects)}")
+            print(f"  Final registry:        {len(self.scan_registry)} scans")
+
             if missing_scans or existing_scans:
-                print(f"\nMissing data by task:")
-                
-                task_missing_subjects = defaultdict(set)  # task -> set of subject_ids with missing data
-                task_existing_subjects = defaultdict(set)  # task -> set of subject_ids with existing data
-                
-                # Collect missing subjects per task
+                print("\nMissing data by task:")
+                task_missing: Dict[str, set] = defaultdict(set)
+                task_existing: Dict[str, set] = defaultdict(set)
                 for scan, _ in missing_scans:
-                    task_missing_subjects[scan.task].add(scan.subject_id)
-                
-                # Collect existing subjects per task
+                    task_missing[scan.task].add(scan.subject_id)
                 for scan in existing_scans:
-                    task_existing_subjects[scan.task].add(scan.subject_id)
-                
-                # Get all unique tasks
-                all_tasks = set(task_missing_subjects.keys()) | set(task_existing_subjects.keys())
-                
-                # Print report for each task
-                for task in sorted(all_tasks):
-                    n_missing = len(task_missing_subjects[task])
-                    n_existing = len(task_existing_subjects[task])
-                    n_total = n_missing + n_existing
-                    
+                    task_existing[scan.task].add(scan.subject_id)
+                for task in sorted(set(task_missing) | set(task_existing)):
+                    n_miss = len(task_missing[task])
+                    n_exist = len(task_existing[task])
+                    n_total = n_miss + n_exist
                     if n_total > 0:
-                        pct_missing = (n_missing / n_total) * 100
-                        print(f"  {task}: {n_missing}/{n_total} subjects missing ({pct_missing:.1f}%)")
-                
-                # Report uniquely missing subjects per task
-                # (subjects missing only for that task but present in all others)
-                print(f"\nUniquely missing subjects by task:")
-                
-                for task in sorted(all_tasks):
-                    if task not in task_missing_subjects:
-                        continue
-                        
-                    # Get other tasks
+                        pct = (n_miss / n_total) * 100
+                        print(f"  {task}: {n_miss}/{n_total} missing ({pct:.1f}%)")
+
+                print("\nUniquely missing subjects by task:")
+                all_tasks = set(task_missing) | set(task_existing)
+                for task in sorted(task_missing):
                     other_tasks = all_tasks - {task}
-                    
-                    # Find subjects missing for this task
-                    missing_for_this_task = task_missing_subjects[task]
-                    
-                    # Find subjects that are uniquely missing (exist in ALL other tasks)
-                    uniquely_missing = set()
-                    for subject in missing_for_this_task:
-                        # Check if this subject exists in all other tasks
-                        exists_in_all_others = all(
-                            subject in task_existing_subjects[other_task] 
-                            for other_task in other_tasks
-                        )
-                        if exists_in_all_others:
-                            uniquely_missing.add(subject)
-                    
-                    if len(uniquely_missing) > 0:
+                    uniquely_missing = {
+                        subj for subj in task_missing[task]
+                        if all(subj in task_existing[t] for t in other_tasks)
+                    }
+                    if uniquely_missing:
                         print(f"  {task}: {len(uniquely_missing)} subjects missing only for this task")
-                        if len(uniquely_missing) <= 5:  # Show subject IDs if 5 or fewer
-                            print(f"    Subject IDs: {sorted(list(uniquely_missing))}")
-        
+                        if len(uniquely_missing) <= 5:
+                            print(f"    Subject IDs: {sorted(uniquely_missing)}")
+
         return {
             'existing': existing_scans,
             'missing': missing_scans,
-            'removed_subjects': removed_subjects
+            'removed_subjects': removed_subjects,
         }
 
-    # ==================== Loading Methods ====================
-    def load_behavioral_data(self):
-        """Load the behavioral CSV file for this dataset."""
+    # --------------------------------------------------------------------------
+    # File path resolution
+    # --------------------------------------------------------------------------
 
-        try:
-            if self.dataset == 'HCP-YA':
-                behavior_path_unrestricted = self.base_dir / 'unrestricted_lindenmp_9_26_2022_16_52_14.csv'
-                behavior_path_restricted = self.base_dir / 'RESTRICTED_lindenmp_9_26_2022_16_42_3.csv'
-
-                df_behavior_unrestricted = pd.read_csv(behavior_path_unrestricted, index_col=0)
-                df_behavior_restricted = pd.read_csv(behavior_path_restricted, index_col=0)
-                df_behavior = pd.merge(df_behavior_unrestricted, df_behavior_restricted, left_index=True, right_index=True)
-                df_behavior['age'] = df_behavior['Age_in_Yrs']
-                df_behavior['sex'] = df_behavior['Gender'] == 'M'
-                df_behavior['sex'] = df_behavior['sex'].astype(int)
-                df_behavior.index = df_behavior.index.astype(str)
-                df_behavior.index.name = 'subject_id'
-                
-                # Apply replacements to column names
-                words_to_convert = ['Emotion', 'Gambling', 'Language', 'Relational', 'Social']
-                new_columns = df_behavior.columns.to_series()
-                for word in words_to_convert:
-                    new_columns = new_columns.str.replace(word, word.upper(), regex=False)
-                df_behavior.columns = new_columns
-            elif self.dataset == 'HCP-D':
-                behavior_path = self.base_dir / 'behavior' / 'socdem01.txt'
-
-                df_behavior = pd.read_csv(behavior_path, skiprows=[1], delimiter='\t')
-                df_behavior = df_behavior.loc[:, ['src_subject_id', 'interview_age', 'sex']]
-                df_behavior.rename(columns={"src_subject_id": "subject_id", "interview_age": "age"}, inplace=True)
-                df_behavior['subject_id'] = [f'{subj_id}V1MR' for subj_id in df_behavior.loc[:, 'subject_id']]
-                df_behavior['age'] = df_behavior['age'] / 12
-                df_behavior['sex'] = df_behavior['sex'] == 'M'
-                df_behavior['sex'] = df_behavior['sex'].astype(int)
-                df_behavior.set_index('subject_id', inplace=True)
-            elif self.dataset == 'PNC':
-                behavior_path = self.base_dir / 'study-PNC_desc-participants.tsv'
-                functionalqc_path = self.base_dir / 'study-PNC_desc-functional_qc.tsv'
-                
-                # load in behavioral data
-                df_behavior = pd.read_csv(behavior_path, index_col=0, delimiter='\t')
-                df_behavior['sex'] = df_behavior['sex'] == 'Male'
-                df_behavior['sex'] = df_behavior['sex'].astype(int)
-                df_behavior.index = df_behavior.index.astype(str)
-                df_behavior.index.name = 'subject_id'
-
-                # load in motion data and filter out subjects using RBC criteria
-                df_qc = pd.read_csv(functionalqc_path, sep="\t", dtype={"participant_id": str})
-                df_qc = df_qc[df_qc["task"] != "idemo"]
-                exclude_cols = ["normCrossCorrExclude", "motionExclude", "fmriExclude"]
-                mask = (df_qc[exclude_cols] == 0).all(axis=1)
-                df_qc = df_qc.loc[mask]
-                has_rest = set(df_qc.loc[df_qc["task"] == "rest", "participant_id"])
-                has_frac2back = set(df_qc.loc[df_qc["task"] == "frac2back", "participant_id"])
-                passing_ids = has_rest & has_frac2back
-
-                df_qc = df_qc[df_qc["participant_id"].isin(passing_ids)]
-                df_qc = df_qc.groupby(["participant_id", "task"])["meanFD"].mean().reset_index()
-
-                rest_fd = df_qc[df_qc["task"] == "rest"].set_index("participant_id")["meanFD"].rename("meanFD_rest")
-                frac2back_fd = df_qc[df_qc["task"] == "frac2back"].set_index("participant_id")["meanFD"].rename("meanFD_frac2back")
-
-                df_qc_final = pd.concat([rest_fd, frac2back_fd], axis=1)
-                # df_qc_final.index = "sub-" + df_qc_final.index
-                df_qc_final.index.name = "subject_id"
-                
-                # filter behavioral data to match qc data
-                df_behavior = df_behavior.loc[df_qc_final.index]
-                df_behavior = pd.merge(df_behavior, df_qc_final, left_index=True, right_index=True)
-            elif self.dataset == 'Penn_LEAD':
-                behavior_path = self.base_dir / 'participants.tsv'
-
-                df_behavior = pd.read_csv(behavior_path, delimiter='\t')
-                df_behavior = df_behavior.loc[:, ['participant_id', 'age_months', 'sex']]
-                df_behavior.rename(columns={"participant_id": "subject_id", "age_months": "age"}, inplace=True)
-                df_behavior['subject_id'] = [subj_id.split('-')[1] for subj_id in df_behavior.loc[:, 'subject_id']]
-                df_behavior['age'] = df_behavior['age'] / 12
-                df_behavior['sex'] = df_behavior['sex'] == 'M'
-                df_behavior['sex'] = df_behavior['sex'].astype(int)
-                df_behavior.set_index('subject_id', inplace=True)
-            elif self.dataset == 'HBN':
-                behavior_path = self.base_dir / 'study-HBN_desc-participants.tsv'
-
-                # load in behavioral data
-                df_behavior = pd.read_csv(behavior_path, index_col=0, delimiter='\t')
-                df_behavior['sex'] = df_behavior['sex'] == 'Male'
-                df_behavior['sex'] = df_behavior['sex'].astype(int)
-                df_behavior.index = df_behavior.index.astype(str)
-                df_behavior.index.name = 'subject_id'
-
-            self.df_behavior = df_behavior
-        except:
-            print(f"Warning: Could not find behavior csv at expected location")
-
-    def get_task_events(self, scan):
-        # Parse scan key
-        kv_dict = parse_scan_string(str(scan))
-        # print(kv_dict)
-        
-        subject_id = kv_dict.get('sub', '')
-        task = kv_dict.get('task', '')
-        modality = kv_dict.get('modality', '')
-        session = kv_dict.get('ses', '')
-
-        if self.dataset == 'HCP-D':
-            subject_id = split_hcpd_string(subject_id)
-        
-        try:
-            if modality == 'MEG' and self.dataset == 'HCP-YA':
-                subdir_str = f'{task[:1]}-{task[1:]}'
-                task_events_file_path = glob.glob(os.path.join(self.rawdata_dir, subject_id, 'unprocessed', 'MEG', subdir_str, 'EPRIME', f'{subject_id}_*_{task[1:]}_*.xlsx'))[0]
-                events = get_task_events_meg(task_events_file_path=task_events_file_path, verbose=False)
-                task_events = events[['onset', 'duration', 'trial_type']]
-            elif modality == 'MRI3T' and (self.dataset == 'HCP-YA' or self.dataset == 'HCP-D'):
-                results_dir = os.path.join(self.rawdata_dir, subject_id, 'MNINonLinear', 'Results')
-                contents = os.listdir(results_dir)
-                contents_joined = [''.join(content.split('_')) for content in contents]
-                idx = contents_joined.index(task)
-                ev_dir = os.path.join(results_dir, contents[idx], 'EVs')
-                task_events = get_task_events_fmri(ev_dir)
-            elif modality == 'MRI3T' and self.dataset == 'PNC':
-                try:
-                    task_events_file_path = glob.glob(os.path.join(self.rawdata_dir, f'sub-{subject_id}', f'ses-{session}', 'func', f'sub-{subject_id}_ses-{session}_task-{task}*events.tsv'))[0]
-                    task_events = pd.read_csv(task_events_file_path, sep='\t')       
-                except:
-                    task_events_file_path = os.path.join(self.rawdata_dir, f'sub-{subject_id}', f'ses-{session}', 'func', f'sub-{subject_id}_ses-{session}_task-{task}_events.tsv')
-                    task_events = pd.read_csv(task_events_file_path, sep='\t')
-                # print(task_events_file_path)
-                # print(task_events)
-            elif modality == 'MRI3T' and self.dataset == 'UCLA':
-                try:
-                    task_events_file_path = glob.glob(os.path.join(self.rawdata_dir, f'sub-{subject_id}', 'func', f'sub-{subject_id}_task-{task}*events.tsv'))[0]
-                    task_events_data_tmp = pd.read_csv(task_events_file_path, sep='\t')       
-                except:
-                    task_events_file_path = os.path.join(self.rawdata_dir, f'sub-{subject_id}', 'func', f'sub-{subject_id}_task-{task}_events.tsv')
-                    task_events_data_tmp = pd.read_csv(task_events_file_path, sep='\t')
-
-                if task == 'stopsignal':
-                    # Stop signal
-                    task_events = task_events_data_tmp[['onset', 'duration', 'trial_type']]
-                    task_events.loc[~task_events['trial_type'].isna()]
-                elif task == 'bart':
-                    # BART
-                    task_events_data_tmp = task_events_data_tmp[['onset', 'duration', 'trial_type', 'trial_number']]
-                    task_events = pd.DataFrame(columns=['onset', 'duration', 'trial_type'])
-                    unique_trials = task_events_data_tmp['trial_number'].unique()
-
-                    for trial_number in unique_trials:
-                        trial_data = task_events_data_tmp.loc[task_events_data_tmp['trial_number'] == trial_number].reset_index(drop=True)
-
-                        trial_data_processed = {'onset': trial_data['onset'].iloc[0], 'duration': trial_data['duration'].values.sum(), 'trial_type': trial_data['trial_type'].iloc[0]}
-                        trial_data_processed = pd.DataFrame([trial_data_processed])
-                        task_events = pd.concat((task_events, trial_data_processed), axis=0, ignore_index=True)
-            elif modality == 'MRI3T' and self.dataset == 'NKI':
-                task_events_file_path = glob.glob(os.path.join(self.rawdata_dir, f'sub-{subject_id}', f'ses-{session}', 'func', f'sub-{subject_id}_ses-{session}_task-{task}_acq-1400*_events.tsv'))[0]
-                task_events = pd.read_csv(task_events_file_path, sep='\t')
-            elif modality == 'MRI3T' and self.dataset == 'Penn_LEAD':
-                task_events_file_path = glob.glob(os.path.join(self.rawdata_dir, f'sub-{subject_id}', f'ses-{session}', 'func', f'sub-{subject_id}_ses-{session}_task-{task}_run-01_events.tsv'))[0]
-                task_events = pd.read_csv(task_events_file_path, sep='\t')
-            elif modality == 'MRI7T':
-                movie_metadata_dir = os.path.join(self.output_dir, 'data', 'supporting_data', 'movie_data')
-                
-                if 'MOVIE1' in task:
-                    timing_file = '7T_MOVIE1_CC1_v2_Video_Timing.csv'
-                elif 'MOVIE2' in task:
-                    timing_file = '7T_MOVIE2_HO1_v2_Video_Timing.csv'
-                elif 'MOVIE3' in task:
-                    timing_file = '7T_MOVIE3_CC2_v2_Video_Timing.csv'
-                elif 'MOVIE4' in task:
-                    timing_file = '7T_MOVIE4_HO2_v2_Video_Timing.csv'
-                
-                block_design_file = os.path.join(movie_metadata_dir, timing_file)
-                block_design_data = pd.read_csv(block_design_file)
-                block_design_data = block_design_data.loc[block_design_data['movie.block'] != 0.0]
-
-                # Create task_events DataFrame for nilearn (task blocks only by default)
-                task_events = pd.DataFrame({
-                    'onset': block_design_data['block_start_time'],
-                    'duration': block_design_data['block_duration'], 
-                    'trial_type': 'movie'
-                }).dropna().sort_values('onset').reset_index(drop=True)
-        
-            return task_events
-        except:
-            return None
-    
     def get_scan_filepath(self, scan: ScanInfo) -> Path:
         """
-        Get the exact filepath for an HCP scan.
-        
+        Construct the expected filepath for a scan's timeseries file.
+
+        Uses the filename_template and dir_template from the dataset YAML config.
+        For datasets with use_glob=True (e.g. NKI), the glob is resolved here
+        and the first match is returned; FileNotFoundError is raised if no match.
+        For datasets with filename_template_fallbacks (e.g. PNC), fallbacks are
+        tried in order after the primary template.
+
         Args:
-            scan: ScanInfo object
-        
+            scan: ScanInfo object.
+
         Returns:
-            Path to the timeseries file (without checking existence)
+            Path to the timeseries file (resolved for glob patterns).
+
+        Raises:
+            FileNotFoundError: If use_glob=True and no file matches the pattern.
+            ValueError: If the modality is not recognised for this dataset.
         """
-        # Base paths from configuration
-        if scan.modality == 'MRI3T':
-            base_path = Path(self.SUBDIR_MAP[self.dataset]['MRI3T']['fmri'])
-        elif scan.modality == 'MRI7T':
-            base_path = Path(self.SUBDIR_MAP[self.dataset]['MRI7T']['fmri'])
-        elif scan.modality == 'MEG':
-            base_path = Path(self.SUBDIR_MAP[self.dataset]['MEG']['meg'])
-        else:
-            raise ValueError(f"Unknown modality: {scan.modality}")
+        if scan.modality not in self.config.modalities:
+            raise ValueError(
+                f"Modality '{scan.modality}' not in config for dataset '{self.dataset}'. "
+                f"Available: {list(self.config.modalities)}"
+            )
+        mod_config = self.config.modalities[scan.modality]
 
-        # Subject directory
-        if scan.session is None:
-            subject_dir = base_path / f'sub-{scan.subject_id}' / 'func'
-        else:
-            subject_dir = base_path / f'sub-{scan.subject_id}' / f'ses-{scan.session}' / 'func'
+        deriv_root = (
+            self.config.base_path
+            / self.config.derivatives_subdir
+            / mod_config.data_subdir
+        )
+        template_kwargs = {
+            'subject_id': scan.subject_id,
+            'session': scan.session,
+            'task': scan.task,
+            'space': scan.space,
+            'seg': scan.seg,
+            'ext': mod_config.file_ext,
+        }
 
-        # File extension
-        if self.dataset == 'HCP-YA' and scan.modality == 'MEG' and scan.rbc is False:
-            fileext = ".ptseries.npy"
-        elif self.dataset == 'HCP-YA' and scan.modality != 'MEG' and scan.rbc is False:
-            fileext = ".ptseries.nii"
-        elif self.dataset == 'HCP-D' and scan.rbc is False:
-            fileext = ".ptseries.nii"
-        elif scan.rbc is True:
-            fileext = ".1D"
-        else:
-            fileext = ".tsv"
+        dir_path = deriv_root / mod_config.dir_template.format(**template_kwargs)
+        filename = mod_config.filename_template.format(**template_kwargs)
+        filepath = dir_path / filename
 
-        # Construct filename
-        if self.dataset == 'PNC':
-            filename = f"sub-{scan.subject_id}_ses-{scan.session}_task-{scan.task}_atlas-{scan.seg}_space-{scan.space}_reg-36Parameter_desc-Mean_timeseries{fileext}"
-            filename_full = subject_dir / filename
-            if not filename_full.exists():
-                filename = f"sub-{scan.subject_id}_ses-{scan.session}_task-{scan.task}_acq-singleband_atlas-{scan.seg}_space-{scan.space}_reg-36Parameter_desc-Mean_timeseries{fileext}"
-                filename_full = subject_dir / filename
-        elif self.dataset == 'NKI':
-            filename = f"sub-{scan.subject_id}_ses-{scan.session}_task-{scan.task}_acq-1400*_atlas-{scan.seg}_space-{scan.space}_reg-36Parameter_desc-Mean_timeseries{fileext}"
-            filename_full = str(subject_dir / filename)
-            filename_full = glob.glob(filename_full)[0]
-            filename_full = Path(filename_full)
-        elif self.dataset == 'Penn_LEAD':
-            filename = f"sub-{scan.subject_id}_ses-{scan.session}_task-{scan.task}_run-01_space-{scan.space}_seg-{scan.seg}_stat-mean_timeseries{fileext}"
-            filename_full = subject_dir / filename
-        elif self.dataset == 'HBN':
-            filename = f"sub-{scan.subject_id}_ses-{scan.session}_task-{scan.task}_run-1_atlas-{scan.seg}_space-{scan.space}_reg-36Parameter_desc-Mean_timeseries{fileext}"
-            filename_full = subject_dir / filename
-        elif scan.rbc is False and scan.session is None:
-            filename = f"sub-{scan.subject_id}_task-{scan.task}_space-{scan.space}_seg-{scan.seg}_stat-mean_timeseries{fileext}"
-            filename_full = subject_dir / filename
-        elif scan.rbc is False and scan.session is not None:
-            filename = f"sub-{scan.subject_id}_ses-{scan.session}_task-{scan.task}_space-{scan.space}_seg-{scan.seg}_stat-mean_timeseries{fileext}"
-            filename_full = subject_dir / filename
+        # Glob-based resolution (e.g. NKI acq label varies)
+        if mod_config.use_glob:
+            matches = glob.glob(str(filepath))
+            if not matches:
+                raise FileNotFoundError(
+                    f"No file matched glob pattern: {filepath}"
+                )
+            return Path(matches[0])
 
-        return filename_full
-    
+        # Fallback templates (e.g. PNC acq-singleband variant)
+        if not filepath.exists() and mod_config.filename_template_fallbacks:
+            for fallback_template in mod_config.filename_template_fallbacks:
+                fallback = dir_path / fallback_template.format(**template_kwargs)
+                if fallback.exists():
+                    return fallback
+
+        return filepath
+
+    # --------------------------------------------------------------------------
+    # Task events
+    # --------------------------------------------------------------------------
+
+    def get_task_events(self, scan: ScanInfo) -> Optional[pd.DataFrame]:
+        """
+        Return task events for a scan, or None if no handler is configured.
+
+        Dispatches to the handler named in the modality config's
+        task_events_handler field. Returns None for rest-only datasets or
+        modalities without event files.
+        """
+        handler_key = self.config.modalities[scan.modality].task_events_handler
+        if handler_key is None:
+            return None
+        handler = TASK_EVENTS_HANDLERS.get(handler_key)
+        if handler is None:
+            raise ValueError(
+                f"Unknown task_events_handler '{handler_key}' for dataset "
+                f"'{self.dataset}'. Available: {list(TASK_EVENTS_HANDLERS)}"
+            )
+        try:
+            return handler(self, scan)
+        except Exception:
+            return None
+
+    # --------------------------------------------------------------------------
+    # Behavioral data
+    # --------------------------------------------------------------------------
+
+    def load_behavioral_data(self):
+        """Load behavioral/demographic data using the configured handler."""
+        handler_key = self.config.behavior_handler
+        if handler_key is None:
+            logger.debug("No behavior handler configured for '%s'.", self.dataset)
+            return
+
+        handler = BEHAVIOR_HANDLERS.get(handler_key)
+        if handler is None:
+            raise ValueError(
+                f"Unknown behavior_handler '{handler_key}'. "
+                f"Available: {list(BEHAVIOR_HANDLERS)}"
+            )
+        try:
+            self.df_behavior = handler(self)
+        except FileNotFoundError as e:
+            logger.warning("Could not load behavioral data for '%s': %s", self.dataset, e)
+
+    # --------------------------------------------------------------------------
+    # Subject ID helpers
+    # --------------------------------------------------------------------------
+
+    def load_subject_ids(self, filename: str = 'subject_ids.txt') -> List[str]:
+        """
+        Load subject IDs from a text file in base_dir.
+
+        Automatically:
+          - Strips 'sub-' prefix if present.
+          - Removes underscores for HCP-D (subject_id_rawdata_transform = split_hcpd).
+
+        Args:
+            filename: Name of the text file relative to base_dir.
+
+        Returns:
+            List of subject ID strings ready for register_scans().
+        """
+        path = self.base_dir / filename
+        subject_ids = np.loadtxt(str(path), dtype=str).tolist()
+        # Strip sub- prefix
+        subject_ids = [s.split('-')[1] if s.startswith('sub-') else s for s in subject_ids]
+        # HCP-D IDs are stored with underscores in the file but used without them
+        if self.config.subject_id_rawdata_transform == 'split_hcpd':
+            subject_ids = [s.replace('_', '') for s in subject_ids]
+        return subject_ids
+
+    # --------------------------------------------------------------------------
+    # Timeseries loading
+    # --------------------------------------------------------------------------
+
     def load_scan_timeseries(
         self,
         scan: ScanInfo,
@@ -718,84 +874,75 @@ class DataLoader:
         nuisance_regression: bool = True,
         standardize: bool = False,
         verbose: bool = False,
-        dry_load: bool = False
-    ) -> np.ndarray:
+        dry_load: bool = False,
+    ) -> Optional[np.ndarray]:
         """
-        Load timeseries for a single HCP scan.
-        
+        Load and preprocess the timeseries for a single scan.
+
         Args:
-            scan: ScanInfo object
-            cache: Whether to cache the data
-            verbose: Print loading details
-        
+            scan: ScanInfo object.
+            cache: Cache the loaded array (keyed by str(scan)).
+            nuisance_regression: Regress out global signal, its derivative,
+                                 and their squares (4 regressors total).
+            standardize: Z-score across timepoints after regression.
+            verbose: Print filepath and shape on load.
+            dry_load: Return None without loading or caching.
+
         Returns:
-            Timeseries array of shape (n_parcels, n_timepoints)
+            Array of shape (n_parcels, n_timepoints), or None if dry_load=True.
         """
-        # Check cache
+        if dry_load:
+            return None
+
         cache_key = str(scan)
         if cache and cache_key in self._data_cache:
             if verbose:
-                print(f"  Using cached: {cache_key}")
+                print(f"  Cached: {cache_key}")
             return self._data_cache[cache_key]
-        
-        # Get filepath
+
         filepath = self.get_scan_filepath(scan)
-        
         if not filepath.exists():
             raise FileNotFoundError(f"File not found: {filepath}")
-        
+
         if verbose:
             print(f"  Loading: {filepath}")
-        
-        # Load based on file type
+
+        # Format-specific loading
         if filepath.suffix == '.npy':
             timeseries = np.load(filepath)
         elif '.nii' in filepath.suffixes:
-            img = nib.load(str(filepath))
-            timeseries = img.get_fdata()
+            timeseries = nib.load(str(filepath)).get_fdata()
         elif filepath.suffix == '.tsv':
-            df = pd.read_csv(filepath, sep='\t')
-            timeseries = df.values  # shape: (n_timepoints, n_parcels)
+            timeseries = pd.read_csv(filepath, sep='\t').values
         elif filepath.suffix == '.1D':
-            df = pd.read_csv(filepath)
-            timeseries = df.values  # shape: (n_timepoints, n_parcels)
+            timeseries = pd.read_csv(filepath).values
         else:
-            raise ValueError(f"Unknown file type: {filepath}")
-        
-        # Convert to float32 for memory efficiency
-        timeseries = timeseries.astype(np.float32)
-        
-        # Run nuisance regression
-        if nuisance_regression:
-            global_signal = np.mean(timeseries, axis=1).reshape(-1, 1)
-            global_signal_diff = np.append(0, np.diff(global_signal, axis=0)).reshape(-1, 1)
-            nuis = np.concatenate((global_signal, global_signal_diff), axis=1)
-            nuis = np.concatenate((nuis, np.square(nuis)), axis=1)
+            raise ValueError(f"Unrecognised file extension: {filepath}")
 
+        timeseries = timeseries.astype(np.float32)
+
+        if nuisance_regression:
+            gs = np.mean(timeseries, axis=1).reshape(-1, 1)
+            gs_diff = np.append(0, np.diff(gs, axis=0)).reshape(-1, 1)
+            nuis = np.concatenate([gs, gs_diff, gs ** 2, gs_diff ** 2], axis=1)
             regr = LinearRegression()
             regr.fit(nuis, timeseries)
-            y_pred = regr.predict(nuis)
-            timeseries = timeseries - y_pred
-        
-        # z score
+            timeseries = timeseries - regr.predict(nuis)
+
         if standardize:
             timeseries = sp.stats.zscore(timeseries, axis=0)
-        
-        # Transpose data to (n_parcels, n_timepoints)
+
+        # (n_timepoints, n_parcels) -> (n_parcels, n_timepoints)
         timeseries = timeseries.T
-        
+
         if verbose:
             print(f"    Shape: {timeseries.shape}")
-        
-        # Cache if requested
+
         if cache:
             self._data_cache[cache_key] = timeseries
-        
-        if dry_load:
-            return None
-        else:
-            return timeseries
-    
+
+        return timeseries
+
     def load_batch(
         self,
         subjects: Optional[List[str]] = None,
@@ -806,339 +953,316 @@ class DataLoader:
         nuisance_regression: bool = True,
         standardize: bool = False,
         verbose: bool = True,
-        dry_load: bool = False
+        dry_load: bool = False,
     ) -> Dict[str, Optional[np.ndarray]]:
         """
-        Load multiple scans with filtering, excluding subjects with any scans containing NaNs or zero-variance regions.
-        
+        Load timeseries for all scans in the registry, with optional filters.
+
         Args:
-            subjects: Filter to specific subjects
-            modalities: Filter to specific modalities
-            conditions: Filter to specific conditions
-            seg: Filter to specific seg
-            cache: Whether to cache data
-            nuisance_regression: Whether to apply nuisance regression
-            standardize: Whether to standardize the data
-            verbose: Print progress
-            dry_load: If True, return scan keys with None values instead of loading data
-        
+            subjects: Restrict to these subject IDs.
+            modalities: Restrict to these modalities.
+            conditions: Restrict to these conditions ('rest', 'task').
+            seg: Restrict to this segmentation label.
+            cache: Cache loaded arrays.
+            nuisance_regression: Apply global-signal nuisance regression.
+            standardize: Z-score timeseries after regression.
+            verbose: Print progress.
+            dry_load: Return {scan_key: None} without loading.
+
         Returns:
-            Dictionary mapping scan identifiers to timeseries (or None if dry_load=True)
+            Dict mapping scan string keys to (n_parcels, n_timepoints) arrays,
+            or to None if dry_load=True.
         """
-        # Filter scans
-        scans_to_load = []
-        for scan in self.scan_registry:
-            if subjects and scan.subject_id not in [str(s) for s in subjects]:
-                continue
-            if modalities and scan.modality not in modalities:
-                continue
-            if conditions and scan.condition not in conditions:
-                continue
-            if seg and scan.seg != seg:
-                continue
-            scans_to_load.append(scan)
-        
+        scans_to_load = [
+            s for s in self.scan_registry
+            if (not subjects or s.subject_id in [str(x) for x in subjects])
+            and (not modalities or s.modality in modalities)
+            and (not conditions or s.condition in conditions)
+            and (not seg or s.seg == seg)
+        ]
+
         if not scans_to_load:
-            raise ValueError("No scans match the filters")
-        
+            raise ValueError("No scans match the specified filters.")
+
         if verbose:
             print(f"{'Dry loading' if dry_load else 'Loading'} {len(scans_to_load)} scans...")
-        
-        # Load scans or return None for dry load
-        loaded = {}
+
+        loaded: Dict[str, Optional[np.ndarray]] = {}
         failed = []
-        
+
         for i, scan in enumerate(scans_to_load):
             try:
                 if verbose and i % 10 == 0:
-                    print(f"  [{i+1}/{len(scans_to_load)}] {scan.subject_id} {scan.task}")
-                
+                    print(f"  [{i + 1}/{len(scans_to_load)}] {scan.subject_id} {scan.task}")
                 loaded[str(scan)] = self.load_scan_timeseries(
-                    scan, 
-                    cache=cache, 
-                    verbose=False, 
+                    scan,
+                    cache=cache,
+                    verbose=False,
                     nuisance_regression=nuisance_regression,
                     standardize=standardize,
-                    dry_load=dry_load
+                    dry_load=dry_load,
                 )
-                
             except Exception as e:
                 failed.append((scan, str(e)))
                 if verbose and len(failed) <= 5:
                     print(f"    Failed: {e}")
-        
-        # Summary
+
         if verbose:
             print(f"\nLoaded: {len(loaded)}/{len(scans_to_load)} scans")
             if failed:
                 print(f"Failed: {len(failed)} scans")
                 for scan, error in failed[:3]:
                     print(f"  {scan.subject_id}: {error[:100]}")
-        
+
         return loaded
-    
-    # ==================== Utility Methods ====================
+
+    # --------------------------------------------------------------------------
+    # Registry serialisation
+    # --------------------------------------------------------------------------
+
+    def list_registered_scans(self) -> pd.DataFrame:
+        """Return a DataFrame of all registered scans."""
+        if not self.scan_registry:
+            return pd.DataFrame()
+        return pd.DataFrame([s.to_dict() for s in self.scan_registry])
+
+    def export_scan_registry(self, file_name: str = 'scan_registry.csv'):
+        """Write the scan registry to a CSV in output_dir."""
+        out_path = self.output_dir / file_name
+        self.list_registered_scans().to_csv(out_path)
+        logger.info("Scan registry exported to %s", out_path)
+
+    def load_scan_registry(self, file_name: str = 'scan_registry.csv'):
+        """Load a previously exported scan registry, reconstructing ScanInfo objects."""
+        path = self.output_dir / file_name
+        if not path.exists():
+            raise FileNotFoundError(f"Scan registry not found: {path}")
+        # dtype=str preserves leading zeros in string fields (e.g. session '01'
+        # must not be read back as integer 1). from_dict handles 'nan' strings
+        # and bool strings produced by this read mode.
+        df = pd.read_csv(path, index_col=0, dtype=str)
+        self.scan_registry = [ScanInfo.from_dict(row) for _, row in df.iterrows()]
+        print(f"Loaded {len(self.scan_registry)} scans from {file_name}")
+
+    # --------------------------------------------------------------------------
+    # Cache management
+    # --------------------------------------------------------------------------
+
     def clear_cache(self):
-        """Clear the data cache to free memory."""
+        """Free all cached timeseries arrays."""
         self._data_cache.clear()
-        print(f"Cleared data cache")
-    
+        print("Cleared data cache.")
+
     def get_cache_info(self) -> Dict:
-        """Get information about the current cache."""
-        info = {
+        """Return cache size and memory usage."""
+        return {
             'n_cached': len(self._data_cache),
             'cached_scans': list(self._data_cache.keys()),
             'memory_mb': sum(
-                arr.nbytes / 1024 / 1024 
-                for arr in self._data_cache.values()
-            )
+                a.nbytes / 1024 / 1024 for a in self._data_cache.values()
+            ),
         }
-        return info
-    
-    def list_registered_scans(self) -> pd.DataFrame:
-        """Return a DataFrame of all registered scans with key-value naming."""
-        if not self.scan_registry:
-            return pd.DataFrame()
-        
-        scan_data = []
-        for scan in self.scan_registry:
-            # Parse the key-value string
-            scan_str = str(scan)
-            kv_dict = parse_scan_string(scan_str)
-            kv_dict = {'scan_string': scan_str, **kv_dict}
-            scan_data.append(kv_dict)
-        
-        return pd.DataFrame(scan_data)
-    
-    def export_scan_registry(self, file_name: str = 'scan_registry.csv'):
-        """Export scan registry as a DataFrame."""
 
-        scan_registry = self.list_registered_scans()
-        scan_registry.to_csv(os.path.join(self.output_dir, file_name))
-
-    def load_scan_registry(self, file_name: str = 'scan_registry.csv'):
-        """ Load a pre-save scan registry"""
-        try:
-            self.scan_registry = pd.read_csv(os.path.join(self.output_dir, file_name), index_col=0)
-        except:
-            print(f'{file_name} not found!')
+    # --------------------------------------------------------------------------
+    # Summary
+    # --------------------------------------------------------------------------
 
     def summary(self):
-        """Print a summary of the current state."""
-        print(f"\n{'='*50}")
-        print(f"Dataset: {self.dataset}")
-        print(f"Base directory: {self.base_dir}")
+        """Print a summary of the current DataLoader state."""
+        print(f"\n{'=' * 50}")
+        print(f"Dataset:          {self.dataset}")
+        print(f"Base directory:   {self.base_dir}")
         print(f"Output directory: {self.output_dir}")
         print(f"Registered scans: {len(self.scan_registry)}")
-        
         if self.scan_registry:
-            df_scans = self.list_registered_scans()
-            print(f"\nScans by modality:")
-            print(df_scans['modality'].value_counts())
-            print(f"\nScans by condition:")
-            print(df_scans['condition'].value_counts())
-        
+            df = self.list_registered_scans()
+            print("\nScans by modality:")
+            print(df['modality'].value_counts().to_string())
+            print("\nScans by condition:")
+            print(df['condition'].value_counts().to_string())
         if self.df_behavior is not None:
             print(f"\nBehavioral data: {self.df_behavior.shape}")
-        
         cache_info = self.get_cache_info()
         if cache_info['n_cached'] > 0:
             print(f"\nCache: {cache_info['n_cached']} scans, {cache_info['memory_mb']:.1f} MB")
-        
-        print(f"{'='*50}\n")
-    
+        print(f"{'=' * 50}\n")
+
     def __repr__(self):
-        return (f"Timescales(dataset='{self.dataset}', "
-                f"n_registered_scans={len(self.scan_registry)})")
-        
-# ==================== Standalone Functions ====================
+        return (
+            f"DataLoader(dataset='{self.dataset}', "
+            f"n_registered_scans={len(self.scan_registry)})"
+        )
+
+
+# ==============================================================================
+# Standalone utility functions (also used by timescales.py)
+# ==============================================================================
+
 def parse_scan_string(scan_string: str) -> Dict[str, str]:
     """
     Parse a key-value formatted scan string into a dictionary.
-    
-    Args:
-        scan_string: String like "sub-100307_modality-MRI3T_task-rfMRIREST1LR_atlas-Schaefer4007"
-    
-    Returns:
-        Dictionary with keys: sub, modality, task, seg, etc.
+
+    Example:
+        "sub-100307_modality-MRI3T_task-rfMRIREST1LR_seg-Schaefer4007"
+        -> {'sub': '100307', 'modality': 'MRI3T', 'task': 'rfMRIREST1LR', ...}
     """
-    parts = scan_string.split('_')
     kv_dict = {}
-    for part in parts:
+    for part in scan_string.split('_'):
         if '-' in part:
-            key, value = part.split('-', 1)  # Split only on first hyphen
+            key, value = part.split('-', 1)
             kv_dict[key] = value
-            
     if 'tr' in kv_dict:
         kv_dict['tr'] = float(kv_dict['tr'])
-        
     return kv_dict
+
 
 def build_scan_string(**kwargs) -> str:
     """
     Build a scan string from key-value pairs.
-    
-    Args:
-        **kwargs: Key-value pairs (e.g., sub='100307', modality='MRI3T', etc.)
-    
-    Returns:
-        Formatted scan string
+
+    Example:
+        build_scan_string(sub='100307', modality='MRI3T', task='rfMRIREST1LR')
+        -> "sub-100307_modality-MRI3T_task-rfMRIREST1LR"
     """
-    parts = []
-    # Ensure consistent ordering
     key_order = ['sub', 'modality', 'task', 'seg', 'stat']
-    
-    for key in key_order:
-        if key in kwargs and kwargs[key] is not None:
-            parts.append(f"{key}-{kwargs[key]}")
-    
-    # Add any additional keys not in the standard order
-    for key, value in kwargs.items():
-        if key not in key_order and value is not None:
-            parts.append(f"{key}-{value}")
-    
+    parts = [
+        f"{key}-{kwargs[key]}"
+        for key in key_order
+        if key in kwargs and kwargs[key] is not None
+    ]
+    parts += [
+        f"{key}-{value}"
+        for key, value in kwargs.items()
+        if key not in key_order and value is not None
+    ]
     return '_'.join(parts)
 
-def get_task_events_fmri(ev_dir):
+
+def get_task_events_fmri(ev_dir: str) -> pd.DataFrame:
+    """Load HCP-style EV text files from a directory into a BIDS events DataFrame."""
     task_events = pd.DataFrame(columns=['onset', 'duration', 'trial_type'])
-
-    conditions = os.listdir(ev_dir)
-    for condition in conditions:
-        task_events_tmp = pd.DataFrame(columns=['onset', 'duration', 'trial_type'])
-
+    for condition in os.listdir(ev_dir):
         try:
             ev_data = np.genfromtxt(os.path.join(ev_dir, condition))
-
+            rows = []
             if ev_data.ndim == 1:
-                task_events_tmp.loc[0, 'onset'] = ev_data[0]
-                task_events_tmp.loc[0, 'duration'] = ev_data[1]
-                task_events_tmp.loc[0, 'trial_type'] = condition.replace('.txt', '')
-
+                rows = [{'onset': ev_data[0], 'duration': ev_data[1],
+                         'trial_type': condition.replace('.txt', '')}]
             elif ev_data.ndim == 2:
-                for block in np.arange(ev_data.shape[0]):
-                    task_events_tmp.loc[block, 'onset'] = ev_data[block, 0]
-                    task_events_tmp.loc[block, 'duration'] = ev_data[block, 1]
-                    task_events_tmp.loc[block, 'trial_type'] = condition.replace('.txt', '')
-        except:
+                rows = [
+                    {'onset': ev_data[i, 0], 'duration': ev_data[i, 1],
+                     'trial_type': condition.replace('.txt', '')}
+                    for i in range(ev_data.shape[0])
+                ]
+            if rows:
+                task_events = pd.concat(
+                    [task_events, pd.DataFrame(rows)], axis=0, ignore_index=True
+                )
+        except Exception:
             pass
-        
-        task_events = pd.concat((task_events, task_events_tmp), axis=0)
+    return task_events.reset_index(drop=True)
 
-    task_events.reset_index(inplace=True, drop=True)
 
-    return task_events
-
-def get_task_events_meg(task_events_file_path, 
-                        onset_column='Stim.OnsetTime',
-                        duration_ms=2000,
-                        verbose=True
-                        ):
+def get_task_events_meg(
+    task_events_file_path: str,
+    onset_column: str = 'Stim.OnsetTime',
+    duration_ms: float = 2000,
+    verbose: bool = True,
+) -> pd.DataFrame:
     """
-    Extract trial onsets and durations from MEG working memory task Excel file.
-    
-    Parameters:
-    -----------
+    Extract trial onsets and durations from an HCP MEG working-memory Excel file.
+
+    Parameters
+    ----------
     task_events_file_path : str
-        Path to the MEG working memory Excel file (e.g., '100307_MEG_Wrkmem_run1.xlsx')
-    onset_column : str, default 'Stim.OnsetTime'
-        Column to use for trial onset timing. Options:
-        - 'Stim.OnsetTime': When stimulus appears (recommended)
-        - 'CueTarget.OnsetTime': When cue/target appears (sparse data)
-        - 'SyncSlide.OnsetTime': Synchronization events
-        - 'GetReady.OnsetTime': Get ready cue onset
-    duration_ms : float, default 2000
-        Duration of each trial in milliseconds
-    
-    Returns:
-    --------
-    events_df : pd.DataFrame
-        DataFrame with columns ['onset', 'duration', 'trial_type', 'block_number'] in seconds
-        where trial_type is '0back'/'2back' and block_number is the block index
-        suitable for use with nilearn GLM functions
+        Path to the MEG working memory Excel file.
+    onset_column : str
+        Column to use for trial onset timing (default: 'Stim.OnsetTime').
+    duration_ms : float
+        Duration of each trial in milliseconds (default: 2000).
+    verbose : bool
+        Print extraction summary.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: onset, duration, trial_type, block_number (times in seconds).
     """
-    
-    # Read Excel file
     try:
         data = pd.read_excel(task_events_file_path, sheet_name=0)
     except Exception as e:
-        raise ValueError(f"Could not read Excel file: {e}")
-    
-    # Check if onset column exists and has sufficient data
+        raise ValueError(f"Could not read Excel file: {e}") from e
+
     if onset_column not in data.columns:
-        available_cols = [col for col in data.columns if 'OnsetTime' in col]
-        raise ValueError(f"Column '{onset_column}' not found. Available timing columns: {available_cols}")
-    
+        available = [c for c in data.columns if 'OnsetTime' in c]
+        raise ValueError(
+            f"Column '{onset_column}' not found. Available timing columns: {available}"
+        )
+
     timing_data_count = data[onset_column].notna().sum()
     if verbose:
         print(f"Timing column '{onset_column}' has {timing_data_count}/{len(data)} non-null values")
-    
-    # Remove rows where onset time is missing or where BlockType is missing (non-task trials)
-    valid_trials = data[onset_column].notna() & data['BlockType'].notna()
-    data_clean = data[valid_trials].copy()
-    
+
+    valid = data[onset_column].notna() & data['BlockType'].notna()
+    data_clean = data[valid].copy()
     if len(data_clean) == 0:
-        raise ValueError(f"No valid trials found with both {onset_column} and BlockType data")
-    
+        raise ValueError(
+            f"No valid trials found with both {onset_column} and BlockType data"
+        )
     if verbose:
-        print(f"Found {len(data_clean)} valid trials (removed {len(data) - len(data_clean)} non-task trials)")
-    
-    # Extract onsets and convert from milliseconds to seconds
-    onsets = data_clean[onset_column].values
-    onsets = onsets / 1000.0  # Convert ms to seconds
-    
-    # Set durations (convert from ms to seconds)
+        print(f"Found {len(data_clean)} valid trials "
+              f"(removed {len(data) - len(data_clean)} non-task trials)")
+
+    onsets = data_clean[onset_column].values / 1000.0
     duration_sec = duration_ms / 1000.0
     durations = np.full(len(onsets), duration_sec)
-    
-    # Determine trial types (0back/2back from BlockType) and block numbers
     trial_types = determine_trial_types_fixed(data_clean)
     block_numbers = extract_block_numbers(data_clean)
-    
-    # Create events DataFrame
+
     events_df = pd.DataFrame({
         'onset': onsets,
         'duration': durations,
         'trial_type': trial_types,
-        'block_number': block_numbers
-    })
-    
-    # Sort by onset time
-    events_df = events_df.sort_values('onset').reset_index(drop=True)
-    
-    # Print summary
+        'block_number': block_numbers,
+    }).sort_values('onset').reset_index(drop=True)
+
     if verbose:
         print(f"\nTrial extraction summary:")
-        print(f"- Total trials: {len(events_df)}")
-        print(f"- Trial duration: {duration_sec:.3f} seconds")
-        print(f"- Onset range: {events_df['onset'].min():.1f} to {events_df['onset'].max():.1f} seconds")
-        print(f"- Trial types: {events_df['trial_type'].value_counts().to_dict()}")
-        print(f"- Block numbers: {sorted(events_df['block_number'].unique())}")
-    
+        print(f"  Total trials: {len(events_df)}")
+        print(f"  Trial duration: {duration_sec:.3f} s")
+        print(f"  Onset range: {events_df['onset'].min():.1f} – {events_df['onset'].max():.1f} s")
+        print(f"  Trial types: {events_df['trial_type'].value_counts().to_dict()}")
+        print(f"  Block numbers: {sorted(events_df['block_number'].unique())}")
+
     return events_df
 
-def determine_trial_types_fixed(data):
-    """Extract trial types (0back/2back) from BlockType column."""
-    
-    block_types = data['BlockType'].values
-    trial_types = []
-    for block_type in block_types:
-        if pd.isna(block_type):
-            trial_types.append('unknown')
-        elif '0-Back' in str(block_type) or '0Back' in str(block_type):
-            trial_types.append('0back')
-        elif '2-Back' in str(block_type) or '2Back' in str(block_type):
-            trial_types.append('2back')
+
+def determine_trial_types_fixed(data: pd.DataFrame) -> List[str]:
+    """Map BlockType column entries to '0back' / '2back' / 'unknown'."""
+    result = []
+    for bt in data['BlockType'].values:
+        if pd.isna(bt):
+            result.append('unknown')
+        elif '0-Back' in str(bt) or '0Back' in str(bt):
+            result.append('0back')
+        elif '2-Back' in str(bt) or '2Back' in str(bt):
+            result.append('2back')
         else:
-            trial_types.append('unknown')
-    return trial_types
+            result.append('unknown')
+    return result
 
-def extract_block_numbers(data):
+
+def extract_block_numbers(data: pd.DataFrame) -> List[int]:
     """Extract block numbers from BlockNumber column."""
-    
-    block_numbers = data['BlockNumber'].values
-    return [int(num) if not pd.isna(num) else -1 for num in block_numbers]
+    return [
+        int(n) if not pd.isna(n) else -1
+        for n in data['BlockNumber'].values
+    ]
 
-def split_hcpd_string(s):
-    """Split string by inserting underscores before V and M."""
+
+def split_hcpd_string(s: str) -> str:
+    """Insert underscores before 'V' and 'M' in HCP-D subject IDs.
+
+    e.g. 'HCD0001305V1MR' -> 'HCD0001305_V1_MR'
+    """
     return re.sub(r'([VM])', r'_\1', s)
-

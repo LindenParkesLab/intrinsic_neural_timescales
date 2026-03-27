@@ -1,0 +1,20 @@
+name: HCP-D
+paths:
+  base: /mnt/lindenmp_bignas/lindenmp/research_data/HCP_D
+  rawdata_subdir: processed
+  derivatives_subdir: derivatives
+modalities:
+  MRI3T:
+    tr: 0.80
+    data_subdir: parcellated_data
+    dir_template: "sub-{subject_id}/ses-{session}/func"
+    filename_template: "sub-{subject_id}_ses-{session}_task-{task}_space-{space}_seg-{seg}_stat-mean_timeseries{ext}"
+    file_ext: .ptseries.nii
+    task_events_handler: hcp_fmri
+behavior:
+  handler: hcp_d_socdem
+rbc: false
+# Subject IDs stored without underscores (e.g. HCD0001305V1MR), but the rawdata
+# directory uses the underscore form (HCD0001305_V1_MR). The split_hcpd transform
+# is applied when constructing rawdata paths for task event lookup.
+subject_id_rawdata_transform: split_hcpd

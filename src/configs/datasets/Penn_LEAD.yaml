@@ -1,0 +1,19 @@
+name: Penn_LEAD
+paths:
+  base: /mnt/lindenmp_bignas/lindenmp/research_data/Penn_LEAD
+  rawdata_subdir: bids
+  derivatives_subdir: derivatives
+modalities:
+  MRI3T:
+    tr: 0.8
+    data_subdir: xcpd
+    dir_template: "sub-{subject_id}/ses-{session}/func"
+    filename_template: "sub-{subject_id}_ses-{session}_task-{task}_run-01_space-{space}_seg-{seg}_stat-mean_timeseries{ext}"
+    file_ext: .tsv
+    task_events_handler: bids_tsv
+    task_events_file_template: "sub-{subject_id}_ses-{session}_task-{task}_run-01_events.tsv"
+    task_events_use_glob: false
+behavior:
+  handler: penn_lead
+rbc: false
+subject_id_rawdata_transform: null
