@@ -15,6 +15,92 @@ from joblib import Parallel, delayed
 from scipy.optimize import curve_fit, OptimizeWarning
 
 from src.data import DataLoader, ScanInfo, parse_scan_string, build_scan_string
+import logging
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Timescale method registry
+# Each entry is a callable: (acf: np.ndarray, tr: float, **kwargs) -> np.ndarray
+# Add new methods here without touching Timescales.compute_timescale_measures.
+# ---------------------------------------------------------------------------
+
+def _ts_method_zero_crossing(acf, tr, inst, **kw):
+    return inst._compute_zero_crossing(acf) * tr
+
+def _ts_method_zero_crossing_robust_nc2(acf, tr, inst, **kw):
+    return inst._compute_zero_crossing_robust(acf, n_crossings=2) * tr
+
+def _ts_method_auc_zero_crossing(acf, tr, inst, **kw):
+    return inst._compute_auc(acf, threshold=0.0) * tr
+
+def _ts_method_auc_half_crossing(acf, tr, inst, **kw):
+    return inst._compute_auc(acf, threshold=0.5) * tr
+
+def _ts_method_decay_time_half(acf, tr, inst, **kw):
+    return inst._compute_decay_time(acf, tr=tr, threshold=0.5)
+
+def _ts_method_lag_one(acf, tr, inst, **kw):
+    return acf[:, 1]
+
+def _ts_method_tau(acf, tr, inst, **kw):
+    return inst._compute_tau_from_acf(acf, tr=tr, version='loglin')
+
+def _ts_method_tau_howell(acf, tr, inst, **kw):
+    return inst._compute_tau_from_acf(acf, tr=tr, version='howell')
+
+def _ts_method_tau_murray_par(acf, tr, inst, **kw):
+    tau, _ = inst._compute_tau_murray_parallel(acf, tr=tr, n_jobs=-1)
+    return tau
+
+def _ts_method_B_murray_par(acf, tr, inst, **kw):
+    _, B = inst._compute_tau_murray_parallel(acf, tr=tr, n_jobs=-1)
+    return B
+
+def _ts_method_B_murray_par_lag3mins(acf, tr, inst, **kw):
+    n_tp = int(3 * 60 / tr)
+    _, B = inst._compute_tau_murray_parallel(acf[:, :n_tp], tr=tr, n_jobs=int(os.cpu_count() / 2))
+    return B
+
+def _ts_method_B_murray_par_lag4mins(acf, tr, inst, **kw):
+    n_tp = int(4 * 60 / tr)
+    _, B = inst._compute_tau_murray_parallel(acf[:, :n_tp], tr=tr, n_jobs=int(os.cpu_count() / 2))
+    return B
+
+def _ts_method_B_murray_par_lag5mins(acf, tr, inst, **kw):
+    n_tp = int(5 * 60 / tr)
+    _, B = inst._compute_tau_murray_parallel(acf[:, :n_tp], tr=tr, n_jobs=int(os.cpu_count() / 2))
+    return B
+
+def _ts_method_exponential_tau(acf, tr, inst, **kw):
+    n_lags = acf.shape[1]
+    lags = np.arange(n_lags) * tr
+    tau = np.full(acf.shape[0], np.nan)
+    for i in range(acf.shape[0]):
+        try:
+            result = fit_exponential_decay(lags, acf[i])
+            if result['success']:
+                tau[i] = result['tau']
+        except Exception:
+            pass
+    return tau
+
+TIMESCALE_METHODS = {
+    'zero_crossing':              _ts_method_zero_crossing,
+    'zero_crossing_robust_nc2':   _ts_method_zero_crossing_robust_nc2,
+    'auc_zero_crossing':          _ts_method_auc_zero_crossing,
+    'auc_half_crossing':          _ts_method_auc_half_crossing,
+    'decay_time_half':            _ts_method_decay_time_half,
+    'lag_one':                    _ts_method_lag_one,
+    'tau':                        _ts_method_tau,
+    'tau_howell':                 _ts_method_tau_howell,
+    'tau_murray_par':             _ts_method_tau_murray_par,
+    'B_murray_par':               _ts_method_B_murray_par,
+    'B_murray_par_lag3mins':      _ts_method_B_murray_par_lag3mins,
+    'B_murray_par_lag4mins':      _ts_method_B_murray_par_lag4mins,
+    'B_murray_par_lag5mins':      _ts_method_B_murray_par_lag5mins,
+    'exponential_tau':            _ts_method_exponential_tau,
+}
+
 
 class Timescales(DataLoader):
     def __init__(
@@ -155,7 +241,7 @@ class Timescales(DataLoader):
             elif filepath.suffix == '.txt':
                 return np.loadtxt(filepath)
         except Exception as e:
-            print(f"Warning: Could not load {filepath}: {e}")
+            logger.warning("Could not load %s: %s", filepath, e)
             return None
 
     def _check_output_exists(
@@ -175,7 +261,7 @@ class Timescales(DataLoader):
                 modality=modality,
                 seg=seg,
                 suffix=suffix,
-                moad='load'
+                mode='load'
             )
             if filepath.exists():
                 return True
@@ -194,6 +280,102 @@ class Timescales(DataLoader):
         return parse_scan_string(scan_key)
 
     # ============== Computation Methods ==============
+    def _run_for_all_scans(
+        self,
+        compute_fn,
+        output_type: str,
+        use_residuals: bool = False,
+        force_recompute: bool = False,
+        save_outputs: bool = True,
+        verbose: bool = True,
+    ) -> dict:
+        """
+        Shared iteration loop for all per-scan compute methods.
+
+        For each scan in self.scans:
+          1. Try to load from cache (unless force_recompute).
+          2. If not cached, call compute_fn(timeseries_scan, kv_dict) → result.
+          3. Optionally save the result.
+
+        Parameters
+        ----------
+        compute_fn : callable
+            Signature: (timeseries_scan: np.ndarray, kv_dict: dict) -> np.ndarray
+            Should raise on failure; exceptions are caught here and logged.
+        output_type : str
+            Used for cache file naming and logging.
+        use_residuals : bool
+            If True and condition == 'task', use self.timeseries_residuals instead
+            of self.timeseries_data.
+        force_recompute : bool
+            Skip cache lookup if True.
+        save_outputs : bool
+            Persist results to disk if True.
+        verbose : bool
+            Print summary counts when True.
+
+        Returns
+        -------
+        dict mapping scan_key -> result array (or None on failure)
+        """
+        results = dict.fromkeys(self.scans)
+        n_loaded = n_computed = n_failed = 0
+
+        for scan_key in tqdm(self.scans, desc=f"Computing {output_type}"):
+            kv_dict = self._parse_scan_string(scan_key)
+            subject_id = kv_dict.get('sub', '')
+            modality   = kv_dict.get('modality', '')
+            condition  = kv_dict.get('condition', '')
+            task       = kv_dict.get('task', '')
+            seg        = kv_dict.get('seg', '')
+            tr         = kv_dict.get('tr', '')
+
+            if not force_recompute:
+                cached = self._load_subject_output(
+                    subject_id=subject_id, output_type=output_type,
+                    task=task, modality=modality, seg=seg,
+                )
+                if cached is not None:
+                    results[scan_key] = cached
+                    n_loaded += 1
+                    continue
+
+            try:
+                if use_residuals and condition == 'task':
+                    timeseries_scan = self.timeseries_residuals[scan_key]
+                else:
+                    timeseries_scan = self.timeseries_data[scan_key]
+
+                result = compute_fn(timeseries_scan, kv_dict)
+                results[scan_key] = result
+                n_computed += 1
+
+                if save_outputs:
+                    self._save_subject_output(
+                        data=result,
+                        subject_id=subject_id,
+                        output_type=output_type,
+                        task=task,
+                        modality=modality,
+                        seg=seg,
+                        metadata={'output_type': output_type, 'tr': tr, 'modality': modality,
+                                  'dataset': self.dataset},
+                    )
+            except Exception as e:
+                logger.warning("Failed to compute %s for %s: %s", output_type, scan_key, e)
+                results[scan_key] = None
+                n_failed += 1
+
+        if verbose:
+            print(f"\n{output_type} computation complete:")
+            print(f"  Loaded from cache: {n_loaded}")
+            print(f"  Newly computed:    {n_computed}")
+            if n_failed:
+                print(f"  Failed:            {n_failed}")
+            print(f"  Total:             {len(self.scans)}")
+
+        return results
+
     def compute_autocorrelation_function(
         self,
         use_fft: bool = False,
@@ -202,103 +384,31 @@ class Timescales(DataLoader):
         suffix: str = None,
         use_residuals: bool = False,
         lowpass_cutoff: float = None,
-        verbose: bool = True
+        verbose: bool = True,
     ):
-        """
-        Compute autocorrelation function for all scans with caching.
-        
-        """
-        autocorr_dict = dict.fromkeys(self.scans)
-        
-        # Track what was loaded vs computed
-        n_loaded = 0
-        n_computed = 0
-        n_failed = 0
-        if lowpass_cutoff is None:
-            output_type = 'autocorr'
-        else:
+        output_type = 'autocorr'
+        if lowpass_cutoff is not None:
             output_type = f'autocorr_lp-{lowpass_cutoff}hz'
         if suffix:
             output_type = f'{output_type}_{suffix}'
         if use_residuals:
-            output_type = output_type + '_resids'
+            output_type = f'{output_type}_resids'
 
-        # Process each scan
-        for scan_key in tqdm(self.scans, desc="Computing autocorrelation"):
-            # Parse scan key using key-value format
-            kv_dict = self._parse_scan_string(scan_key)
-            
-            subject_id = kv_dict.get('sub', '')
-            modality = kv_dict.get('modality', '')
-            condition = kv_dict.get('condition', '')
-            task = kv_dict.get('task', '')
-            seg = kv_dict.get('seg', '')
-            tr = kv_dict.get('tr', '')
-            
-            # Check for existing output
-            if not force_recompute:
-                loaded_acf = self._load_subject_output(
-                    subject_id=subject_id,
-                    output_type=output_type,
-                    task=task,
-                    modality=modality,
-                    seg=seg
-                )
-                
-                if loaded_acf is not None:
-                    autocorr_dict[scan_key] = loaded_acf
-                    n_loaded += 1
-                    continue
-            
-            # Compute autocorrelation
-            try:
-                if use_residuals and condition == 'task':
-                    # print('Using residuals...')
-                    timeseries_scan = self.timeseries_residuals[scan_key]
-                else:
-                    timeseries_scan = self.timeseries_data[scan_key]
+        def _compute(timeseries_scan, kv_dict):
+            ts = timeseries_scan
+            if lowpass_cutoff is not None:
+                tr = kv_dict.get('tr', 1.0)
+                ts = apply_lowpass_filter(ts, 1 / tr, lowpass_cutoff)
+            return compute_acf(ts, use_fft=use_fft)
 
-                if lowpass_cutoff is not None:
-                    sampling_freq = 1 / tr
-                    timeseries_scan = apply_lowpass_filter(timeseries_scan, sampling_freq, lowpass_cutoff)
-                acf_result = compute_acf(timeseries_scan, use_fft=use_fft)
-
-                autocorr_dict[scan_key] = acf_result
-                n_computed += 1
-                
-                # Save output if requested
-                if save_outputs:
-                    self._save_subject_output(
-                        data=acf_result,
-                        subject_id=subject_id,
-                        output_type=output_type,
-                        task=task,
-                        modality=modality,
-                        seg=seg,
-                        metadata={
-                            'use_fft': use_fft,
-                            'lowpass_cutoff': lowpass_cutoff,
-                            'tr': tr,
-                            'modality': modality,
-                            'dataset': self.dataset
-                        }
-                    )
-            
-            except Exception as e:
-                print(f"Warning: Failed to compute autocorrelation for {scan_key}: {e}")
-                autocorr_dict[scan_key] = None
-                n_failed += 1
-        
-        # Store results
-        self.autocorr_dict = autocorr_dict
-        
-        if verbose:
-            print(f"\nAutocorrelation computation complete:")
-            print(f"  Loaded from cache: {n_loaded}")
-            print(f"  Newly computed: {n_computed}")
-            if n_failed > 0:
-                print(f"  Failed: {n_failed}")
-            print(f"  Total: {len(self.scans)}")
+        self.autocorr_dict = self._run_for_all_scans(
+            compute_fn=_compute,
+            output_type=output_type,
+            use_residuals=use_residuals,
+            force_recompute=force_recompute,
+            save_outputs=save_outputs,
+            verbose=verbose,
+        )
 
     def compute_timescale_measures(
         self,
@@ -309,151 +419,80 @@ class Timescales(DataLoader):
         use_residuals: bool = False,
         verbose: bool = True
     ) -> Dict[str, Any]:
-        """
-        Compute timescale measures from autocorrelation functions.
-        
-        Args:
-            method: Method to use ('zero_crossing', 'auc', 'decay_time')
-            force_recompute: Force recomputation even if saved
-            save_outputs: Save computed outputs
-            verbose: Print progress
-        
-        Returns:
-            Dictionary of timescale measures for each scan
-        """
+        """Compute timescale measures from autocorrelation functions."""
         if not hasattr(self, 'autocorr_dict') or self.autocorr_dict is None:
             raise ValueError("Must compute autocorrelation first")
-        
-        timescales_dict = {}
-        if method == 'exponential_tau':
-            tau_fit_infos = {}
-        n_loaded = 0
-        n_computed = 0
+
+        if method not in TIMESCALE_METHODS:
+            raise ValueError(
+                f"Unknown timescale method '{method}'. "
+                f"Available: {list(TIMESCALE_METHODS)}"
+            )
+        method_fn = TIMESCALE_METHODS[method]
+
         output_type = f'timescale_{method}'
         if suffix:
             output_type = f'{output_type}_{suffix}'
-        
+
+        # compute_timescale_measures keeps its own loop (rather than using
+        # _run_for_all_scans) because it needs to look up autocorr_dict by
+        # scan_key rather than using timeseries_data/timeseries_residuals.
+        results = dict.fromkeys(self.scans)
+        n_loaded = n_computed = n_failed = 0
+
         for scan_key in tqdm(self.scans, desc=f"Computing {method} timescales"):
-            # Parse scan key
             kv_dict = self._parse_scan_string(scan_key)
-            
             subject_id = kv_dict.get('sub', '')
-            modality = kv_dict.get('modality', '')
-            condition = kv_dict.get('condition', '')
-            task = kv_dict.get('task', '')
-            seg = kv_dict.get('seg', '')
-            tr = kv_dict.get('tr', '')
-            
-            # Check for existing output
+            modality   = kv_dict.get('modality', '')
+            task       = kv_dict.get('task', '')
+            seg        = kv_dict.get('seg', '')
+            tr         = kv_dict.get('tr', '')
+
             if not force_recompute:
-                loaded_timescales = self._load_subject_output(
-                    subject_id=subject_id,
-                    output_type=output_type,
-                    task=task,
-                    modality=modality,
-                    seg=seg
+                cached = self._load_subject_output(
+                    subject_id=subject_id, output_type=output_type,
+                    task=task, modality=modality, seg=seg,
                 )
-                
-                if loaded_timescales is not None:
-                    timescales_dict[scan_key] = loaded_timescales
+                if cached is not None:
+                    results[scan_key] = cached
                     n_loaded += 1
                     continue
-            
-            # Compute timescale measure
-            if self.autocorr_dict.get(scan_key) is None:
-                timescales_dict[scan_key] = None
+
+            acf = self.autocorr_dict.get(scan_key)
+            if acf is None:
+                results[scan_key] = None
                 continue
-                
-            acf = self.autocorr_dict[scan_key]
-            
+
             try:
-                if method == 'zero_crossing':
-                    # Find first zero crossing for each parcel
-                    timescales = self._compute_zero_crossing(acf) * tr
-                elif method == 'zero_crossing_robust_nc2':
-                    # Find first zero crossing for each parcel (robust)
-                    timescales = self._compute_zero_crossing_robust(acf, n_crossings=2) * tr
-                elif method == 'auc_zero_crossing':
-                    # Area under curve
-                    timescales = self._compute_auc(acf) * tr
-                elif method == 'auc_half_crossing':
-                    # Area under curve
-                    threshold = 0.5
-                    timescales = self._compute_auc(acf, tr, threshold=threshold)
-                elif method == 'decay_time_1e':
-                    # Time to decay to 1/e
-                    threshold = 1 / np.e
-                    timescales = self._compute_decay_time(acf, tr, threshold=threshold)
-                elif method == 'decay_time_half':
-                    # Time to decay to 0.5
-                    threshold = 0.5
-                    timescales = self._compute_decay_time(acf, tr, threshold=threshold)
-                elif method == 'lag_one':
-                    timescales = acf[:, 1]
-                elif method == 'tau':
-                    # Compute tau for each parcel
-                    timescales = self._compute_tau_from_acf(acf, tr, version='loglin')
-                elif method == 'tau_howell':
-                    # Compute tau for each parcel
-                    timescales = self._compute_tau_from_acf(acf, tr, version='howell')
-                elif method == 'tau_murray':
-                    # Compute tau for each parcel using Murray et al. 2014
-                    timescales, _ = self._compute_tau_from_acf(acf, tr, version='murray')
-                elif method == 'B_murray':
-                    # Compute B for each parcel using Murray et al. 2014
-                    _, timescales = self._compute_tau_from_acf(acf, tr, version='murray')
-                elif method == 'tau_murray_par':
-                    # Compute tau for each parcel using Murray et al. 2014
-                    timescales, _ = self._compute_tau_murray_parallel(acf, tr, int(os.cpu_count() / 2))
-                elif method == 'B_murray_par':
-                    # Compute B for each parcel using Murray et al. 2014
-                    _, timescales = self._compute_tau_murray_parallel(acf, tr, int(os.cpu_count() / 2))
-                elif method == 'B_murray_par_lag3mins':
-                    # Compute B for each parcel using Murray et al. 2014
-                    n_seconds = int(3 * 60)
-                    n_timepoints = int(n_seconds / tr)
-                    _, timescales = self._compute_tau_murray_parallel(acf[:, :n_timepoints], tr, int(os.cpu_count() / 2))
-                elif method == 'B_murray_par_lag4mins':
-                    # Compute B for each parcel using Murray et al. 2014
-                    n_seconds = int(4 * 60)
-                    n_timepoints = int(n_seconds / tr)
-                    _, timescales = self._compute_tau_murray_parallel(acf[:, :n_timepoints], tr, int(os.cpu_count() / 2))
-                elif method == 'B_murray_par_lag5mins':
-                    # Compute B for each parcel using Murray et al. 2014
-                    n_seconds = int(5 * 60)
-                    n_timepoints = int(n_seconds / tr)
-                    _, timescales = self._compute_tau_murray_parallel(acf[:, :n_timepoints], tr, int(os.cpu_count() / 2))
-                else:
-                    raise ValueError(f"Unknown method: {method}")
-                
-                timescales_dict[scan_key] = timescales
+                tr_float = float(tr) if tr else 1.0
+                result = method_fn(acf, tr_float, inst=self)
+                results[scan_key] = result
                 n_computed += 1
-                
-                # Save output
+
                 if save_outputs:
                     self._save_subject_output(
-                        data=timescales,
+                        data=result,
                         subject_id=subject_id,
                         output_type=output_type,
                         task=task,
                         modality=modality,
                         seg=seg,
-                        metadata={'method': method, 'tr': tr}
+                        metadata={'method': method, 'tr': tr},
                     )
-                    
             except Exception as e:
-                print(f"Warning: Failed to compute {method} for {scan_key}: {e}")
-                timescales_dict[scan_key] = None
+                logger.warning("Failed to compute %s for %s: %s", method, scan_key, e)
+                results[scan_key] = None
+                n_failed += 1
 
-        self.timescales_dict = timescales_dict
-        if method == 'exponential_tau':
-            self.tau_fit_infos = tau_fit_infos
+        self.timescales_dict = results
 
         if verbose:
             print(f"\n{method} timescale computation complete:")
             print(f"  Loaded from cache: {n_loaded}")
-            print(f"  Newly computed: {n_computed}")
-            print(f"  Total: {len(self.scans)}")
+            print(f"  Newly computed:    {n_computed}")
+            if n_failed:
+                print(f"  Failed:            {n_failed}")
+            print(f"  Total:             {len(self.scans)}")
 
     def compute_timeseries_measures(
         self,
@@ -461,104 +500,31 @@ class Timescales(DataLoader):
         force_recompute: bool = False,
         save_outputs: bool = True,
         use_residuals: bool = False,
-        verbose: bool = True
+        verbose: bool = True,
     ):
-        """
-        Compute temporal signal-to-noise ratio (tSNR) for all scans with caching.
-        
-        Parameters:
-        -----------
-        force_recompute : bool, default=False
-            If True, recompute even if cached results exist
-        save_outputs : bool, default=True
-            If True, save computed results to disk
-        verbose : bool, default=True
-            If True, print progress information
-        """
-        data_dict = dict.fromkeys(self.scans)
-        
-        # Track what was loaded vs computed
-        n_loaded = 0
-        n_computed = 0
-        n_failed = 0
         output_type = f'metric_{method}'
         if use_residuals:
-            output_type = output_type + '_resids'
+            output_type = f'{output_type}_resids'
 
-        # Process each scan
-        for scan_key in tqdm(self.scans, desc=f"Computing {method}"):
-            # Parse scan key using key-value format
-            kv_dict = self._parse_scan_string(scan_key)
-            
-            subject_id = kv_dict.get('sub', '')
-            modality = kv_dict.get('modality', '')
-            condition = kv_dict.get('condition', '')
-            task = kv_dict.get('task', '')
-            seg = kv_dict.get('seg', '')
-            tr = kv_dict.get('tr', '')
-            
-            # Check for existing output
-            if not force_recompute:
-                loaded_metric = self._load_subject_output(
-                    subject_id=subject_id,
-                    output_type=output_type,
-                    task=task,
-                    modality=modality,
-                    seg=seg
-                )
-                
-                if loaded_metric is not None:
-                    data_dict[scan_key] = loaded_metric
-                    n_loaded += 1
-                    continue
-            
-            # Compute timeseries measure
-            try:
-                if use_residuals and condition == 'task':
-                    # print('Using residuals...')
-                    timeseries_scan = self.timeseries_residuals[scan_key]
-                else:
-                    timeseries_scan = self.timeseries_data[scan_key]
+        _METRIC_FNS = {
+            'tsnr': calculate_tsnr,
+            'var':  lambda ts: np.var(ts, axis=1),
+        }
+        if method not in _METRIC_FNS:
+            raise ValueError(f"Unknown method '{method}'. Available: {list(_METRIC_FNS)}")
+        metric_fn = _METRIC_FNS[method]
 
-                if method == 'tsnr':
-                    timeseries_result = calculate_tsnr(timeseries_scan)
-                elif method == 'var':
-                    timeseries_result = np.var(timeseries_scan, axis=1)
-                
-                data_dict[scan_key] = timeseries_result
-                n_computed += 1
-                
-                # Save output if requested
-                if save_outputs:
-                    self._save_subject_output(
-                        data=timeseries_result,
-                        subject_id=subject_id,
-                        output_type=output_type,
-                        task=task,
-                        modality=modality,
-                        seg=seg,
-                        metadata={
-                            'tr': tr,
-                            'modality': modality,
-                            'dataset': self.dataset
-                        }
-                    )
-            
-            except Exception as e:
-                print(f"Warning: Failed to compute tSNR for {scan_key}: {e}")
-                data_dict[scan_key] = None
-                n_failed += 1
-        
-        # Store results
-        self.data_dict = data_dict
-        
-        if verbose:
-            print(f"\n{method} computation complete:")
-            print(f"  Loaded from cache: {n_loaded}")
-            print(f"  Newly computed: {n_computed}")
-            if n_failed > 0:
-                print(f"  Failed: {n_failed}")
-            print(f"  Total: {len(self.scans)}")
+        def _compute(timeseries_scan, kv_dict):
+            return metric_fn(timeseries_scan)
+
+        self.data_dict = self._run_for_all_scans(
+            compute_fn=_compute,
+            output_type=output_type,
+            use_residuals=use_residuals,
+            force_recompute=force_recompute,
+            save_outputs=save_outputs,
+            verbose=verbose,
+        )
 
     # ============== Timescale Computation Methods ==============
     def _compute_zero_crossing(self, acf: np.ndarray) -> np.ndarray:
@@ -646,7 +612,7 @@ class Timescales(DataLoader):
 
                 # auc[i] = np.trapezoid(acf[i, :max_lag_i], dx=tr)
                 auc[i] = np.sum(acf[i, :max_lag_i])
-            except:
+            except Exception:
                 auc[i] = np.nan
         
         return auc
@@ -695,7 +661,7 @@ class Timescales(DataLoader):
                             tau[i], A, B[i] = fit_tau_murray(acf[i], delta=tr)
                     else:
                         tau[i], A, B[i] = fit_tau_murray(acf[i], delta=tr)
-            except:
+            except Exception:
                 tau[i] = np.nan
                 B[i] = np.nan
 
@@ -797,7 +763,7 @@ class Timescales(DataLoader):
                                                                       hrf_model=hrf_model, drift_model=drift_model
                                                                       )
                     task_events_acf[scan_key] = compute_acf(design_matrix_flat['trial'].values)
-                except:
+                except Exception:
                     timeseries_residuals[scan_key] = None
                     task_events[scan_key] = None
                     design_matrices[scan_key] = None
@@ -1657,7 +1623,7 @@ def filter_data_dict(data_dict, data_dict_residuals=None, remove_subject_level=T
             if 'condition-task' in scan_key:
                 try:
                     data_dict[scan_key] = data_dict_residuals[scan_key].copy()
-                except:
+                except Exception:
                     if remove_subject_level:
                         sub_key = scan_key.split('_')[0]
                         remove_these_keys.append([k for k in data_dict.keys() if sub_key in k])
@@ -1677,252 +1643,148 @@ def filter_data_dict(data_dict, data_dict_residuals=None, remove_subject_level=T
     else:
         return data_dict, data_dict_residuals
 
-def create_ints_dataframe_custom_grouping(data_dict, n_regions=400,
-                                          average_3t_rest=False, average_7t_rest=False, average_all_rest=False, 
-                                          average_7t_movies=False,
-                                          average_3t_task_pairs=False, average_3t_tasks=False, 
-                                          average_meg_rest=False, average_meg_task=False,
-                                          sort_by_median=False):
+def _apply_scan_groupings(
+    data_dict: dict,
+    average_3t_rest: bool = False,
+    average_7t_rest: bool = False,
+    average_all_rest: bool = False,
+    average_7t_movies: bool = False,
+    average_3t_task_pairs: bool = False,
+    average_3t_tasks: bool = False,
+    average_meg_rest: bool = False,
+    average_meg_task: bool = False,
+) -> dict:
     """
-    Create a dataframe with brain regions as indices and unique scans as columns.
-    Groups scans by scan type only (ignoring subject, modality, condition, atlas).
-    Values represent INTs averaged over subjects for each scan type.
-    
-    Parameters:
-    -----------
-    data_dict : dict
-        Dictionary where keys are scan strings like 
-        'sub-100307_modality-MEG_condition-rest_scan-3Restin_atlas-Schaefer4007'
-        and values are vectors of INTs (one per brain region)
-    n_regions : int, default 400
-        Number of brain regions
-    average_3t_rest : bool, default False
-        If True, average 3T rest scans (rfMRIREST1LR, rfMRIREST1RL, etc.) into "REST_3T"
-        Cannot be True if average_all_rest is True
-    average_3t_task_pairs : bool, default False
-        If True, average 3T task LR/RL pairs (e.g., tfMRIWMLR + tfMRIWMRL)
-        Cannot be True if average_3t_tasks is True
-    average_3t_tasks : bool, default False
-        If True, average ALL 3T task scans (all tfMRI scans except 7T movies) into "Tasks"
-        Cannot be True if average_3t_task_pairs is True
-    average_7t_rest : bool, default False
-        If True, average 7T rest scans (rfMRIREST17TPA, rfMRIREST27TAP, etc.) into "REST_7T"
-        Cannot be True if average_all_rest is True
-    average_7t_movies : bool, default False
-        If True, average 7T movie scans (tfMRIMOVIE17TAP, tfMRIMOVIE27TPA, etc.) into "Movies"
-    average_all_rest : bool, default False
-        If True, average ALL rest scans (both 3T and 7T) into "Rest"
-        Cannot be True if average_3t_rest or average_7t_rest is True
-    sort_by_median : bool, default False
-        If True, sort columns by their median INT values in descending order
-    
-    Returns:
-    --------
-    df_ints : pd.DataFrame
-        DataFrame with brain regions as index and unique scan types as columns.
-        Values are INTs averaged across subjects for each scan type.
+    Apply scan-grouping/averaging logic to a data_dict.
+
+    All keys in data_dict are expected to be scan-key strings; values are
+    1-D arrays of shape (n_regions,).  Returns a new dict with the same
+    structure after the requested averaging operations are applied.
+
+    Raises ValueError on mutually-exclusive flag combinations.
     """
-    
-    # Check for mutually exclusive options
+    if average_3t_rest and average_all_rest:
+        raise ValueError("average_3t_rest and average_all_rest are mutually exclusive")
+    if average_7t_rest and average_all_rest:
+        raise ValueError("average_7t_rest and average_all_rest are mutually exclusive")
     if average_3t_task_pairs and average_3t_tasks:
-        raise ValueError("average_3t_task_pairs and average_3t_tasks cannot both be True")
-    
-    if average_all_rest and (average_3t_rest or average_7t_rest):
-        raise ValueError("average_all_rest cannot be True if average_3t_rest or average_7t_rest is True")
-    
-    def extract_scan_name(scan_key):
-        """Extract just the scan part from a full scan key."""
-        parts = scan_key.split('_')
-        for part in parts:
-            if part.startswith('task-'):
-                return part
-        return None
-    
-    # Group scans by scan type only
-    scan_groups = defaultdict(list)
-    
-    for scan_key, ints_vector in data_dict.items():
-        scan_name = extract_scan_name(scan_key)
-        if scan_name:
-            scan_groups[scan_name].append(ints_vector)
-    
-    # Check that all vectors have the expected length
-    for scan_key, ints_vector in data_dict.items():
-        if len(ints_vector) != n_regions:
-            raise ValueError(f"Expected {n_regions} regions, but scan {scan_key} has {len(ints_vector)} values")
-    
-    # Calculate mean INTs for each scan type across subjects
-    averaged_data = {}
-    
-    for scan_name, vectors_list in scan_groups.items():
-        if len(vectors_list) > 0:
-            stacked_vectors = np.stack(vectors_list, axis=0)
-            mean_vector = np.nanmean(stacked_vectors, axis=0)
-            # mean_vector = np.nanmedian(stacked_vectors, axis=0)
-            averaged_data[scan_name] = mean_vector
-            
-            print(f"Scan: {scan_name}")
-            print(f"  Number of subjects: {len(vectors_list)}")
-            print(f"  Mean INT range: [{mean_vector.min():.3f}, {mean_vector.max():.3f}]")
-    
-    # Apply optional scan averaging
-    if average_7t_rest or average_7t_movies or average_3t_rest or average_3t_task_pairs or average_3t_tasks or average_all_rest or average_meg_rest or average_meg_task:
-        print(f"\nApplying optional scan averaging...")
+        raise ValueError("average_3t_task_pairs and average_3t_tasks are mutually exclusive")
 
-    # Average ALL rest scans (3T and 7T)
-    if average_all_rest:
-        all_rest_scans = ['task-rfMRIREST1LR', 'task-rfMRIREST1RL', 'task-rfMRIREST2LR', 'task-rfMRIREST2RL',
-                          'task-rfMRIREST1AP', 'task-rfMRIREST1PA', 'task-rfMRIREST2AP', 'task-rfMRIREST2PA',
-                          'task-rfMRIREST17TPA', 'task-rfMRIREST27TAP', 'task-rfMRIREST37TPA', 'task-rfMRIREST47TAP']
-        all_rest_data = []
-        
-        for scan_name in list(averaged_data.keys()):
-            if scan_name in all_rest_scans:
-                all_rest_data.append(averaged_data[scan_name])
-                del averaged_data[scan_name]
-        
-        if all_rest_data:
-            all_rest_mean = np.nanmean(np.stack(all_rest_data, axis=0), axis=0)
-            averaged_data['Rest'] = all_rest_mean
-            print(f"  Averaged {len(all_rest_data)} rest scans (3T and 7T) into: Rest")
+    out = dict(data_dict)  # shallow copy — we replace keys, not mutate values
 
-    # Average 3T rest scans  
+    def _avg_group(keys_to_merge, new_key):
+        """Average a list of keys into new_key; remove originals."""
+        arrays = [out[k] for k in keys_to_merge if k in out and out[k] is not None]
+        if not arrays:
+            return
+        out[new_key] = np.nanmean(np.stack(arrays, axis=0), axis=0)
+        for k in keys_to_merge:
+            out.pop(k, None)
+
+    def _keys_matching(patterns):
+        return [k for k in list(out) if any(p in k for p in patterns)]
+
+    _3t_rest_tasks  = ['rfMRIREST1LR', 'rfMRIREST1RL', 'rfMRIREST2LR', 'rfMRIREST2RL']
+    _7t_rest_tasks  = ['rfMRIREST17TPA', 'rfMRIREST27TAP', 'rfMRIREST37TPA', 'rfMRIREST47TAP']
+    _7t_movie_tasks = ['tfMRIMOVIE17TAP', 'tfMRIMOVIE27TPA', 'tfMRIMOVIE37TPA', 'tfMRIMOVIE47TAP']
+    _3t_task_pairs  = [
+        (['tfMRIWMLR',          'tfMRIWMRL'],          'task-WM'),
+        (['tfMRIEMOTIONLR',     'tfMRIEMOTIONRL'],     'task-EMOTION'),
+        (['tfMRIGAMBLINGLR',    'tfMRIGAMBLINGRL'],    'task-GAMBLING'),
+        (['tfMRILANGUAGELR',    'tfMRILANGUAGERL'],    'task-LANGUAGE'),
+        (['tfMRIRELATIONALLR',  'tfMRIRELATIONALRL'],  'task-RELATIONAL'),
+        (['tfMRISOCIALLR',      'tfMRISOCIALRL'],      'task-SOCIAL'),
+    ]
+    _meg_rest_tasks = ['3Restin', '4Restin', '5Restin']
+    _meg_task_tasks = ['6Wrkmem', '7Wrkmem']
+
     if average_3t_rest:
-        rest_3t_scans = ['task-rfMRIREST1LR', 'task-rfMRIREST1RL', 'task-rfMRIREST2LR', 'task-rfMRIREST2RL',
-                         'task-rfMRIREST1AP', 'task-rfMRIREST1PA', 'task-rfMRIREST2AP', 'task-rfMRIREST2PA']
-        rest_3t_data = []
-        
-        for scan_name in list(averaged_data.keys()):
-            if scan_name in rest_3t_scans:
-                rest_3t_data.append(averaged_data[scan_name])
-                del averaged_data[scan_name]
-        
-        if rest_3t_data:
-            rest_3t_mean = np.nanmean(np.stack(rest_3t_data, axis=0), axis=0)
-            averaged_data['Rest-3T'] = rest_3t_mean
-            print(f"  Averaged {len(rest_3t_data)} 3T rest scans into: scan-REST3T")
-    
-    # Average ALL 3T task scans (excluding 7T movies)
-    if average_3t_tasks:
-        task_3t_data = []
-        
-        for scan_name in list(averaged_data.keys()):
-            if scan_name.startswith('task-tfMRI') and 'MOVIE' not in scan_name:
-                task_3t_data.append(averaged_data[scan_name])
-                del averaged_data[scan_name]
-        
-        if task_3t_data:
-            task_3t_mean = np.nanmean(np.stack(task_3t_data, axis=0), axis=0)
-            averaged_data['Tasks'] = task_3t_mean
-            print(f"  Averaged {len(task_3t_data)} 3T task scans into: Tasks")
-    
-    # Average 3T task LR/RL pairs
-    if average_3t_task_pairs:
-        task_pairs = {}
-        
-        for scan_name in list(averaged_data.keys()):
-            if scan_name.startswith('task-tfMRI') and (scan_name.endswith('LR') or scan_name.endswith('RL') or scan_name.endswith('AP') or scan_name.endswith('PA')):
-                # Get base task name (remove LR/RL/AP/PA)
-                base_task = scan_name[:-2]  # Remove last 2 characters
-                
-                if base_task not in task_pairs:
-                    task_pairs[base_task] = []
-                task_pairs[base_task].append((scan_name, averaged_data[scan_name]))
-        
-        # Average pairs and remove originals
-        for base_task, scan_list in task_pairs.items():
-            if len(scan_list) == 2:  # We have both LR and RL (or AP and PA)
-                vectors = [item[1] for item in scan_list]
-                pair_mean = np.nanmean(np.stack(vectors, axis=0), axis=0)
-                
-                # Remove original scans
-                for scan_name, _ in scan_list:
-                    del averaged_data[scan_name]
-                
-                # Create new scan name
-                new_scan_name = base_task  # base_task already includes 'task-'
-                averaged_data[new_scan_name] = pair_mean
-                print(f"  Averaged LR/RL pair for {base_task} into: {new_scan_name}")
-
-    # Average 7T rest scans
+        _avg_group(_keys_matching(_3t_rest_tasks), 'task-REST_3T')
     if average_7t_rest:
-        rest_7t_scans = ['task-rfMRIREST17TPA', 'task-rfMRIREST27TAP', 'task-rfMRIREST37TPA', 'task-rfMRIREST47TAP']
-        rest_7t_data = []
-        
-        for scan_name in list(averaged_data.keys()):
-            if scan_name in rest_7t_scans:
-                rest_7t_data.append(averaged_data[scan_name])
-                del averaged_data[scan_name]
-        
-        if rest_7t_data:
-            rest_7t_mean = np.nanmean(np.stack(rest_7t_data, axis=0), axis=0)
-            averaged_data['Rest-7T'] = rest_7t_mean
-            print(f"  Averaged {len(rest_7t_data)} 7T rest scans into: scan-REST7T")
-    
-    # Average 7T movie scans
+        _avg_group(_keys_matching(_7t_rest_tasks), 'task-REST_7T')
+    if average_all_rest:
+        _avg_group(_keys_matching(_3t_rest_tasks + _7t_rest_tasks), 'task-Rest')
     if average_7t_movies:
-        movie_7t_scans = ['task-tfMRIMOVIE17TAP', 'task-tfMRIMOVIE27TPA', 'task-tfMRIMOVIE37TPA', 'task-tfMRIMOVIE47TAP']
-        movie_7t_data = []
-        
-        for scan_name in list(averaged_data.keys()):
-            if scan_name in movie_7t_scans:
-                movie_7t_data.append(averaged_data[scan_name])
-                del averaged_data[scan_name]
-        
-        if movie_7t_data:
-            movie_7t_mean = np.nanmean(np.stack(movie_7t_data, axis=0), axis=0)
-            averaged_data['Movies'] = movie_7t_mean
-            print(f"  Averaged {len(movie_7t_data)} 7T movie scans into: Movies")
-            
-    # Average MEG rest scans
+        _avg_group(_keys_matching(_7t_movie_tasks), 'task-Movies')
+    if average_3t_task_pairs:
+        for task_names, new_key in _3t_task_pairs:
+            _avg_group(_keys_matching(task_names), new_key)
+    if average_3t_tasks:
+        all_3t_task_names = [t for pair, _ in _3t_task_pairs for t in pair]
+        _avg_group(_keys_matching(all_3t_task_names), 'task-Tasks')
     if average_meg_rest:
-        rest_meg_scans = ['task-3Restin', 'task-4Restin', 'task-5Restin']
-        rest_meg_data = []
-        
-        for scan_name in list(averaged_data.keys()):
-            if scan_name in rest_meg_scans:
-                rest_meg_data.append(averaged_data[scan_name])
-                del averaged_data[scan_name]
-        
-        if rest_meg_data:
-            rest_meg_mean = np.nanmean(np.stack(rest_meg_data, axis=0), axis=0)
-            averaged_data['Rest-MEG'] = rest_meg_mean
-            print(f"  Averaged {len(rest_meg_data)} MEG rest scans into: scan-RESTMEG")
-
-    # Average MEG task scans
+        _avg_group(_keys_matching(_meg_rest_tasks), 'task-MEG_Rest')
     if average_meg_task:
-        task_meg_scans = ['task-6Wrkmem', 'task-7Wrkmem']
-        task_meg_data = []
-        
-        for scan_name in list(averaged_data.keys()):
-            if scan_name in task_meg_scans:
-                task_meg_data.append(averaged_data[scan_name])
-                del averaged_data[scan_name]
-        
-        if task_meg_data:
-            task_meg_mean = np.nanmean(np.stack(task_meg_data, axis=0), axis=0)
-            averaged_data['Task-MEG'] = task_meg_mean
-            print(f"  Averaged {len(task_meg_data)} MEG task scans into: scan-TASKMEG")
+        _avg_group(_keys_matching(_meg_task_tasks), 'task-MEG_Task')
 
-    # Create DataFrame
-    df_ints = pd.DataFrame(averaged_data)
-    df_ints.index.name = 'brain_region'
-    df_ints.index = range(n_regions)
-    df_ints.columns = df_ints.columns.str.replace('task-', '', regex=False)
-    
-    # Sort columns by median if requested
+    return out
+
+
+def create_ints_dataframe_custom_grouping(
+    data_dict,
+    n_regions=400,
+    average_3t_rest=False,
+    average_7t_rest=False,
+    average_all_rest=False,
+    average_7t_movies=False,
+    average_3t_task_pairs=False,
+    average_3t_tasks=False,
+    average_meg_rest=False,
+    average_meg_task=False,
+    sort_by_median=False,
+):
+    """
+    Create a DataFrame (regions × scan-types) of mean INTs.
+
+    Parameters
+    ----------
+    data_dict : dict
+        scan_key → 1-D array of shape (n_regions,)
+    n_regions : int
+        Number of brain regions (used only to initialise the output DataFrame)
+    average_* : bool
+        Averaging flags — see _apply_scan_groupings for semantics.
+    sort_by_median : bool
+        Sort columns by descending median across regions.
+    """
+    def _extract_scan_name(scan_key):
+        """Return the task-entity value from a scan key string."""
+        for part in scan_key.split('_'):
+            if part.startswith('task-'):
+                return part[len('task-'):]
+        return scan_key
+
+    # Group by scan type (strip per-subject info), averaging across subjects
+    by_scan_type = defaultdict(list)
+    for scan_key, arr in data_dict.items():
+        if arr is not None:
+            by_scan_type[_extract_scan_name(scan_key)].append(arr)
+
+    scan_type_means = {
+        name: np.nanmean(np.stack(arrs, axis=0), axis=0)
+        for name, arrs in by_scan_type.items()
+    }
+
+    # Apply grouping/averaging
+    scan_type_means = _apply_scan_groupings(
+        scan_type_means,
+        average_3t_rest=average_3t_rest,
+        average_7t_rest=average_7t_rest,
+        average_all_rest=average_all_rest,
+        average_7t_movies=average_7t_movies,
+        average_3t_task_pairs=average_3t_task_pairs,
+        average_3t_tasks=average_3t_tasks,
+        average_meg_rest=average_meg_rest,
+        average_meg_task=average_meg_task,
+    )
+
+    df = pd.DataFrame(scan_type_means, index=range(n_regions))
+
     if sort_by_median:
-        column_summary_stat = df_ints.median(axis=0)
-        sorted_columns = column_summary_stat.sort_values(ascending=False).index
-        df_ints = df_ints[sorted_columns]
-        print(f"Sorted columns by median INT values (descending order)")
-    
-    print(f"\nCreated DataFrame with shape: {df_ints.shape}")
-    print(f"Brain regions (rows): {df_ints.shape[0]}")
-    print(f"Unique scan types (columns): {df_ints.shape[1]}")
-    print(f"Final scan types: {list(df_ints.columns)}")
-    
-    return df_ints
+        order = df.median(axis=0).sort_values(ascending=False).index
+        df = df[order]
+
+    return df
 
 def sort_and_group_timescales(timescales, brain_map, ntile=10):
     n_nodes = len(brain_map)
@@ -1958,221 +1820,31 @@ def convert_data_dict(data_dict, scan_registry, brain_map=None, verbose=True):
             
     return data_dict_converted
 
-def average_data_dict_converted(data_dict_converted, average_7t_rest=False, average_3t_rest=False, 
-                                average_3t_task_pairs=False, average_3t_tasks=False,
-                                average_7t_movies=False, average_all_rest=False,
-                                average_meg_rest=False, average_meg_task=False):
-    """
-    Apply scan averaging to a dictionary of scan data organized by brain systems.
-    
-    Parameters:
-    -----------
-    data_dict_converted : dict
-        Dictionary where keys are scan names (e.g., 'rfMRIREST1LR', 'tfMRIWMLR')
-        and values are arrays of shape (n_subjects, 10) where 10 corresponds to brain systems
-    average_7t_rest : bool, default False
-        If True, average 7T rest scans (rfMRIREST17TPA, rfMRIREST27TAP, etc.) into "REST_7T"
-        Cannot be True if average_all_rest is True
-    average_3t_rest : bool, default False
-        If True, average 3T rest scans (rfMRIREST1LR, rfMRIREST1RL, etc.) into "REST_3T"
-        Cannot be True if average_all_rest is True
-    average_3t_task_pairs : bool, default False
-        If True, average 3T task LR/RL pairs (e.g., tfMRIWMLR + tfMRIWMRL)
-        Cannot be True if average_3t_tasks is True
-    average_3t_tasks : bool, default False
-        If True, average ALL 3T task scans (all tfMRI scans except 7T movies) into "Tasks"
-        Cannot be True if average_3t_task_pairs is True
-    average_7t_movies : bool, default False
-        If True, average 7T movie scans (tfMRIMOVIE17TAP, tfMRIMOVIE27TPA, etc.) into "MOVIE"
-    average_all_rest : bool, default False
-        If True, average ALL rest scans (both 3T and 7T) into "Rest"
-        Cannot be True if average_3t_rest or average_7t_rest is True
-    average_meg_rest : bool, default False
-        If True, average MEG rest scans into "RESTMEG"
-    average_meg_task : bool, default False
-        If True, average MEG task scans into "TASKMEG"
-    
-    Returns:
-    --------
-    averaged_dict : dict
-        Dictionary with averaged scan data, same structure as input but with averaged scans
-    """
-    
-    # Check for mutually exclusive options
-    if average_3t_task_pairs and average_3t_tasks:
-        raise ValueError("average_3t_task_pairs and average_3t_tasks cannot both be True")
-    
-    if average_all_rest and (average_3t_rest or average_7t_rest):
-        raise ValueError("average_all_rest cannot be True if average_3t_rest or average_7t_rest is True")
-    
-    # Create a copy to avoid modifying the original
-    averaged_dict = data_dict_converted.copy()
-    
-    print("Applying scan averaging to centiles dictionary...")
-    
-    # 1. Average ALL rest scans (3T and 7T)
-    if average_all_rest:
-        all_rest_scans = ['rfMRIREST1LR', 'rfMRIREST1RL', 'rfMRIREST2LR', 'rfMRIREST2RL',
-                          'rfMRIREST1AP', 'rfMRIREST1PA', 'rfMRIREST2AP', 'rfMRIREST2PA',
-                          'rfMRIREST17TPA', 'rfMRIREST27TAP', 'rfMRIREST37TPA', 'rfMRIREST47TAP']
-        all_rest_data = []
-        
-        for scan_name in list(averaged_dict.keys()):
-            if scan_name in all_rest_scans:
-                all_rest_data.append(averaged_dict[scan_name])
-                del averaged_dict[scan_name]
-        
-        if all_rest_data:
-            all_rest_mean = np.nanmean(np.stack(all_rest_data, axis=0), axis=0)
-            averaged_dict['Rest'] = all_rest_mean
-            print(f"  Averaged {len(all_rest_data)} rest scans (3T and 7T) into: Rest")
-            print(f"    Shape: {all_rest_mean.shape}")
-    
-    # 2. Average 7T rest scans
-    if average_7t_rest:
-        rest_7t_scans = ['rfMRIREST17TPA', 'rfMRIREST27TAP', 'rfMRIREST37TPA', 'rfMRIREST47TAP']
-        rest_7t_data = []
-        
-        for scan_name in list(averaged_dict.keys()):
-            if scan_name in rest_7t_scans:
-                rest_7t_data.append(averaged_dict[scan_name])
-                del averaged_dict[scan_name]
-        
-        if rest_7t_data:
-            # Average across the different 7T rest scans (axis=0 combines scans)
-            rest_7t_mean = np.nanmean(np.stack(rest_7t_data, axis=0), axis=0)
-            averaged_dict['Rest-7T'] = rest_7t_mean
-            print(f"  Averaged {len(rest_7t_data)} 7T rest scans into: REST7T")
-            print(f"    Shape: {rest_7t_mean.shape}")
-    
-    # 3. Average 3T rest scans  
-    if average_3t_rest:
-        rest_3t_scans = ['rfMRIREST1LR', 'rfMRIREST1RL', 'rfMRIREST2LR', 'rfMRIREST2RL',
-                         'rfMRIREST1AP', 'rfMRIREST1PA', 'rfMRIREST2AP', 'rfMRIREST2PA']
-        rest_3t_data = []
-        
-        for scan_name in list(averaged_dict.keys()):
-            if scan_name in rest_3t_scans:
-                rest_3t_data.append(averaged_dict[scan_name])
-                del averaged_dict[scan_name]
-        
-        if rest_3t_data:
-            rest_3t_mean = np.nanmean(np.stack(rest_3t_data, axis=0), axis=0)
-            averaged_dict['Rest-3T'] = rest_3t_mean
-            print(f"  Averaged {len(rest_3t_data)} 3T rest scans into: REST3T")
-            print(f"    Shape: {rest_3t_mean.shape}")
-    
-    # 4. Average ALL 3T task scans (excluding 7T movies)
-    if average_3t_tasks:
-        task_3t_data = []
-        
-        for scan_name in list(averaged_dict.keys()):
-            if scan_name.startswith('tfMRI') and 'MOVIE' not in scan_name:
-                task_3t_data.append(averaged_dict[scan_name])
-                del averaged_dict[scan_name]
-        
-        if task_3t_data:
-            task_3t_mean = np.nanmean(np.stack(task_3t_data, axis=0), axis=0)
-            averaged_dict['Tasks'] = task_3t_mean
-            print(f"  Averaged {len(task_3t_data)} 3T task scans into: Tasks")
-            print(f"    Shape: {task_3t_mean.shape}")
-    
-    # 5. Average 3T task LR/RL pairs
-    if average_3t_task_pairs:
-        task_pairs = {}
-        
-        for scan_name in list(averaged_dict.keys()):
-            if scan_name.startswith('tfMRI') and (scan_name.endswith('LR') or scan_name.endswith('RL') or scan_name.endswith('AP') or scan_name.endswith('PA')):
-                # Get base task name (remove LR/RL/AP/PA)
-                base_task = scan_name[:-2]  # Remove last 2 characters
-                
-                if base_task not in task_pairs:
-                    task_pairs[base_task] = []
-                task_pairs[base_task].append((scan_name, averaged_dict[scan_name]))
-        
-        # Average pairs and remove originals
-        for base_task, scan_list in task_pairs.items():
-            if len(scan_list) == 2:  # We have both LR and RL (or AP and PA)
-                vectors = [item[1] for item in scan_list]
-                pair_mean = np.nanmean(np.stack(vectors, axis=0), axis=0)
-                
-                # Remove original scans
-                for scan_name, _ in scan_list:
-                    del averaged_dict[scan_name]
-                
-                # Create new scan name (remove tfMRI prefix for cleaner name)
-                new_scan_name = base_task.replace('tfMRI', '')  # e.g., 'tfMRIWM' -> 'WM'
-                averaged_dict[new_scan_name] = pair_mean
-                print(f"  Averaged LR/RL pair for {base_task} into: {new_scan_name}")
-                print(f"    Shape: {pair_mean.shape}")
-    
-    # 6. Average 7T movie scans
-    if average_7t_movies:
-        movie_7t_scans = ['tfMRIMOVIE17TAP', 'tfMRIMOVIE27TPA', 'tfMRIMOVIE37TPA', 'tfMRIMOVIE47TAP']
-        movie_7t_data = []
-        
-        for scan_name in list(averaged_dict.keys()):
-            if scan_name in movie_7t_scans:
-                movie_7t_data.append(averaged_dict[scan_name])
-                del averaged_dict[scan_name]
-        
-        if movie_7t_data:
-            movie_7t_mean = np.nanmean(np.stack(movie_7t_data, axis=0), axis=0)
-            averaged_dict['Movies'] = movie_7t_mean
-            print(f"  Averaged {len(movie_7t_data)} 7T movie scans into: Movies")
-            print(f"    Shape: {movie_7t_mean.shape}")
-    
-    # 7. Average MEG rest scans
-    if average_meg_rest:
-        rest_meg_scans = ['3Restin', '4Restin', '5Restin']
-        rest_meg_data = []
-        
-        for scan_name in list(averaged_dict.keys()):
-            if scan_name in rest_meg_scans:
-                rest_meg_data.append(averaged_dict[scan_name])
-                del averaged_dict[scan_name]
-        
-        if rest_meg_data:
-            rest_meg_mean = np.nanmean(np.stack(rest_meg_data, axis=0), axis=0)
-            averaged_dict['Rest-MEG'] = rest_meg_mean
-            print(f"  Averaged {len(rest_meg_data)} MEG rest scans into: RESTMEG")
-            print(f"    Shape: {rest_meg_mean.shape}")
-    
-    # 8. Average MEG task scans
-    if average_meg_task:
-        task_meg_scans = ['6Wrkmem', '7Wrkmem']
-        task_meg_data = []
-        
-        for scan_name in list(averaged_dict.keys()):
-            if scan_name in task_meg_scans:
-                task_meg_data.append(averaged_dict[scan_name])
-                del averaged_dict[scan_name]
-        
-        if task_meg_data:
-            task_meg_mean = np.nanmean(np.stack(task_meg_data, axis=0), axis=0)
-            averaged_dict['Task-MEG'] = task_meg_mean
-            print(f"  Averaged {len(task_meg_data)} MEG task scans into: TASKMEG")
-            print(f"    Shape: {task_meg_mean.shape}")
-    
-    # Print summary
-    print(f"\nFinal dictionary contains {len(averaged_dict)} scan types:")
-    for scan_name, data in averaged_dict.items():
-        print(f"  {scan_name}: {data.shape}")
-    
-    # Print summary of averaging operations
-    averaging_ops = []
-    if average_all_rest: averaging_ops.append("all rest")
-    if average_7t_rest: averaging_ops.append("7T rest")
-    if average_3t_rest: averaging_ops.append("3T rest")
-    if average_3t_tasks: averaging_ops.append("3T all tasks")
-    if average_3t_task_pairs: averaging_ops.append("3T task pairs")
-    if average_7t_movies: averaging_ops.append("7T movies")
-    if average_meg_rest: averaging_ops.append("MEG rest")
-    if average_meg_task: averaging_ops.append("MEG task")
-    
-    if averaging_ops:
-        print(f"\nApplied averaging for: {', '.join(averaging_ops)}")
-    else:
-        print("\nNo scan averaging applied")
-    
-    return averaged_dict
+def average_data_dict_converted(
+    data_dict_converted,
+    average_7t_rest=False,
+    average_3t_rest=False,
+    average_all_rest=False,
+    average_7t_movies=False,
+    average_3t_task_pairs=False,
+    average_3t_tasks=False,
+    average_meg_rest=False,
+    average_meg_task=False,
+):
+    """Average scan groups within a task-keyed dict produced by convert_data_dict."""
+    # data_dict_converted is keyed by task name; values are (n_subjects, n_regions) arrays.
+    # _apply_scan_groupings._keys_matching uses substring matching, so it works whether
+    # the key is a full scan string or just a bare task name like 'rfMRIREST1LR'.
+    flat = {task: arr for task, arr in data_dict_converted.items() if arr is not None}
+
+    return _apply_scan_groupings(
+        flat,
+        average_3t_rest=average_3t_rest,
+        average_7t_rest=average_7t_rest,
+        average_all_rest=average_all_rest,
+        average_7t_movies=average_7t_movies,
+        average_3t_task_pairs=average_3t_task_pairs,
+        average_3t_tasks=average_3t_tasks,
+        average_meg_rest=average_meg_rest,
+        average_meg_task=average_meg_task,
+    )
