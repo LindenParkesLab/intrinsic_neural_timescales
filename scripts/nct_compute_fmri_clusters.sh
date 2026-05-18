@@ -17,4 +17,9 @@ for n_clusters in $(seq ${k_start} ${k_end}); do
 done
 ########################################################################################################################
 
-
+########################################################################################################################
+# carit task
+for n_clusters in $(seq ${k_start} ${k_end}); do
+    python ${scriptsdir}/nct_compute_fmri_clusters.py --indir ${indir} --outdir ${outdir} --fmri_file 'HCP-D_Schaefer4007_task-tfMRICARITPA_data-ts.npy' --file_prefix 'HCP-D_Schaefer4007_task-tfMRICARITPA_' --n_clusters ${n_clusters}
+done
+########################################################################################################################
