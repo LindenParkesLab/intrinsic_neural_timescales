@@ -13,8 +13,10 @@ from statsmodels.tsa.stattools import acf
 from collections import defaultdict
 from joblib import Parallel, delayed
 from scipy.optimize import curve_fit, OptimizeWarning
+import statsmodels.api as sm
 
 from src.data import DataLoader, ScanInfo, parse_scan_string, build_scan_string
+from src.utils import apply_frequency_filter
 import logging
 logger = logging.getLogger(__name__)
 
@@ -29,6 +31,9 @@ def _ts_method_zero_crossing(acf, tr, inst, **kw):
 
 def _ts_method_zero_crossing_robust_nc2(acf, tr, inst, **kw):
     return inst._compute_zero_crossing_robust(acf, n_crossings=2) * tr
+
+def _ts_method_zero_crossing_robust_nc3(acf, tr, inst, **kw):
+    return inst._compute_zero_crossing_robust(acf, n_crossings=3) * tr
 
 def _ts_method_auc_zero_crossing(acf, tr, inst, **kw):
     return inst._compute_auc(acf, threshold=0.0) * tr
@@ -87,6 +92,7 @@ def _ts_method_exponential_tau(acf, tr, inst, **kw):
 TIMESCALE_METHODS = {
     'zero_crossing':              _ts_method_zero_crossing,
     'zero_crossing_robust_nc2':   _ts_method_zero_crossing_robust_nc2,
+    'zero_crossing_robust_nc3':   _ts_method_zero_crossing_robust_nc3,
     'auc_zero_crossing':          _ts_method_auc_zero_crossing,
     'auc_half_crossing':          _ts_method_auc_half_crossing,
     'decay_time_half':            _ts_method_decay_time_half,
@@ -131,20 +137,30 @@ class Timescales(DataLoader):
         task: str,
         modality: str,
         seg: str,
+        space: str = None,
+        session: str = None,
+        run: str = None,
         suffix: str = '.npy',
         mode: str = 'load'
     ) -> Path:
         """
         Generate standardized filepath for subject-specific outputs using key-value naming.
-        
+
+        The filename includes every field that uniquely identifies a scan so
+        that outputs for different sessions, spaces, or runs never collide.
+
         Args:
             subject_id: Subject identifier
             output_type: Type of output (e.g., 'autocorr', 'timescale_acf')
-            task: Name of scan (e.g., 'rfMRIREST1LR')
+            task: Task/run label (e.g., 'rfMRIREST1LR')
             modality: Modality string (e.g., 'MRI3T')
-            seg: Atlas name
+            seg: Atlas/parcellation name
+            space: Template space (e.g., 'fsLR', 'MNI152NLin2009cAsym')
+            session: Session label (e.g., '1', '01') — required for longitudinal data
+            run: Run label (e.g., '01') — included when present
             suffix: File extension
-        
+            mode: 'save' creates parent dirs; 'load' does not
+
         Returns:
             Path object for the output file
         """
@@ -152,16 +168,19 @@ class Timescales(DataLoader):
         output_subdir = self.output_dir / 'data' / 'timescales_outputs' / self.dataset / output_type
         if mode == 'save':
             output_subdir.mkdir(parents=True, exist_ok=True)
-        
-        # Build filename using key-value format
+
+        # Build filename — include all fields that uniquely identify a scan
         filename = build_scan_string(
             sub=subject_id,
+            ses=session,
             modality=modality,
             task=task,
+            space=space,
             seg=seg,
-            stat=output_type
+            run=run,
+            stat=output_type,
         ) + suffix
-        
+
         return output_subdir / filename
 
     def _save_subject_output(
@@ -172,6 +191,9 @@ class Timescales(DataLoader):
         task: str,
         modality: str,
         seg: str = None,
+        space: str = None,
+        session: str = None,
+        run: str = None,
         metadata: Dict = None,
     ) -> Path:
         """Save subject-specific output data with key-value naming."""
@@ -179,15 +201,18 @@ class Timescales(DataLoader):
             suffix = '.txt'
         elif data.ndim > 1:
             suffix = '.npy'
-        
+
         filepath = self._get_output_filepath(
             subject_id=subject_id,
             output_type=output_type,
             task=task,
             modality=modality,
             seg=seg,
+            space=space,
+            session=session,
+            run=run,
             suffix=suffix,
-            mode='save'
+            mode='save',
         )
         
         # Save data
@@ -208,6 +233,9 @@ class Timescales(DataLoader):
         task: str,
         modality: str,
         seg: str = None,
+        space: str = None,
+        session: str = None,
+        run: str = None,
     ) -> Optional[Any]:
         """Load previously saved subject-specific output with key-value naming."""
         suffix = '.npy'
@@ -217,8 +245,11 @@ class Timescales(DataLoader):
             task=task,
             modality=modality,
             seg=seg,
+            space=space,
+            session=session,
+            run=run,
             suffix=suffix,
-            mode='load'
+            mode='load',
         )
         
         # Check for .npz if .npy doesn't exist
@@ -250,7 +281,10 @@ class Timescales(DataLoader):
         output_type: str,
         task: str,
         modality: str,
-        seg: str = None
+        seg: str = None,
+        space: str = None,
+        session: str = None,
+        run: str = None,
     ) -> bool:
         """Check if a subject output file already exists."""
         for suffix in ['.npy', '.npz', '.pkl']:
@@ -260,8 +294,11 @@ class Timescales(DataLoader):
                 task=task,
                 modality=modality,
                 seg=seg,
+                space=space,
+                session=session,
+                run=run,
                 suffix=suffix,
-                mode='load'
+                mode='load',
             )
             if filepath.exists():
                 return True
@@ -328,12 +365,16 @@ class Timescales(DataLoader):
             condition  = kv_dict.get('condition', '')
             task       = kv_dict.get('task', '')
             seg        = kv_dict.get('seg', '')
+            space      = kv_dict.get('space')
+            session    = kv_dict.get('ses')
+            run        = kv_dict.get('run')
             tr         = kv_dict.get('tr', '')
 
             if not force_recompute:
                 cached = self._load_subject_output(
                     subject_id=subject_id, output_type=output_type,
                     task=task, modality=modality, seg=seg,
+                    space=space, session=session, run=run,
                 )
                 if cached is not None:
                     results[scan_key] = cached
@@ -358,6 +399,9 @@ class Timescales(DataLoader):
                         task=task,
                         modality=modality,
                         seg=seg,
+                        space=space,
+                        session=session,
+                        run=run,
                         metadata={'output_type': output_type, 'tr': tr, 'modality': modality,
                                   'dataset': self.dataset},
                     )
@@ -383,23 +427,25 @@ class Timescales(DataLoader):
         save_outputs: bool = True,
         suffix: str = None,
         use_residuals: bool = False,
-        lowpass_cutoff: float = None,
+        lowpass: float = None,
+        highpass: float = None,
         verbose: bool = True,
     ):
         output_type = 'autocorr'
-        if lowpass_cutoff is not None:
-            output_type = f'autocorr_lp-{lowpass_cutoff}hz'
+        if highpass is not None and lowpass is not None:
+            output_type = f'autocorr_bp-{highpass}-{lowpass}hz'
+        elif highpass is not None:
+            output_type = f'autocorr_hp-{highpass}hz'
+        elif lowpass is not None:
+            output_type = f'autocorr_lp-{lowpass}hz'
         if suffix:
             output_type = f'{output_type}_{suffix}'
         if use_residuals:
             output_type = f'{output_type}_resids'
 
+        # lowpass/highpass are used for output naming only; filtering is applied at load time via load_batch
         def _compute(timeseries_scan, kv_dict):
-            ts = timeseries_scan
-            if lowpass_cutoff is not None:
-                tr = kv_dict.get('tr', 1.0)
-                ts = apply_lowpass_filter(ts, 1 / tr, lowpass_cutoff)
-            return compute_acf(ts, use_fft=use_fft)
+            return compute_acf(timeseries_scan, use_fft=use_fft)
 
         self.autocorr_dict = self._run_for_all_scans(
             compute_fn=_compute,
@@ -446,12 +492,16 @@ class Timescales(DataLoader):
             modality   = kv_dict.get('modality', '')
             task       = kv_dict.get('task', '')
             seg        = kv_dict.get('seg', '')
+            space      = kv_dict.get('space')
+            session    = kv_dict.get('ses')
+            run        = kv_dict.get('run')
             tr         = kv_dict.get('tr', '')
 
             if not force_recompute:
                 cached = self._load_subject_output(
                     subject_id=subject_id, output_type=output_type,
                     task=task, modality=modality, seg=seg,
+                    space=space, session=session, run=run,
                 )
                 if cached is not None:
                     results[scan_key] = cached
@@ -477,6 +527,9 @@ class Timescales(DataLoader):
                         task=task,
                         modality=modality,
                         seg=seg,
+                        space=space,
+                        session=session,
+                        run=run,
                         metadata={'method': method, 'tr': tr},
                     )
             except Exception as e:
@@ -784,7 +837,7 @@ class Timescales(DataLoader):
         df_behavior_matched = pd.DataFrame(columns=self.df_behavior.columns)
         df_behavior_matched.index.name = 'subject_id'
         
-        for subject_id in {scan.subject_id for scan in self.scan_registry}:
+        for subject_id in list(dict.fromkeys(scan.subject_id for scan in self.scan_registry)):
             subject_id = str(subject_id)
             if subject_id in self.df_behavior.index and subject_id not in df_behavior_matched.index:
                 df_behavior_matched.loc[subject_id] = self.df_behavior.loc[subject_id]
@@ -813,17 +866,23 @@ class Timescales(DataLoader):
             kv_dict = self._parse_scan_string(scan_key)
             
             subject_id = kv_dict.get('sub', '')
-            modality = kv_dict.get('modality', '')
-            task = kv_dict.get('task', '')
-            seg = kv_dict.get('seg', '')
-            
+            modality   = kv_dict.get('modality', '')
+            task       = kv_dict.get('task', '')
+            seg        = kv_dict.get('seg', '')
+            space      = kv_dict.get('space')
+            session    = kv_dict.get('ses')
+            run        = kv_dict.get('run')
+
             # Check for existing output
             loaded_data = self._load_subject_output(
                 subject_id=subject_id,
                 output_type=output_type,
                 task=task,
                 modality=modality,
-                seg=seg
+                seg=seg,
+                space=space,
+                session=session,
+                run=run,
             )
             
             data_dict[scan_key] = loaded_data
@@ -1087,40 +1146,8 @@ def get_acf_time_index(time_window=25, tr=None):
     max_lag = int(time_window / tr)
     return max_lag + 1
 
-def apply_lowpass_filter(data, sampling_freq, lowpass_cutoff):
-    """
-    Apply progressive lowpass filtering to MEG data and compute autocorrelation functions.
-    
-    Parameters
-    ----------
-    data : ndarray
-        Data with shape (n_regions, n_timepoints)
-    sampling_freq : float
-        Sampling frequency in Hz (e.g., 500)
-    lowpass_cutoff : float
-        Frequency cutoff in Hz for lowpass filtering (e.g., 50, 30, 10, 5, 1, 0.5)
-        Filter will remove faster fluctuations
 
-    """
-    n_regions, n_timepoints = data.shape
 
-    # Design lowpass filter (Butterworth, 4th order)
-    nyquist = sampling_freq / 2
-    normalized_cutoff = lowpass_cutoff / nyquist
-    
-    # Ensure lowpass_cutoff is below Nyquist frequency
-    if normalized_cutoff >= 1.0:
-        print(f"Warning: Cutoff {lowpass_cutoff} Hz is >= Nyquist frequency {nyquist} Hz.")
-        
-    b, a = sp.signal.butter(4, normalized_cutoff, btype='low')
-    
-    # Filter each region
-    filtered_data = np.zeros_like(data)
-    for region_idx in range(n_regions):
-        # Use filtfilt for zero-phase filtering
-        filtered_data[region_idx, :] = sp.signal.filtfilt(b, a, data[region_idx, :])
-            
-    return filtered_data
 
 def create_design_matrix_nilearn(
     events,
@@ -1540,6 +1567,99 @@ def fit_acf_exp(acf_vals, tr,
 
 # ==================== Standalone Utility Functions (for use in notebooks) ====================
 def compute_deflections(rest_timescales, task_timescales, nuisance_regression=False, standardize=False, absolute=False):
+    # Normalise input types — convert Series/DataFrame to numpy arrays
+    if isinstance(rest_timescales, (pd.Series, pd.DataFrame)):
+        rest_timescales = rest_timescales.to_numpy()
+    if isinstance(task_timescales, (pd.Series, pd.DataFrame)):
+        task_timescales = task_timescales.to_numpy()
+
+    # Always copy so that standardize='pooled' (in-place row assignment) never
+    # mutates the caller's arrays when the input is already float64.
+    rest_timescales = np.array(rest_timescales, dtype=float)
+    task_timescales = np.array(task_timescales, dtype=float)
+
+    if rest_timescales.ndim not in (1, 2) or task_timescales.ndim not in (1, 2):
+        raise ValueError("rest_timescales and task_timescales must be 1-D or 2-D arrays.")
+    if rest_timescales.shape != task_timescales.shape:
+        raise ValueError(
+            f"rest_timescales and task_timescales must have the same shape; "
+            f"got {rest_timescales.shape} and {task_timescales.shape}."
+        )
+
+    # Matrix mode: (n_subjects, n_regions) — each subject processed independently.
+    # Vector mode: (n,) — reshape to (n, 1) for uniform internal handling.
+    matrix_mode = rest_timescales.ndim == 2
+    if not matrix_mode:
+        rest_timescales = rest_timescales.reshape(-1, 1)
+        task_timescales = task_timescales.reshape(-1, 1)
+
+    if standardize is True or standardize == 'separate':
+        if matrix_mode:
+            # Per-subject z-score over regions (axis=1)
+            rest_timescales = (rest_timescales - np.nanmean(rest_timescales, axis=1, keepdims=True)) / np.nanstd(rest_timescales, axis=1, keepdims=True)
+            task_timescales = (task_timescales - np.nanmean(task_timescales, axis=1, keepdims=True)) / np.nanstd(task_timescales, axis=1, keepdims=True)
+        else:
+            rest_timescales = (rest_timescales - np.nanmean(rest_timescales)) / np.nanstd(rest_timescales)
+            task_timescales = (task_timescales - np.nanmean(task_timescales)) / np.nanstd(task_timescales)
+    elif standardize == 'pooled':
+        if matrix_mode:
+            # Per-subject pooled z-score (rest and task scaled together)
+            for j in range(rest_timescales.shape[0]):
+                pooled = np.concatenate([rest_timescales[j, :], task_timescales[j, :]])
+                mu, sigma = np.nanmean(pooled), np.nanstd(pooled)
+                rest_timescales[j, :] = (rest_timescales[j, :] - mu) / sigma
+                task_timescales[j, :] = (task_timescales[j, :] - mu) / sigma
+        else:
+            pooled = np.concatenate([rest_timescales, task_timescales])
+            pooled_mean = np.nanmean(pooled)
+            pooled_std = np.nanstd(pooled)
+            rest_timescales = (rest_timescales - pooled_mean) / pooled_std
+            task_timescales = (task_timescales - pooled_mean) / pooled_std
+    elif standardize is not False:
+        raise ValueError(f"standardize must be False, True, 'separate', or 'pooled'; got '{standardize}'")
+
+    int_deflections = task_timescales - rest_timescales
+
+    if nuisance_regression:
+        if matrix_mode:
+            # Subject-specific spatial nuisance regression:
+            # for each subject, regress their rest timescales (across regions)
+            # out of their deflections (across regions).
+            for j in range(rest_timescales.shape[0]):
+                rest_j = rest_timescales[j, :]
+                def_j  = int_deflections[j, :]
+                valid  = ~(np.isnan(rest_j) | np.isnan(def_j))
+                if valid.sum() < 2:
+                    # Too few valid regions to fit — mark entire subject as NaN
+                    # rather than silently returning unresidualised values.
+                    int_deflections[j, :] = np.nan
+                    continue
+                X_valid = np.column_stack([rest_j[valid], np.ones(valid.sum())])
+                beta    = np.linalg.lstsq(X_valid, def_j[valid], rcond=None)[0]
+                X_full  = np.column_stack([rest_j, np.ones(len(rest_j))])
+                int_deflections[j, :] = def_j - X_full @ beta
+        else:
+            valid_mask = ~(np.isnan(rest_timescales[:, 0]) | np.isnan(int_deflections[:, 0]))
+            X_full = np.concatenate((rest_timescales, np.ones((rest_timescales.shape[0], 1))), axis=1)
+
+            X_valid = X_full[valid_mask]
+            y_valid = int_deflections[valid_mask]
+
+            beta    = np.linalg.lstsq(X_valid, y_valid, rcond=None)[0]
+            predicted = X_full @ beta
+
+            int_deflections = int_deflections - predicted
+
+    if absolute:
+        int_deflections = np.abs(int_deflections)
+
+    if matrix_mode:
+        return int_deflections  # (n_subjects, n_regions)
+    else:
+        return int_deflections[:, 0]  # (n,)
+
+
+def compute_deflections_glm(rest_timescales, task_timescales, features, standardize=False):
     if isinstance(rest_timescales, pd.Series):
         rest_timescales = rest_timescales.to_numpy()
     if isinstance(task_timescales, pd.Series):
@@ -1548,41 +1668,125 @@ def compute_deflections(rest_timescales, task_timescales, nuisance_regression=Fa
     rest_timescales = np.asarray(rest_timescales, dtype=float)
     task_timescales = np.asarray(task_timescales, dtype=float)
 
-    if rest_timescales.ndim == 1:
-        rest_timescales = rest_timescales.reshape(-1, 1)
-    if task_timescales.ndim == 1:
-        task_timescales = task_timescales.reshape(-1, 1)
-
-    if standardize is True or standardize == 'separate':
+    if standardize:
         rest_timescales = (rest_timescales - np.nanmean(rest_timescales)) / np.nanstd(rest_timescales)
         task_timescales = (task_timescales - np.nanmean(task_timescales)) / np.nanstd(task_timescales)
-    elif standardize == 'pooled':
-        pooled = np.concatenate([rest_timescales, task_timescales])
-        pooled_mean = np.nanmean(pooled)
-        pooled_std = np.nanstd(pooled)
-        rest_timescales = (rest_timescales - pooled_mean) / pooled_std
-        task_timescales = (task_timescales - pooled_mean) / pooled_std
-    elif standardize is not False:
-        raise ValueError(f"standardize must be False, True, 'separate', or 'pooled'; got '{standardize}'")
 
-    int_deflections = task_timescales - rest_timescales
+    n_regions = len(rest_timescales)
 
-    if nuisance_regression:
-        valid_mask = ~(np.isnan(rest_timescales[:, 0]) | np.isnan(int_deflections[:, 0]))
-        X_full = np.concatenate((rest_timescales, np.ones((rest_timescales.shape[0], 1))), axis=1)
+    if isinstance(features, pd.Series):
+        features = features.to_frame()
+    elif isinstance(features, np.ndarray):
+        if features.ndim == 1:
+            features = pd.DataFrame(features, columns=['feature_0'])
+        else:
+            features = pd.DataFrame(features, columns=[f'feature_{i}' for i in range(features.shape[1])])
 
-        X_valid = X_full[valid_mask]
-        y_valid = int_deflections[valid_mask]
+    results = {}
 
-        beta = np.dot(np.linalg.pinv(X_valid), y_valid)
-        predicted = np.dot(X_full, beta)
+    for feature_name in features.columns:
+        feature_vals = features[feature_name].to_numpy().astype(float)
 
-        int_deflections = int_deflections - predicted
+        if standardize:
+            feature_vals = (feature_vals - np.nanmean(feature_vals)) / np.nanstd(feature_vals)
 
-    if absolute:
-        int_deflections = np.abs(int_deflections)
+        valid_mask = ~(np.isnan(rest_timescales) | np.isnan(task_timescales) | np.isnan(feature_vals))
 
-    return int_deflections[:, 0]
+        rest_valid = rest_timescales[valid_mask]
+        task_valid = task_timescales[valid_mask]
+        feature_valid = feature_vals[valid_mask]
+
+        X = sm.add_constant(np.column_stack((feature_valid, rest_valid)))
+        y = task_valid
+
+        model = sm.OLS(y, X).fit()
+
+        X_rest = sm.add_constant(rest_valid)
+        task_resid_valid = sm.OLS(task_valid, X_rest).fit().resid
+        feature_resid_valid = sm.OLS(feature_valid, X_rest).fit().resid
+
+        task_resid = np.full(n_regions, np.nan)
+        feature_resid = np.full(n_regions, np.nan)
+        task_resid[valid_mask] = task_resid_valid
+        feature_resid[valid_mask] = feature_resid_valid
+
+        results[feature_name] = {
+            'model':                 model,
+            'coef':                  model.params[1],
+            'pvalue':                model.pvalues[1],
+            'tstat':                 model.tvalues[1],
+            'conf_int':              model.conf_int()[1],
+            'r_squared':             model.rsquared,
+            'r_squared_adj':         model.rsquared_adj,
+            'task_partial_resid':    task_resid,
+            'feature_partial_resid': feature_resid,
+            'valid_mask':            valid_mask,
+        }
+
+    return results
+
+
+def compute_regional_corrs(rest_data, task_data, behavior_data,
+                           nuisance_regression, deflection_method,
+                           standardize=False, absolute=True, verbose=False, return_pval=False):
+    n_regions = rest_data.shape[1]
+    rest_correlations       = np.full(n_regions, np.nan)
+    task_correlations       = np.full(n_regions, np.nan)
+    deflection_correlations = np.full(n_regions, np.nan)
+    rest_pvalues            = np.full(n_regions, np.nan)
+    task_pvalues            = np.full(n_regions, np.nan)
+    deflection_pvalues      = np.full(n_regions, np.nan)
+
+    if deflection_method not in ('simple', 'matrix'):
+        raise ValueError(f"deflection_method must be 'simple' or 'matrix'; got '{deflection_method}'")
+
+    beh_valid = ~np.isnan(behavior_data)
+    behavior_clean = behavior_data[beh_valid]
+    rest_clean     = rest_data[beh_valid, :]
+    task_clean     = task_data[beh_valid, :]
+
+    if verbose:
+        print(f"  Valid subjects: {np.sum(beh_valid)}/{len(behavior_data)}")
+
+    if deflection_method == 'matrix':
+        defl = compute_deflections(rest_clean, task_clean,
+                                   nuisance_regression=nuisance_regression,
+                                   standardize=standardize, absolute=absolute)
+
+    for region_idx in range(n_regions):
+        rest_region = rest_clean[:, region_idx]
+        task_region = task_clean[:, region_idx]
+
+        valid = ~(np.isnan(rest_region) | np.isnan(task_region))
+        if valid.sum() < 3:
+            continue
+
+        rest_correlations[region_idx], rest_pvalues[region_idx] = sp.stats.pearsonr(
+            rest_region[valid], behavior_clean[valid])
+        task_correlations[region_idx], task_pvalues[region_idx] = sp.stats.pearsonr(
+            task_region[valid], behavior_clean[valid])
+
+        if deflection_method == 'simple':
+            defl = compute_deflections(rest_region, task_region,
+                                       nuisance_regression=nuisance_regression,
+                                       standardize=standardize, absolute=absolute)
+            valid_d = ~np.isnan(defl)
+            if valid_d.sum() >= 3:
+                deflection_correlations[region_idx], deflection_pvalues[region_idx] = sp.stats.pearsonr(
+                    defl[valid_d], behavior_clean[valid_d])
+        elif deflection_method == 'matrix':
+            defl_region = defl[:, region_idx]
+            valid_d = ~np.isnan(defl_region)
+            if valid_d.sum() >= 3:
+                deflection_correlations[region_idx], deflection_pvalues[region_idx] = sp.stats.pearsonr(
+                    defl_region[valid_d], behavior_clean[valid_d])
+
+    if return_pval:
+        return (rest_correlations, task_correlations, deflection_correlations,
+                rest_pvalues, task_pvalues, deflection_pvalues)
+    else:
+        return (rest_correlations, task_correlations, deflection_correlations)
+
 
 def filter_data_dict(data_dict, data_dict_residuals=None, remove_subject_level=True):
     """
@@ -1631,7 +1835,7 @@ def filter_data_dict(data_dict, data_dict_residuals=None, remove_subject_level=T
                         remove_these_keys.append([scan_key])
     
     # Flatten list and remove duplicates
-    remove_these_keys = list(set([item for sublist in remove_these_keys for item in sublist]))
+    remove_these_keys = list(dict.fromkeys([item for sublist in remove_these_keys for item in sublist]))
     
     # Remove marked keys
     for remove_key in remove_these_keys:
@@ -1684,16 +1888,25 @@ def _apply_scan_groupings(
     def _keys_matching(patterns):
         return [k for k in list(out) if any(p in k for p in patterns)]
 
-    _3t_rest_tasks  = ['rfMRIREST1LR', 'rfMRIREST1RL', 'rfMRIREST2LR', 'rfMRIREST2RL']
+    # HCP-YA 3T rest (LR/RL phase-encoding) and HCP-D 3T rest (AP/PA phase-encoding)
+    _3t_rest_tasks  = ['rfMRIREST1LR', 'rfMRIREST1RL', 'rfMRIREST2LR', 'rfMRIREST2RL',   # HCP-YA
+                       'rfMRIREST1PA', 'rfMRIREST2PA']   # HCP-D
+                    #    'rfMRIREST1AP', 'rfMRIREST1PA', 'rfMRIREST2AP', 'rfMRIREST2PA']   # HCP-D
+                    
     _7t_rest_tasks  = ['rfMRIREST17TPA', 'rfMRIREST27TAP', 'rfMRIREST37TPA', 'rfMRIREST47TAP']
     _7t_movie_tasks = ['tfMRIMOVIE17TAP', 'tfMRIMOVIE27TPA', 'tfMRIMOVIE37TPA', 'tfMRIMOVIE47TAP']
     _3t_task_pairs  = [
+        # HCP-YA — LR/RL counterbalanced pairs
         (['tfMRIWMLR',          'tfMRIWMRL'],          'task-WM'),
         (['tfMRIEMOTIONLR',     'tfMRIEMOTIONRL'],     'task-EMOTION'),
         (['tfMRIGAMBLINGLR',    'tfMRIGAMBLINGRL'],    'task-GAMBLING'),
         (['tfMRILANGUAGELR',    'tfMRILANGUAGERL'],    'task-LANGUAGE'),
         (['tfMRIRELATIONALLR',  'tfMRIRELATIONALRL'],  'task-RELATIONAL'),
         (['tfMRISOCIALLR',      'tfMRISOCIALRL'],      'task-SOCIAL'),
+        # HCP-D — single PA direction (no LR/RL counterpart)
+        (['tfMRICARITPA'],                              'task-CARIT'),
+        (['tfMRIEMOTIONPA'],                            'task-EMOTION'),
+        (['tfMRIGUESSINGPA'],                           'task-GUESSING'),
     ]
     _meg_rest_tasks = ['3Restin', '4Restin', '5Restin']
     _meg_task_tasks = ['6Wrkmem', '7Wrkmem']
