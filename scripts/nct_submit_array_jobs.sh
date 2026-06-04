@@ -22,7 +22,9 @@
 #SBATCH --array=0-499
 
 # Print the task id.
-# SLURM_ARRAY_TASK_ID=0
+if [[ "$USER" == "lindenmp" ]]; then
+    SLURM_ARRAY_TASK_ID=0
+fi
 echo "SLURM_ARRAY_TASK_ID:" ${SLURM_ARRAY_TASK_ID}
 
 # print info about GPU
@@ -30,39 +32,45 @@ echo "SLURM_ARRAY_TASK_ID:" ${SLURM_ARRAY_TASK_ID}
 
 ########################################################################################################################
 # directories
-nct_script='/projectsp/f_lp756_1/lindenmp/research_projects/nct_xr/scripts/compute_optimized_control_energy.py'
-projdir='/projectsp/f_lp756_1/lindenmp/research_projects/intrinsic_neural_timescales'
+if [[ "$USER" == "lindenmp" ]]; then
+    nct_script='/mnt/storage_ssd_raid/research_projects/nct_xr/scripts/compute_optimized_control_energy.py'
+    projdir='/mnt/storage_ssd_raid/research_projects/intrinsic_neural_timescales'
+elif [[ "$USER" == "lp756" ]]; then
+    nct_script='/projectsp/f_lp756_1/lindenmp/research_projects/nct_xr/scripts/compute_optimized_control_energy.py'
+    projdir='/projectsp/f_lp756_1/lindenmp/research_projects/intrinsic_neural_timescales'
+fi
 seg='Schaefer4007'
 
 ########################################################################################################################
 time_horizon=1
 reference_state='xf'
+normalize_connectome='True'
 ########################################################################################################################
 
-########################################################################################################################
-# HCP-YA
-dataset='HCP-YA'
-nct_dir=${projdir}'/data/nct/'${dataset}
-outdir=${projdir}'/results/'${dataset}'/nct'
-outsubdir='subjects'
+# ########################################################################################################################
+# # HCP-YA
+# dataset='HCP-YA'
+# nct_dir=${projdir}'/data/nct/'${dataset}
+# outdir=${projdir}'/results/'${dataset}'/nct'
+# outsubdir='subjects'
 
-A_file=${nct_dir}'/'${dataset}'_'${seg}'_adjacency_matrices.npy'
-k_combined=22
-fmri_clusters_file=${nct_dir}'/'${dataset}'_'${seg}'_REST-WM-kmeans-contrasts_fmri_clusters_k-'${k_combined}'.npy'
-file_prefix=${dataset}'_'${seg}
+# A_file=${nct_dir}'/'${dataset}'_'${seg}'_adjacency_matrices.npy'
+# k_combined=22
+# fmri_clusters_file=${nct_dir}'/'${dataset}'_'${seg}'_REST-WM-kmeans-contrasts_fmri_clusters_k-'${k_combined}'.npy'
+# file_prefix=${dataset}'_'${seg}
 
-for i in 0 500; do
-    perm_idx=$((${SLURM_ARRAY_TASK_ID} + ${i}))
-    echo "perm_idx:" ${perm_idx}
+# for i in 0 500; do
+#     perm_idx=$((${SLURM_ARRAY_TASK_ID} + ${i}))
+#     echo "perm_idx:" ${perm_idx}
 
-    python ${nct_script} \
-        --outdir ${outdir} --outsubdir ${outsubdir} --file_prefix ${file_prefix} \
-        --A_file ${A_file} --fmri_clusters_file ${fmri_clusters_file} \
-        --time_horizon ${time_horizon} --reference_state ${reference_state} \
-        --perm_idx ${perm_idx} \
-        --compact_save 'True'
-done
-########################################################################################################################
+#     python ${nct_script} \
+#         --outdir ${outdir} --outsubdir ${outsubdir} --file_prefix ${file_prefix} \
+#         --A_file ${A_file} --fmri_clusters_file ${fmri_clusters_file} \
+#         --time_horizon ${time_horizon} --reference_state ${reference_state} \
+#         --perm_idx ${perm_idx} \
+#         --compact_save 'True' --normalize_connectome ${normalize_connectome}
+# done
+# ########################################################################################################################
 
 ########################################################################################################################
 # HCP-D
@@ -85,6 +93,6 @@ for i in 0 500; do
         --A_file ${A_file} --fmri_clusters_file ${fmri_clusters_file} \
         --time_horizon ${time_horizon} --reference_state ${reference_state} \
         --perm_idx ${perm_idx} \
-        --compact_save 'True'
+        --compact_save 'True' --normalize_connectome ${normalize_connectome}
 done
 ########################################################################################################################
