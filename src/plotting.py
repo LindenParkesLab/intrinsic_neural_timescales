@@ -20,18 +20,34 @@ except ImportError:  # optional; scatter labels fall back to no repulsion
 
 def plot_autocorrelation_analysis(autocorr_raw, autocorr_resid, zero_crossings_raw, zero_crossings_resid, tr,
                                   max_lag=None, n_example_voxels=5, figsize=(12.5, 5), save_path=None, dpi=300):
-    """
-    Plot autocorrelation analysis results and block design.
-    
-    Parameters:
-    - autocorr_raw: autocorrelation before task removal (n_voxels x n_lags)
-    - autocorr_resid: autocorrelation after task removal (n_voxels x n_lags)
-    - zero_crossings_raw: first zero-crossing indices (n_voxels,), may contain NaNs
-    - zero_crossings_resid: first zero-crossing indices (n_voxels,), may contain NaNs
-    - tr: repetition time in seconds
-    - max_lag: maximum lag to plot (in timepoints)
-    - n_example_voxels: number of example voxel ACF curves to show
-    - figsize: figure size tuple
+    """Plot autocorrelation analysis results (mean ACF, example voxels, INT histogram).
+
+    Parameters
+    ----------
+    autocorr_raw : (n_voxels, n_lags) ndarray
+        Autocorrelation before task removal.
+    autocorr_resid : (n_voxels, n_lags) ndarray
+        Autocorrelation after task removal.
+    zero_crossings_raw : (n_voxels,) ndarray
+        First zero-crossing indices before removal; may contain NaNs.
+    zero_crossings_resid : (n_voxels,) ndarray
+        First zero-crossing indices after removal; may contain NaNs.
+    tr : float
+        Repetition time in seconds.
+    max_lag : int or None
+        Maximum lag to plot (in timepoints); defaults to the largest zero-crossing.
+    n_example_voxels : int
+        Number of example voxel ACF curves to show.
+    figsize : tuple
+        Figure size.
+    save_path : str or None
+        If given, save the figure to this path.
+    dpi : int
+        Resolution for the saved figure.
+
+    Returns
+    -------
+    fig : matplotlib Figure
     """
     
     # Limit the lag range for plotting
@@ -748,51 +764,43 @@ def plot_subject_timeseries_heatmap(raw_data, scan_string,
                                     time_units='minutes', tr=None,
                                     title_prefix="Neural Time Series",
                                     save_path=None, dpi=300):
-    """
-    Plot a subject's neural time series as 2D heat matrices with optional task regression analysis.
-    
-    Creates either:
-    - 1-row visualization (if residual_data and design_matrix are None): Raw time series only
-    - 5-row visualization (if residual_data and design_matrix provided):
-      1. Raw time series
-      2. Task-regressed residuals  
-      3. Task-related signal (Raw - Residual)
-      4. Variance of task-related signal across brain regions
-      5. Design matrix (task regressors)
-    
-    Parameters:
-    -----------
-    raw_data : ndarray
-        Raw time series data (n_regions x n_timepoints)
+    """Plot a subject's neural timeseries as heatmaps, optionally with task-regression rows.
+
+    With residual_data and design_matrix, produces 5 rows (raw, task-regressed
+    residuals, task signal = raw - residual, its variance across regions, and the
+    design matrix); otherwise a single raw-timeseries row.
+
+    Parameters
+    ----------
+    raw_data : (n_regions, n_timepoints) ndarray
+        Raw timeseries.
     scan_string : str
-        Scan identifier, e.g., 'sub-100307_modality-MRI3T_tr-0.72_condition-task_scan-tfMRIWMLR_atlas-Schaefer4007'
-    residual_data : ndarray, optional (default=None)
-        Task-regressed residuals (n_regions x n_timepoints).
-        If None, only raw data is plotted.
-    design_matrix : ndarray or DataFrame, optional (default=None)
-        Design matrix with task regressors.
-        If None, only raw data is plotted.
-    figsize : tuple, optional
-        Figure size (width, height). If None, auto-determined based on number of plots.
-    cmap : str, default 'RdBu_r'
-        Colormap for neural data heatmaps
-    vmin, vmax : float, optional
-        Color scaling limits. If None, uses 2nd-98th percentiles
-    time_units : str, default 'minutes'
-        Time axis units ('seconds', 'minutes', 'timepoints')
-    tr : float, optional
-        Repetition time in seconds. Extracted from scan_string if None
-    title_prefix : str, default "Neural Time Series"
-        Title prefix
-    save_path : str, optional
-        Path to save figure
-    dpi : int, default 300
-        Resolution for saved figure
-        
-    Returns:
-    --------
-    fig : matplotlib.Figure
-    axes : tuple of matplotlib.Axes
+        Scan identifier (e.g. 'sub-100307_modality-MRI3T_tr-0.72_...').
+    residual_data : (n_regions, n_timepoints) ndarray or None
+        Task-regressed residuals. If None, only raw data is plotted.
+    design_matrix : ndarray, pd.DataFrame, or None
+        Task regressors. If None, only raw data is plotted.
+    figsize : tuple or None
+        Figure size; auto-determined from the number of rows if None.
+    cmap : str
+        Colormap for the neural-data heatmaps.
+    vmin, vmax : float or None
+        Colour limits; 2nd/98th percentiles if None.
+    time_units : {'minutes', 'seconds', 'timepoints'}
+        Units for the time axis.
+    tr : float or None
+        Repetition time in seconds; parsed from scan_string if None.
+    title_prefix : str
+        Title prefix.
+    save_path : str or None
+        If given, save the figure to this path.
+    dpi : int
+        Resolution for the saved figure.
+
+    Returns
+    -------
+    fig : matplotlib Figure
+    axes : tuple of matplotlib Axes
     """
     
     n_regions, n_timepoints = raw_data.shape
@@ -1028,25 +1036,32 @@ def plot_faceted_lollipops(df_r, df_p, category_colors=None, figsize=None,
                             rank_reference='Rest', show_legend=True,
                             annotate_sig=False, annotation_fontsize=5,
                             annotation_offset=0.02, fontsize=8):
-    """
-    Horizontal faceted lollipop plot of correlations.
+    """Horizontal faceted lollipop plot of correlations, one panel per condition.
 
-    One panel per column in df_r, sorted by r within each panel.
-    Colors assigned by feature category (prefix before first '_').
+    Each panel plots the features sorted by r, coloured by feature category (the
+    prefix before the first '_').
 
     Parameters
     ----------
-    df_r             : pd.DataFrame — correlations (features × conditions)
-    df_p             : pd.DataFrame — p-values matching df_r
-    category_colors  : dict, list, or None
-    rank_reference   : str or None — column to use for ranking panels by ρ
-    show_legend      : bool
-    annotate_sig     : bool — annotate lollipop tips with *, **, ns
-    fontsize         : base font size
+    df_r : pd.DataFrame
+        Correlations (features x conditions).
+    df_p : pd.DataFrame
+        P-values matching df_r.
+    category_colors : dict, list, or None
+        Per-category colours; a tab10 mapping is built if None.
+    rank_reference : str or None
+        Column used to rank the other panels by their Spearman rho against it.
+    show_legend : bool
+        Draw a category legend below the panels.
+    annotate_sig : bool
+        Annotate lollipop tips with **/*/ns.
+    fontsize : int
+        Base font size.
 
     Returns
     -------
-    fig, axes
+    fig : matplotlib Figure
+    axes : list of matplotlib Axes
     """
     features       = df_r.index.tolist()
     all_conditions = df_r.columns.tolist()
@@ -1150,24 +1165,30 @@ def plot_two_condition_supplement(df_r, df_p, reference, sig_threshold=0.05,
                                    absolute_delta=False, show_lollipop=True,
                                    split_lollipop=False, show_legend=True,
                                    fontsize=8):
-    """
-    Scatter + optional lollipop supplement for a two-condition correlation table.
+    """Scatter + optional lollipop supplement for a two-condition correlation table.
 
-    Left panel: scatter of r(reference) vs r(task).
-    Right panel(s): horizontal lollipop of Δr, sorted descending.
+    Left panel: scatter of r(reference) vs r(task). Right panel(s): horizontal
+    lollipop of the change in correlation (task - reference), sorted descending.
 
     Parameters
     ----------
-    df_r          : pd.DataFrame — 2 columns, one of which is `reference`
-    df_p          : pd.DataFrame — matching p-values
-    reference     : str — column name of the reference condition
-    show_lollipop : bool — show lollipop panel(s) alongside the scatter
-    split_lollipop: bool — split lollipop by sign of r(reference)
-    show_legend   : bool
+    df_r : pd.DataFrame
+        Exactly 2 columns, one of which is `reference`.
+    df_p : pd.DataFrame
+        Matching p-values.
+    reference : str
+        Column name of the reference condition.
+    show_lollipop : bool
+        Show the lollipop panel(s) alongside the scatter.
+    split_lollipop : bool
+        Split the lollipop by the sign of r(reference).
+    show_legend : bool
+        Draw a category legend.
 
     Returns
     -------
-    fig, tuple of axes
+    fig : matplotlib Figure
+    axes : tuple of matplotlib Axes
     """
     if df_r.shape[1] != 2:
         raise ValueError('plot_two_condition_supplement requires exactly 2 conditions.')
@@ -1300,12 +1321,14 @@ def plot_two_condition_supplement(df_r, df_p, reference, sig_threshold=0.05,
 
 # ==================== Support Utility Functions ====================
 def create_sydnor_sa_colormap():
-    """
-    Create a custom colormap that transitions from yellow/orange (sensorimotor pole, low rank) 
-    through white at the center to purple (association pole, high rank).
-    
-    Returns:
-        matplotlib.colors.LinearSegmentedColormap: The custom colormap
+    """Create the Sydnor S-A colormap (orange sensorimotor pole -> white -> purple association).
+
+    Also registers it with matplotlib under the name 'sydnor_sa'.
+
+    Returns
+    -------
+    matplotlib.colors.LinearSegmentedColormap
+        The custom colormap.
     """
     
     # Define the colors for the colormap
