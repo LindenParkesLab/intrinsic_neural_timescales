@@ -1,23 +1,21 @@
-import os, sys, time, getpass, warnings
+import warnings
+
 import numpy as np
 import scipy as sp
 import pandas as pd
 import seaborn as sns
-from scipy import stats
-from scipy.stats import pearsonr, spearmanr
-
-import seaborn as sns
+import matplotlib as mpl
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
+import matplotlib.gridspec as gridspec
+import matplotlib.patches as mpatches
 from matplotlib.colors import Normalize
 from matplotlib.cm import ScalarMappable
-plt.ion()
 
-import nibabel as nib
-from nilearn import datasets
-from nilearn import plotting
-from nilearn.image import new_img_like
-from nilearn.surface import load_surf_data, vol_to_surf
+try:
+    import adjustText
+except ImportError:  # optional; scatter labels fall back to no repulsion
+    adjustText = None
 
 
 def plot_autocorrelation_analysis(autocorr_raw, autocorr_resid, zero_crossings_raw, zero_crossings_resid, tr,
@@ -108,14 +106,14 @@ def plot_autocorrelation_analysis(autocorr_raw, autocorr_resid, zero_crossings_r
     if len(valid_raw) > 0:
         zero_crossings_seconds = valid_raw * tr
         ax3.hist(zero_crossings_seconds, bins=20, alpha=0.7, color='b', edgecolor='black', label='Before')
-        ax3.axvline(np.mean(zero_crossings_seconds), color='b', linestyle='--', linewidth=2,
-                   label=f'Mean (before): {np.mean(zero_crossings_seconds):.1f}s')
+        ax3.axvline(np.nanmean(zero_crossings_seconds), color='b', linestyle='--', linewidth=2,
+                   label=f'Mean (before): {np.nanmean(zero_crossings_seconds):.1f}s')
     
     if len(valid_resid) > 0:
         zero_crossings_seconds = valid_resid * tr
         ax3.hist(zero_crossings_seconds, bins=20, alpha=0.7, color='r', edgecolor='black', label='After')
-        ax3.axvline(np.mean(zero_crossings_seconds), color='r', linestyle='--', linewidth=2,
-                   label=f'Mean (after): {np.mean(zero_crossings_seconds):.1f}s')
+        ax3.axvline(np.nanmean(zero_crossings_seconds), color='r', linestyle='--', linewidth=2,
+                   label=f'Mean (after): {np.nanmean(zero_crossings_seconds):.1f}s')
     
     if len(valid_raw) == 0 and len(valid_resid) == 0:
         ax3.text(0.5, 0.5, 'No valid zero-crossings', ha='center', va='center', transform=ax3.transAxes)
@@ -136,9 +134,10 @@ def plot_autocorrelation_analysis(autocorr_raw, autocorr_resid, zero_crossings_r
 
 
 def plot_repeated_measures_violins(df, ax, color_vector=None, colormap='viridis',
-                                   point_alpha=1, line_alpha=1, violin_alpha=0.5, 
-                                   point_size=1, line_width=0.5, 
-                                   correlation_method=None, add_colorbar=True):
+                                   point_alpha=1, line_alpha=1, violin_alpha=0.5,
+                                   point_size=1, line_width=0.5,
+                                   correlation_method=None, add_colorbar=True,
+                                   annotate_variance=False, fontsize=8):
     """
     Create violin plots for repeated measures data with connecting lines.
     
@@ -173,6 +172,9 @@ def plot_repeated_measures_violins(df, ax, color_vector=None, colormap='viridis'
         If provided, correlations between color_vector and each condition are annotated.
     add_colorbar : bool, default=True
         Whether to add colorbar when color_vector is provided.
+    annotate_variance : bool, default=False
+        Whether to annotate standard deviation for each condition.
+        If correlation_method is None, only shows SD. Otherwise shows both.
         
     Returns
     -------
@@ -186,8 +188,6 @@ def plot_repeated_measures_violins(df, ax, color_vector=None, colormap='viridis'
     condition_names = df_clean.columns.tolist()
     n_conditions = len(condition_names)
     
-    print(f"Data shape: {df_clean.shape}")
-    print(f"Conditions: {condition_names}")
     
     # Reshape to long format for seaborn
     df_long = pd.melt(df_clean.reset_index(), 
@@ -233,7 +233,7 @@ def plot_repeated_measures_violins(df, ax, color_vector=None, colormap='viridis'
                    color=point_colors[i], alpha=point_alpha, 
                    s=point_size, zorder=2)
     
-    # Add correlation annotations if requested
+    # Add annotations if requested
     if color_vector is not None and correlation_method is not None:
         y_min, y_max = ax.get_ylim()
         
@@ -243,29 +243,65 @@ def plot_repeated_measures_violins(df, ax, color_vector=None, colormap='viridis'
             
             # Compute correlation
             if correlation_method.lower() == 'pearson':
-                corr_value, _ = pearsonr(condition_values[valid_mask], 
-                                        color_vector[valid_mask])
+                corr_value, _ = sp.stats.pearsonr(condition_values[valid_mask], 
+                                                   color_vector[valid_mask])
+                corr_symbol = 'r'
             elif correlation_method.lower() == 'spearman':
-                corr_value, _ = spearmanr(condition_values[valid_mask], 
-                                         color_vector[valid_mask])
+                corr_value, _ = sp.stats.spearmanr(condition_values[valid_mask], 
+                                                    color_vector[valid_mask])
+                corr_symbol = 'ρ'
             else:
                 raise ValueError("correlation_method must be 'pearson' or 'spearman'")
             
+            # Skip annotation if correlation is 1.00 (e.g. variable correlated with itself)
+            if round(corr_value, 2) == 1.0:
+                continue
+
+            # Build annotation text
+            annotation_text = f'{corr_symbol}={corr_value:.2f}'
+            
+            # Add variance if requested
+            if annotate_variance:
+                sd_value = np.nanstd(condition_values[valid_mask], ddof=1)
+                annotation_text += f',\nσ={sd_value:.2f}'
+            
             # Position annotation
             annotation_y = _calculate_annotation_height(condition_values, y_min, y_max)
-            ax.text(i, annotation_y, f'r={corr_value:.2f}', 
-                    ha='center', va='bottom', fontsize=5)
+            ax.text(i, annotation_y, annotation_text,
+                    ha='center', va='bottom', fontsize=fontsize-2)
+
+        # Adjust y-axis to accommodate annotations
+        if annotate_variance:
+            ax.set_ylim(y_min, y_max + (y_max - y_min) * 0.25)
+        else:
+            ax.set_ylim(y_min, y_max + (y_max - y_min) * 0.125)
+
+    elif annotate_variance:
+        # Only show variance, no correlation
+        y_min, y_max = ax.get_ylim()
+
+        for i, condition in enumerate(condition_names):
+            condition_values = df_clean[condition].values
+            valid_mask = ~df_clean[condition].isnull().values
+
+            sd_value = np.nanstd(condition_values[valid_mask], ddof=1)
+            annotation_text = f'σ={sd_value:.2f}'
+
+            # Position annotation
+            annotation_y = _calculate_annotation_height(condition_values, y_min, y_max)
+            ax.text(i, annotation_y, annotation_text,
+                    ha='center', va='bottom', fontsize=fontsize-2)
         
         # Adjust y-axis to accommodate annotations
-        ax.set_ylim(y_min, y_max + (y_max - y_min) * 0.1)
+        ax.set_ylim(y_min, y_max + (y_max - y_min) * 0.125)
     
     # Customize plot appearance
-    ax.set_xlabel('Condition', fontsize=10)
-    ax.set_ylabel('Value', fontsize=10)
-    ax.tick_params(axis='x', rotation=45)
-    ax.set_xticklabels(ax.get_xticklabels(), rotation=0, ha='center')
+    ax.set_xlabel('', fontsize=fontsize)
+    # ax.set_ylabel('Value', fontsize=fontsize)
+    ax.tick_params(axis='both', labelsize=fontsize)
+    ax.set_xticklabels(ax.get_xticklabels(), rotation=0, ha='center', fontsize=fontsize)
     ax.grid(True, alpha=0.3, axis='y')
-    
+
     # Add colorbar if requested
     if color_vector is not None and add_colorbar and cmap is not None:
         _add_colorbar(ax, cmap, min(color_vector), max(color_vector), 
@@ -274,15 +310,16 @@ def plot_repeated_measures_violins(df, ax, color_vector=None, colormap='viridis'
     return ax
 
 
-def plot_subject_level_violins(df, ax, observation_indices, 
+def plot_subject_level_violins(df, ax, observation_indices,
                                violin_alpha=0.5, point_alpha=0.5, point_size=1,
                                line_alpha=0.25, line_width=0.5,
                                show_points=True, point_jitter=0.02,
-                               show_lines=False, show_violins=True, 
+                               show_lines=False, show_violins=True,
                                line_color_by='subject', ylim=None,
                                fit_trends=False, trend_line_width=1, trend_alpha=1,
                                hide_legend=False, sort_by_median=False,
-                               add_colorbar=True, show_r2_annotation=False):
+                               add_colorbar=True, show_r2_annotation=False,
+                               annotate_variance=False, fontsize=8):
     """
     Create violin plots showing subject-level variation for selected regions.
     
@@ -336,6 +373,10 @@ def plot_subject_level_violins(df, ax, observation_indices,
         Whether to add colorbar when line_color_by='subject'.
     show_r2_annotation : bool, default=False
         Whether to show R² values above each condition (only when fit_trends=True).
+    annotate_variance : bool, default=False
+        Whether to annotate standard deviation for each condition.
+        If show_r2_annotation is False, only shows SD. Otherwise shows both.
+
         
     Returns
     -------
@@ -343,6 +384,15 @@ def plot_subject_level_violins(df, ax, observation_indices,
         The axes object with the plot.
     trend_results : dict, optional
         Dictionary containing trend fitting results if fit_trends=True.
+        
+    Notes
+    -----
+    NaN values are handled as follows:
+    - Median calculations use np.nanmedian
+    - Mean calculations (for trends) use np.nanmean
+    - NaN points are silently excluded from scatter plots
+    - NaN values are skipped in connecting lines
+    - Violins automatically handle NaN via seaborn
     """
     
     # Prepare data
@@ -357,9 +407,6 @@ def plot_subject_level_violins(df, ax, observation_indices,
     n_subjects = len(subject_ids)
     condition_names = [col for col in df_clean.columns if col != 'subject']
     
-    print(f"Number of subjects: {n_subjects}")
-    print(f"Selected regions: {observation_indices}")
-    print(f"Conditions: {condition_names}")
     
     # Create observation index within each subject
     df_clean['obs_index'] = df_clean.groupby('subject').cumcount()
@@ -367,22 +414,17 @@ def plot_subject_level_violins(df, ax, observation_indices,
     # Filter for selected observations
     df_filtered = df_clean[df_clean['obs_index'].isin(observation_indices)].copy()
     
-    print(f"Filtered data shape: {df_filtered.shape}")
-    print(f"Expected rows: {n_subjects * len(observation_indices)}")
     
     # Sort conditions by median if requested
     if sort_by_median:
         condition_medians = {
-            cond: np.median(df_filtered[cond].values) 
+            cond: np.nanmedian(df_filtered[cond].values) 
             for cond in condition_names
         }
         condition_names = sorted(condition_names, 
                                 key=lambda x: condition_medians[x], 
                                 reverse=True)
         
-        print("Sorted conditions by median (descending):")
-        for cond in condition_names:
-            print(f"  {cond}: median = {condition_medians[cond]:.4f}")
     
     # Reshape to long format
     df_long = pd.melt(df_filtered, 
@@ -412,7 +454,7 @@ def plot_subject_level_violins(df, ax, observation_indices,
     
     # Prepare colors for subjects (for line coloring)
     if line_color_by == 'subject':
-        subject_cmap = plt.cm.get_cmap('viridis')
+        subject_cmap = plt.get_cmap('viridis')
         subject_colors = {
             subj: subject_cmap(i / max(1, n_subjects - 1)) 
             for i, subj in enumerate(subject_ids)
@@ -429,7 +471,6 @@ def plot_subject_level_violins(df, ax, observation_indices,
     # Fit trends if requested
     trend_results = {}
     if fit_trends and n_observations >= 3:
-        print("Fitting polynomial trends to distribution means...")
         
         trend_color = "#3B3B3B"  # Soft grey
         n_conditions = len(condition_names)
@@ -444,7 +485,7 @@ def plot_subject_level_violins(df, ax, observation_indices,
                 mask = ((df_long['Condition'] == cond) & 
                        (df_long['obs_index'] == obs_idx))
                 region_data = df_long[mask]['Value']
-                region_means.append(np.mean(region_data))
+                region_means.append(np.nanmean(region_data))
             condition_means[cond] = np.array(region_means)
         
         # Fit trends for each condition
@@ -466,7 +507,7 @@ def plot_subject_level_violins(df, ax, observation_indices,
                     # Calculate R²
                     y_pred = poly_func(x_data)
                     ss_res = np.sum((means - y_pred) ** 2)
-                    ss_tot = np.sum((means - np.mean(means)) ** 2)
+                    ss_tot = np.sum((means - np.nanmean(means)) ** 2)
                     r2 = 1 - (ss_res / ss_tot) if ss_tot != 0 else 0
                     
                     r2_scores.append(r2)
@@ -515,7 +556,6 @@ def plot_subject_level_violins(df, ax, observation_indices,
                        color=trend_color, linewidth=trend_line_width, 
                        alpha=trend_alpha, linestyle='-', zorder=10)
             
-            print(f"  {cond}: Best fit = {degree_names[best_idx]} (R² = {best_r2:.3f})")
     
     # Add connecting lines if requested
     if show_lines:
@@ -538,6 +578,11 @@ def plot_subject_level_violins(df, ax, observation_indices,
                     for cond_idx, cond in enumerate(condition_names):
                         if cond in subject_obs_data.columns:
                             y_val = subject_obs_data[cond].iloc[0]
+                            
+                            # Skip NaN values
+                            if np.isnan(y_val):
+                                continue
+                            
                             y_values.append(y_val)
                             
                             # Calculate x position for this observation's violin
@@ -569,7 +614,10 @@ def plot_subject_level_violins(df, ax, observation_indices,
                 # Filter data for this condition and observation
                 mask = ((df_long['Condition'] == cond) & 
                        (df_long['obs_index'] == obs_val))
-                data_subset = df_long[mask]
+                data_subset = df_long[mask].copy()
+                
+                # Remove NaN values
+                data_subset = data_subset[~data_subset['Value'].isna()]
                 
                 if len(data_subset) > 0:
                     # Calculate x position
@@ -587,7 +635,7 @@ def plot_subject_level_violins(df, ax, observation_indices,
                              color=observation_colors[obs_idx], 
                              alpha=point_alpha, s=point_size, zorder=3)
     
-    # Add R² annotations if requested
+    # Add annotations if requested
     if show_r2_annotation and fit_trends and trend_results:
         y_min, y_max = ax.get_ylim()
         
@@ -595,25 +643,56 @@ def plot_subject_level_violins(df, ax, observation_indices,
             if cond in trend_results:
                 r2_value = trend_results[cond]['best_r2']
                 
-                # Find maximum value in this condition's distribution
-                condition_data = df_long[df_long['Condition'] == cond]['Value']
-                annotation_y = _calculate_annotation_height(condition_data.values, 
+                # Get condition data for annotation positioning and variance calculation
+                condition_data = df_long[df_long['Condition'] == cond]['Value'].values
+                annotation_y = _calculate_annotation_height(condition_data, 
                                                            y_min, y_max)
                 
+                # Build annotation text
+                annotation_text = f"R²={r2_value:.2f}"
+                
+                # Add variance if requested
+                if annotate_variance:
+                    sd_value = np.nanstd(condition_data, ddof=1)
+                    annotation_text += f",\nσ={sd_value:.2f}"
+                
                 # Place annotation
-                ax.text(cond_idx, annotation_y, f"R²={r2_value:.2f}",
-                       ha='center', va='bottom', fontsize=5)
+                ax.text(cond_idx, annotation_y, annotation_text,
+                       ha='center', va='bottom', fontsize=fontsize-2)
+
+        # Adjust y-axis to accommodate annotations
+        if annotate_variance:
+            ax.set_ylim(y_min, y_max + (y_max - y_min) * 0.3)
+        else:
+            ax.set_ylim(y_min, y_max + (y_max - y_min) * 0.15)
+
+    elif annotate_variance:
+        # Only show variance, no R²
+        y_min, y_max = ax.get_ylim()
+
+        for cond_idx, cond in enumerate(condition_names):
+            # Get condition data
+            condition_data = df_long[df_long['Condition'] == cond]['Value'].values
+
+            sd_value = np.nanstd(condition_data, ddof=1)
+            annotation_text = f"σ={sd_value:.2f}"
+
+            # Position annotation
+            annotation_y = _calculate_annotation_height(condition_data, y_min, y_max)
+            ax.text(cond_idx, annotation_y, annotation_text,
+                   ha='center', va='bottom', fontsize=fontsize-2)
         
         # Adjust y-axis to accommodate annotations
-        ax.set_ylim(y_min, y_max + (y_max - y_min) * 0.1)
+        ax.set_ylim(y_min, y_max + (y_max - y_min) * 0.15)
     
     # Customize plot appearance
-    ax.set_xlabel('Condition', fontsize=10)
-    ax.set_ylabel('Value', fontsize=10)
+    ax.set_xlabel('', fontsize=fontsize)
+    # ax.set_ylabel('Value', fontsize=fontsize)
+    ax.tick_params(axis='both', labelsize=fontsize)
     ax.set_xticks(range(len(condition_names)))
-    ax.set_xticklabels(condition_names, rotation=0, ha='center')
+    ax.set_xticklabels(condition_names, rotation=0, ha='center', fontsize=fontsize)
     ax.grid(True, alpha=0.3, axis='y')
-    
+
     # Create legend
     legend_handles = []
     legend_labels = []
@@ -626,9 +705,8 @@ def plot_subject_level_violins(df, ax, observation_indices,
             legend_handles.extend(region_handles)
             legend_labels.extend(region_labels)
         else:
-            from matplotlib.patches import Patch
             region_elements = [
-                Patch(facecolor=observation_colors[i], label=f'Index {idx}') 
+                mpatches.Patch(facecolor=observation_colors[i], label=f'Index {idx}')
                 for i, idx in enumerate(observation_indices)
             ]
             legend_handles.extend(region_elements)
@@ -636,9 +714,9 @@ def plot_subject_level_violins(df, ax, observation_indices,
     
     # Set legend
     if legend_handles and not hide_legend:
-        ax.legend(handles=legend_handles, labels=legend_labels, 
-                 title='Group Index', loc='upper right', 
-                 bbox_to_anchor=(1, 1), fontsize=9)
+        ax.legend(handles=legend_handles, labels=legend_labels,
+                 title='Group Index', loc='upper right',
+                 bbox_to_anchor=(1, 1), fontsize=fontsize)
     
     # Add colorbar for subject coloring if applicable
     if show_lines and line_color_by == 'subject' and add_colorbar:
@@ -661,785 +739,6 @@ def plot_subject_level_violins(df, ax, observation_indices,
         return ax, trend_results
     else:
         return ax
-
-
-def plot_correlation(x, y, x_label=None, y_label=None, title=None, 
-                    method='pearson', color="#3B3B3B", alpha=0.6, 
-                    size=20, figsize=(3, 3), show_line=True, 
-                    show_confidence=True, show_stats=True,
-                    stats_position='upper left', font_size=8,
-                    grid=True, grid_alpha=0.3, dpi=300,
-                    outlier_threshold=None, highlight_outliers=False, 
-                    save_path=None, return_stats=False, ax=None,
-                    auto_polynomial=False, models_to_test=[1, 2, 3], 
-                    model_selection_metric='variance_explained',
-                    data_group=None, data_group_cmap='tab10'):
-    """
-    Enhanced correlation plot with automatic polynomial model selection and data group coloring.
-    
-    Parameters:
-    -----------
-    x, y : array-like, pandas.Series, or numpy.ndarray
-        Input variables to correlate. If pandas Series, their names will be used 
-        as default axis labels unless x_label/y_label are explicitly provided.
-    x_label, y_label : str, optional
-        Labels for x and y axes. If None and inputs are pandas Series, 
-        the Series names will be used automatically.
-    title : str, optional
-        Plot title
-    method : str, default 'pearson'
-        Correlation method ('pearson', 'spearman')
-    color : str, default '#3B3B3B'
-        Color for scatter points and regression line (used when data_group=None)
-    alpha : float, default 0.6
-        Transparency of scatter points
-    size : float, default 20
-        Size of scatter points
-    figsize : tuple, default (3, 3)
-        Figure size in inches (only used if ax=None)
-    show_line : bool, default True
-        Whether to show regression line
-    show_confidence : bool, default True
-        Whether to show confidence interval around regression line
-    show_stats : bool, default True
-        Whether to display correlation statistics on plot
-    stats_position : str, default 'upper left'
-        Position of statistics text box
-    font_size : int, default 8
-        Base font size for labels and text
-    grid : bool, default True
-        Whether to show grid
-    grid_alpha : float, default 0.3
-        Grid transparency
-    outlier_threshold : float, optional
-        Z-score threshold for outlier detection (e.g., 2.5)
-    highlight_outliers : bool, default False
-        Whether to highlight outliers in different color
-    save_path : str, optional
-        Path to save the figure (only used if ax=None)
-    return_stats : bool, default False
-        Whether to return correlation statistics
-    ax : matplotlib.axes.Axes, optional
-        Pre-existing axis to plot on. If None, creates new figure and axis.
-    auto_polynomial : bool, default False
-        Whether to automatically select best polynomial fit
-    models_to_test : list, default [1, 2, 3]
-        List of polynomial degrees to test (e.g., [1, 2, 3] for linear, quadratic, cubic)
-    model_selection_metric : str, default 'variance_explained'
-        Metric for model selection: 'variance_explained', 'rmse', or 'mae'
-    data_group : array-like, optional
-        Vector of integer values or string labels designating which group each data point belongs to.
-        Must have same length as x and y. If provided, points will be colored by group.
-    data_group_cmap : str, default 'tab10'
-        Colormap to use for data group coloring. Good options: 'tab10', 'tab20', 'Set3', 'viridis'
-        
-    Returns:
-    --------
-    fig, ax : matplotlib objects (if ax=None)
-        Figure and axis objects
-    ax : matplotlib axis object (if ax was provided)
-        The provided axis object
-    stats_dict : dict, optional
-        Dictionary with correlation statistics (if return_stats=True)
-    """
-    
-    # Handle pandas Series input and extract labels
-    x_series_name = None
-    y_series_name = None
-    
-    if isinstance(x, pd.Series):
-        x_series_name = x.name
-        x = x.values
-    if isinstance(y, pd.Series):
-        y_series_name = y.name
-        y = y.values
-    
-    # Set default labels from pandas Series names if not provided
-    if x_label is None and x_series_name is not None:
-        x_label = str(x_series_name)
-    if y_label is None and y_series_name is not None:
-        y_label = str(y_series_name)
-    
-    # Convert to numpy arrays and handle missing data
-    x = np.array(x, dtype=float)
-    y = np.array(y, dtype=float)
-    
-    # Handle data_group input
-    if data_group is not None:
-        data_group = np.array(data_group)  # Don't force dtype - allow strings or integers
-        if len(data_group) != len(x):
-            raise ValueError(f"data_group length ({len(data_group)}) must match x and y length ({len(x)})")
-    
-    # Remove NaN values
-    valid_mask = ~(np.isnan(x) | np.isnan(y))
-    x_clean = x[valid_mask]
-    y_clean = y[valid_mask]
-    
-    if data_group is not None:
-        data_group_clean = data_group[valid_mask]
-    
-    if len(x_clean) < 3:
-        raise ValueError("Need at least 3 valid data points for correlation")
-    
-    # Calculate correlation
-    if method.lower() == 'pearson':
-        corr_coef, p_value = pearsonr(x_clean, y_clean)
-        method_name = "Pearson"
-    elif method.lower() == 'spearman':
-        corr_coef, p_value = spearmanr(x_clean, y_clean)
-        method_name = "Spearman"
-    else:
-        raise ValueError("Method must be 'pearson' or 'spearman'")
-    
-    # Detect outliers if requested
-    outlier_mask = np.zeros(len(x_clean), dtype=bool)
-    if outlier_threshold is not None:
-        z_scores_x = np.abs(stats.zscore(x_clean))
-        z_scores_y = np.abs(stats.zscore(y_clean))
-        outlier_mask = (z_scores_x > outlier_threshold) | (z_scores_y > outlier_threshold)
-    
-    # Create figure and axis or use provided axis
-    created_new_figure = ax is None
-    if created_new_figure:
-        fig, ax = plt.subplots(figsize=figsize)
-    else:
-        fig = ax.get_figure()
-    
-    # Plot scatter points
-    if data_group is not None:
-        # Color by data groups (handles both strings and integers)
-        unique_groups = np.unique(data_group_clean)
-        n_groups = len(unique_groups)
-        
-        # Get colormap
-        cmap = plt.cm.get_cmap(data_group_cmap)
-        
-        # Create colors for each group
-        if n_groups <= 10 and data_group_cmap == 'tab10':
-            # Use discrete colors for tab10
-            colors = [cmap(i) for i in range(n_groups)]
-        elif n_groups <= 20 and data_group_cmap == 'tab20':
-            # Use discrete colors for tab20
-            colors = [cmap(i) for i in range(n_groups)]
-        else:
-            # Use continuous colormap
-            colors = [cmap(i / max(1, n_groups - 1)) for i in range(n_groups)]
-        
-        # Create mapping from group labels to colors
-        group_colors = {group: colors[i] for i, group in enumerate(unique_groups)}
-        
-        # Plot points for each data group
-        for group in unique_groups:
-            group_mask = data_group_clean == group
-            
-            if highlight_outliers and np.any(outlier_mask):
-                # Separate normal and outlier points within this group
-                normal_mask = group_mask & (~outlier_mask)
-                outlier_mask_group = group_mask & outlier_mask
-                
-                # Plot normal points for this group
-                if np.any(normal_mask):
-                    ax.scatter(x_clean[normal_mask], y_clean[normal_mask], 
-                              c=[group_colors[group]], alpha=alpha, s=size, 
-                              edgecolors='white', linewidth=0.5, 
-                              label=f'{group}')
-                
-                # Plot outliers for this group with different marker
-                if np.any(outlier_mask_group):
-                    ax.scatter(x_clean[outlier_mask_group], y_clean[outlier_mask_group], 
-                              c=[group_colors[group]], alpha=alpha+0.2, s=size*1.2, 
-                              edgecolors='darkred', linewidth=1, marker='^',
-                              label=f'{group} (outliers)')
-            else:
-                # Plot all points for this group normally
-                ax.scatter(x_clean[group_mask], y_clean[group_mask], 
-                          c=[group_colors[group]], alpha=alpha, s=size, 
-                          edgecolors='white', linewidth=0.5, 
-                          label=f'{group}')
-        
-        # Add colorbar for data groups
-        if n_groups > 1:  # Only add colorbar if more than one group
-            # For string labels, we need to create a discrete colorbar
-            if isinstance(unique_groups[0], (str, np.str_)):
-                # Create discrete colorbar for string labels
-                # Import required matplotlib components for colorbar handling
-                from matplotlib.colors import BoundaryNorm, ListedColormap
-                
-                # Create a listed colormap from the colors we're using
-                listed_cmap = ListedColormap(colors[:n_groups])
-                bounds = np.arange(n_groups + 1) - 0.5
-                norm = BoundaryNorm(bounds, listed_cmap.N)
-                
-                sm = plt.cm.ScalarMappable(cmap=listed_cmap, norm=norm)
-                sm.set_array([])
-                cbar = plt.colorbar(sm, ax=ax, shrink=0.8, aspect=20, pad=0.05)
-                cbar.set_label('Data Group', fontsize=font_size-2)
-                
-                # Set colorbar ticks to show string labels
-                cbar.set_ticks(np.arange(n_groups))
-                if n_groups <= 10:
-                    cbar.set_ticklabels(unique_groups)
-                else:
-                    # For many groups, show fewer labels
-                    tick_indices = np.linspace(0, n_groups-1, min(5, n_groups), dtype=int)
-                    cbar.set_ticks(tick_indices)
-                    cbar.set_ticklabels([unique_groups[i] for i in tick_indices])
-            else:
-                # Original numeric colorbar
-                sm = plt.cm.ScalarMappable(cmap=cmap, 
-                                          norm=plt.Normalize(vmin=min(unique_groups), 
-                                                           vmax=max(unique_groups)))
-                sm.set_array([])
-                cbar = plt.colorbar(sm, ax=ax, shrink=0.8, aspect=20, pad=0.05)
-                cbar.set_label('Data Group', fontsize=font_size-2)
-                
-                # Set colorbar ticks to show group numbers
-                if n_groups <= 10:
-                    cbar.set_ticks(unique_groups)
-                else:
-                    # For many groups, show fewer ticks
-                    tick_groups = unique_groups[::max(1, len(unique_groups)//5)]
-                    cbar.set_ticks(tick_groups)
-    
-    else:
-        # Original coloring logic when data_group is None
-        if highlight_outliers and np.any(outlier_mask):
-            # Plot normal points
-            normal_mask = ~outlier_mask
-            ax.scatter(x_clean[normal_mask], y_clean[normal_mask], 
-                      c=color, alpha=alpha, s=size, edgecolors='white', 
-                      linewidth=0.5, label='Data points')
-            
-            # Plot outliers
-            ax.scatter(x_clean[outlier_mask], y_clean[outlier_mask], 
-                      c='red', alpha=alpha+0.2, s=size*1.2, edgecolors='darkred', 
-                      linewidth=1, marker='^', label='Outliers')
-        else:
-            ax.scatter(x_clean, y_clean, c=color, alpha=alpha, s=size, 
-                      edgecolors='white', linewidth=0.5)
-    
-    # Initialize model info for stats display
-    best_model_info = None
-    
-    # Add regression line and confidence interval
-    if show_line and len(x_clean) > 2:
-        
-        if auto_polynomial and len(x_clean) >= (max(models_to_test) + 1):  # Need more points than max degree
-            # Test specified polynomial degrees
-            model_results = {}
-            
-            for degree in models_to_test:
-                if len(x_clean) > degree:  # Need more points than parameters
-                    try:
-                        # Fit polynomial
-                        poly_coeffs = np.polyfit(x_clean, y_clean, degree)
-                        y_pred = np.polyval(poly_coeffs, x_clean)
-                        
-                        # Calculate model fit metrics
-                        residuals = y_clean - y_pred
-                        ss_res = np.sum(residuals ** 2)
-                        ss_tot = np.sum((y_clean - np.mean(y_clean)) ** 2)
-                        
-                        # Variance explained (R²)
-                        r_squared = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0
-                        
-                        # RMSE
-                        rmse = np.sqrt(np.mean(residuals ** 2))
-                        
-                        # MAE
-                        mae = np.mean(np.abs(residuals))
-                        
-                        model_results[degree] = {
-                            'coeffs': poly_coeffs,
-                            'r_squared': r_squared,
-                            'rmse': rmse,
-                            'mae': mae,
-                            'y_pred': y_pred
-                        }
-                    except (np.RankWarning, np.linalg.LinAlgError):
-                        # Skip this degree if fitting fails
-                        continue
-            
-            # Select best model based on chosen metric
-            if model_results:
-                if model_selection_metric == 'variance_explained':
-                    best_degree = max(model_results.keys(), 
-                                    key=lambda k: model_results[k]['r_squared'])
-                elif model_selection_metric == 'rmse':
-                    best_degree = min(model_results.keys(), 
-                                    key=lambda k: model_results[k]['rmse'])
-                elif model_selection_metric == 'mae':
-                    best_degree = min(model_results.keys(), 
-                                    key=lambda k: model_results[k]['mae'])
-                else:
-                    raise ValueError("model_selection_metric must be 'variance_explained', 'rmse', or 'mae'")
-                
-                best_model = model_results[best_degree]
-                best_model_info = {
-                    'degree': best_degree,
-                    'r_squared': best_model['r_squared'],
-                    'rmse': best_model['rmse'],
-                    'mae': best_model['mae'],
-                    'metric_used': model_selection_metric
-                }
-                
-                # Create smooth line for plotting
-                x_line = np.linspace(np.min(x_clean), np.max(x_clean), 100)
-                y_line = np.polyval(best_model['coeffs'], x_line)
-                
-                # Plot regression line
-                degree_names = {1: 'Linear', 2: 'Quadratic', 3: 'Cubic', 4: 'Quartic', 
-                               5: 'Quintic', 6: 'Sextic'}
-                model_name = degree_names.get(best_degree, f'Degree {best_degree}')
-                
-                # Use the original color for regression line
-                line_color = color if data_group is None else '#3B3B3B'
-                ax.plot(x_line, y_line, color=line_color, linewidth=2.5, alpha=0.8, 
-                       linestyle='-', 
-                       label=f'{model_name} fit (R²={best_model["r_squared"]:.3f})')
-                
-                # Add confidence interval for polynomial (approximation)
-                if show_confidence and best_degree == 1:  # Only for linear
-                    # Use the original linear regression confidence interval calculation
-                    slope, intercept, r_value, p_value_reg, std_err = stats.linregress(x_clean, y_clean)
-                    
-                    def predict_interval(x_new, x_data, y_data, confidence=0.95):
-                        n = len(x_data)
-                        x_mean = np.mean(x_data)
-                        sxx = np.sum((x_data - x_mean) ** 2)
-                        sxy = np.sum((x_data - x_mean) * (y_data - np.mean(y_data)))
-                        syy = np.sum((y_data - np.mean(y_data)) ** 2)
-                        
-                        s = np.sqrt((syy - sxy**2/sxx) / (n - 2))
-                        t_val = stats.t.ppf((1 + confidence) / 2, n - 2)
-                        
-                        margin = t_val * s * np.sqrt(1/n + (x_new - x_mean)**2/sxx)
-                        y_pred = slope * x_new + intercept
-                        
-                        return y_pred - margin, y_pred + margin
-                    
-                    y_lower, y_upper = predict_interval(x_line, x_clean, y_clean)
-                    ax.fill_between(x_line, y_lower, y_upper, color=line_color, alpha=0.15, 
-                                   label='95% Confidence Interval')
-            else:
-                # Fall back to linear regression if polynomial fitting fails
-                auto_polynomial = False
-        
-        if not auto_polynomial:
-            # Original linear regression
-            slope, intercept, r_value, p_value_reg, std_err = stats.linregress(x_clean, y_clean)
-            
-            # Create line points
-            x_line = np.linspace(np.min(x_clean), np.max(x_clean), 100)
-            y_line = slope * x_line + intercept
-            
-            # Plot regression line
-            line_color = color if data_group is None else '#3B3B3B'
-            ax.plot(x_line, y_line, color=line_color, linewidth=2.5, alpha=0.8, 
-                   linestyle='-', label='Linear regression')
-            
-            # Store linear model info
-            y_pred_linear = slope * x_clean + intercept
-            residuals_linear = y_clean - y_pred_linear
-            ss_res_linear = np.sum(residuals_linear ** 2)
-            ss_tot_linear = np.sum((y_clean - np.mean(y_clean)) ** 2)
-            r_squared_linear = 1 - (ss_res_linear / ss_tot_linear) if ss_tot_linear > 0 else 0
-            
-            best_model_info = {
-                'degree': 1,
-                'r_squared': r_squared_linear,
-                'rmse': np.sqrt(np.mean(residuals_linear ** 2)),
-                'mae': np.mean(np.abs(residuals_linear)),
-                'metric_used': 'linear_only'
-            }
-            
-            # Add confidence interval
-            if show_confidence:
-                def predict_interval(x_new, x_data, y_data, confidence=0.95):
-                    n = len(x_data)
-                    x_mean = np.mean(x_data)
-                    sxx = np.sum((x_data - x_mean) ** 2)
-                    sxy = np.sum((x_data - x_mean) * (y_data - np.mean(y_data)))
-                    syy = np.sum((y_data - np.mean(y_data)) ** 2)
-                    
-                    s = np.sqrt((syy - sxy**2/sxx) / (n - 2))
-                    t_val = stats.t.ppf((1 + confidence) / 2, n - 2)
-                    
-                    margin = t_val * s * np.sqrt(1/n + (x_new - x_mean)**2/sxx)
-                    y_pred = slope * x_new + intercept
-                    
-                    return y_pred - margin, y_pred + margin
-                
-                y_lower, y_upper = predict_interval(x_line, x_clean, y_clean)
-                ax.fill_between(x_line, y_lower, y_upper, color=line_color, alpha=0.15, 
-                               label='95% Confidence Interval')
-    
-    # Add statistics text box
-    if show_stats:
-        # Determine significance stars
-        if p_value < 0.001:
-            sig_stars = "***"
-        elif p_value < 0.01:
-            sig_stars = "**"
-        elif p_value < 0.05:
-            sig_stars = "*"
-        else:
-            sig_stars = "ns"
-        
-        # Create statistics text
-        stats_text = f"{method_name} r = {corr_coef:.3f}{sig_stars}\n"
-        stats_text += f"p = {p_value:.3e}"
-        # stats_text += f"n = {len(x_clean)}"
-        
-        # Add data group info if provided
-        if data_group is not None:
-            unique_groups = np.unique(data_group_clean)
-            # stats_text += f"\nGroups: {len(unique_groups)}"
-            # Show actual group labels if they're short enough
-            if len(unique_groups) <= 5:
-                if isinstance(unique_groups[0], (str, np.str_)):
-                    group_labels = ", ".join([str(g) for g in unique_groups])
-                    if len(group_labels) <= 20:  # Only show if not too long
-                        stats_text += f"\n({group_labels})"
-        
-        # Add model information if available and auto_polynomial was used
-        if best_model_info is not None and auto_polynomial:
-            degree_names = {1: 'Linear', 2: 'Quadratic', 3: 'Cubic', 4: 'Quartic', 
-                           5: 'Quintic', 6: 'Sextic'}
-            model_name = degree_names.get(best_model_info['degree'], f"Degree {best_model_info['degree']}")
-            stats_text += f"\n{model_name} fit:"
-            metric_values = {
-                'variance_explained': best_model_info['r_squared'],
-                'rmse': best_model_info['rmse'],
-                'mae': best_model_info['mae']
-            }
-            metric_labels = {
-                'variance_explained': 'R²',
-                'rmse': 'RMSE',
-                'mae': 'MAE'
-            }
-            metric_value = metric_values.get(model_selection_metric, 0)
-            metric_label = metric_labels.get(model_selection_metric, model_selection_metric)
-            stats_text += f"\n{metric_label} = {metric_value:.3f}"
-        
-        if np.any(outlier_mask):
-            stats_text += f"\nOutliers: {np.sum(outlier_mask)}"
-        
-        # Position the text box
-        position_dict = {
-            'upper left': (0.05, 0.95),
-            'upper right': (0.95, 0.95),
-            'lower left': (0.05, 0.05),
-            'lower right': (0.95, 0.05)
-        }
-        
-        text_x, text_y = position_dict.get(stats_position, (0.05, 0.95))
-        ha = 'left' if text_x < 0.5 else 'right'
-        va = 'top' if text_y > 0.5 else 'bottom'
-        
-        ax.text(text_x, text_y, stats_text, transform=ax.transAxes,
-               bbox=dict(boxstyle="round,pad=0.3", facecolor='white', 
-                        edgecolor='gray', alpha=0.8),
-               fontsize=font_size-2, ha=ha, va=va, family='monospace')
-    
-    # Customize appearance
-    ax.set_xlabel(x_label or 'X Variable', fontsize=font_size)
-    ax.set_ylabel(y_label or 'Y Variable', fontsize=font_size)
-    
-    if title:
-        ax.set_title(title, fontsize=font_size+2, fontweight='bold', pad=10)
-    
-    # Grid
-    if grid:
-        ax.grid(True, alpha=grid_alpha, linestyle='-', linewidth=0.5)
-        ax.set_axisbelow(True)
-    
-    # Styling
-    ax.spines['top'].set_visible(False)
-    ax.spines['right'].set_visible(False)
-    ax.spines['left'].set_linewidth(1.2)
-    ax.spines['bottom'].set_linewidth(1.2)
-    
-    # Tick parameters
-    ax.tick_params(axis='both', which='major', labelsize=font_size,
-                  length=6, width=1.2, colors='black')
-    
-    # Legend if data_group are provided or outliers are highlighted
-    # if (data_group is not None and len(np.unique(data_group_clean)) <= 10) or \
-    #    (highlight_outliers and np.any(outlier_mask)):
-    #     # Position legend outside plot area when using data groups to avoid overlap with colorbar
-    #     if data_group is not None and len(np.unique(data_group_clean)) > 1:
-    #         ax.legend(fontsize=font_size-2, framealpha=0.9, 
-    #                  bbox_to_anchor=(1.15, 1), loc='upper left')
-    #     else:
-    #         ax.legend(fontsize=font_size-2, loc='best', framealpha=0.9)
-    
-    # Only apply tight_layout and save if we created a new figure
-    if created_new_figure:
-        plt.tight_layout()
-        
-        # Save figure if path provided
-        if save_path:
-            plt.savefig(save_path, dpi=dpi, bbox_inches='tight', 
-                       facecolor='white', edgecolor='none')
-    
-    # Prepare return values
-    stats_dict = None
-    if return_stats:
-        stats_dict = {
-            'correlation': corr_coef,
-            'p_value': p_value,
-            'n_samples': len(x_clean),
-            'method': method_name,
-            'n_outliers': np.sum(outlier_mask) if outlier_threshold else 0,
-            'outlier_indices': np.where(valid_mask)[0][outlier_mask] if outlier_threshold else [],
-            'model_info': best_model_info,
-            'data_group_info': {
-                'n_groups': len(np.unique(data_group_clean)) if data_group is not None else None,
-                'unique_groups': np.unique(data_group_clean).tolist() if data_group is not None else None,
-                'group_type': 'string' if data_group is not None and isinstance(np.unique(data_group_clean)[0], (str, np.str_)) else 'numeric'
-            } if data_group is not None else None
-        }
-    
-    # Return appropriate values based on whether we created a new figure
-    if created_new_figure:
-        if return_stats:
-            return fig, ax, stats_dict
-        else:
-            return fig, ax
-    else:
-        if return_stats:
-            return ax, stats_dict
-        else:
-            return ax
-        
-
-def plot_brain_surface_data(data_vector, parcellation='schaefer_400', surface='fsaverage5',
-                           cmap='viridis', vmin=None, vmax=None, threshold=None,
-                           title='Brain Surface Data', figsize=(6, 4), 
-                           colorbar=True, symmetric_cbar=False, save_path=None, 
-                           dpi=300, alpha=0.8, darkness=0.7, show_stats=False):
-    """
-    Plot brain data on cortical surface with lateral and medial views for both hemispheres.
-    
-    Parameters:
-    -----------
-    data_vector : array-like
-        1D numpy array containing brain data values. Length should match the number of parcels
-        in the specified parcellation (e.g., 400 for Schaefer 400-parcel atlas).
-    parcellation : str, default 'schaefer_400'
-        Parcellation scheme to use. Options: 'schaefer_400', 'schaefer_200', 'schaefer_100'
-    surface : str, default 'fsaverage5'
-        Brain surface to use. Options: 'fsaverage5', 'fsaverage'
-    cmap : str, default 'viridis'
-        Colormap for data visualization
-    vmin, vmax : float, optional
-        Min/max values for color scaling. If None, uses data range.
-    threshold : float, optional
-        Threshold below which values are not displayed
-    title : str, default 'Brain Surface Data'
-        Main title for the figure
-    figsize : tuple, default (6, 4)
-        Figure size (width, height) in inches
-    colorbar : bool, default True
-        Whether to show colorbar
-    symmetric_cbar : bool, default False
-        Whether to center colorbar at zero
-    save_path : str, optional
-        Path to save the figure
-    dpi : int, default 300
-        DPI for saved figure
-    alpha : float, default 0.8
-        Transparency of the surface data overlay
-    darkness : float, default 0.7
-        Darkness of the brain surface (0=light, 1=dark)
-    show_stats : bool, default False
-        Whether to show data statistics text box
-        
-    Returns:
-    --------
-    fig : matplotlib.figure.Figure
-        The created figure object
-    axes : list
-        List of matplotlib axes objects for each subplot
-        
-    Examples:
-    ---------
-    # Generate example data for 400-parcel Schaefer atlas
-    example_data = np.random.randn(400)
-    fig, axes = plot_brain_surface_data(example_data, title='Random Brain Data')
-    
-    # Plot with custom parameters
-    fig, axes = plot_brain_surface_data(
-        data_vector=my_brain_data,
-        parcellation='schaefer_400',
-        cmap='RdBu_r',
-        symmetric_cbar=True,
-        threshold=0.1,
-        title='Task-related Brain Activity',
-        show_stats=True  # Show statistics box
-    )
-    """
-    
-    # Validate input data
-    data_vector = np.array(data_vector)
-    if data_vector.ndim != 1:
-        raise ValueError("data_vector must be 1-dimensional")
-    
-    # Load appropriate parcellation atlas
-    if parcellation == 'schaefer_400':
-        atlas = datasets.fetch_atlas_schaefer_2018(n_rois=400, yeo_networks=7, resolution_mm=1)
-        expected_length = 400
-    elif parcellation == 'schaefer_200':
-        atlas = datasets.fetch_atlas_schaefer_2018(n_rois=200, yeo_networks=7, resolution_mm=1)
-        expected_length = 200
-    elif parcellation == 'schaefer_100':
-        atlas = datasets.fetch_atlas_schaefer_2018(n_rois=100, yeo_networks=7, resolution_mm=1)
-        expected_length = 100
-    else:
-        raise ValueError(f"Unsupported parcellation: {parcellation}")
-    
-    # Validate data length
-    if len(data_vector) != expected_length:
-        raise ValueError(f"Data vector length ({len(data_vector)}) doesn't match expected parcellation size ({expected_length})")
-    
-    # Load brain surface
-    if surface == 'fsaverage5':
-        surf_mesh = datasets.fetch_surf_fsaverage(mesh='fsaverage5')
-    elif surface == 'fsaverage':
-        surf_mesh = datasets.fetch_surf_fsaverage(mesh='fsaverage')
-    else:
-        raise ValueError(f"Unsupported surface: {surface}")
-    
-    
-    # Load the atlas image
-    atlas_img = nib.load(atlas['maps'])
-    atlas_data = atlas_img.get_fdata()
-    
-    # Create data image by mapping parcel values to atlas regions
-    data_img_data = np.zeros_like(atlas_data)
-    for i, value in enumerate(data_vector):
-        data_img_data[atlas_data == (i + 1)] = value  # Atlas labels start from 1
-    
-    # Create nibabel image
-    data_img = new_img_like(atlas_img, data_img_data)
-    
-    # Project volumetric data to surface for each hemisphere
-    # Use nearest neighbor interpolation to preserve discrete parcellation boundaries
-    # Set radius and n_samples to minimum values for precise mapping
-    surf_data_left = vol_to_surf(data_img, surf_mesh['pial_left'], 
-                                 interpolation='nearest', radius=0.1, n_samples=1)
-    surf_data_right = vol_to_surf(data_img, surf_mesh['pial_right'], 
-                                  interpolation='nearest', radius=0.1, n_samples=1)
-    
-    # Set up color scaling
-    if vmin is None:
-        vmin = np.min(data_vector)
-    if vmax is None:
-        vmax = np.max(data_vector)
-    
-    if symmetric_cbar:
-        abs_max = max(abs(vmin), abs(vmax))
-        vmin, vmax = -abs_max, abs_max
-    
-    # Create main figure
-    fig = plt.figure(figsize=figsize)
-    
-    # Define views and data
-    views_data = [
-        ('left', 'lateral', 'Left Lateral', surf_data_left, surf_mesh['pial_left']),
-        ('left', 'medial', 'Left Medial', surf_data_left, surf_mesh['pial_left']), 
-        ('right', 'lateral', 'Right Lateral', surf_data_right, surf_mesh['pial_right']),
-        ('right', 'medial', 'Right Medial', surf_data_right, surf_mesh['pial_right'])
-    ]
-    
-    axes = []
-    
-    # Plot each view
-    for idx, (hemi, view, view_title, surf_data, surf_mesh_hemi) in enumerate(views_data):
-        # Create subplot with 3D projection
-        ax = fig.add_subplot(2, 2, idx+1, projection='3d')
-        axes.append(ax)
-        
-        try:
-            # Create surface plot using plot_surf_stat_map
-            plotting.plot_surf_stat_map(
-                surf_mesh=surf_mesh_hemi,
-                stat_map=surf_data,
-                hemi=hemi,
-                view=view,
-                bg_map=surf_mesh[f'sulc_{hemi}'],
-                bg_on_data=True,
-                alpha=alpha,
-                darkness=darkness,
-                vmin=vmin,
-                vmax=vmax,
-                cmap=cmap,
-                threshold=threshold,
-                colorbar=False,  # We'll add a single colorbar later
-                axes=ax,
-                figure=fig
-            )
-            
-            # Set subplot title
-            # ax.set_title(view_title, fontsize=12, fontweight='bold', pad=10)
-            
-        except Exception as e:
-            print(f"Warning: Could not plot {view_title}: {str(e)}")
-            # Clear the 3D axis and create a simple error display
-            ax.clear()
-            ax.text(0.5, 0.5, 0.5, f'Error plotting\n{view_title}', 
-                   ha='center', va='center', fontsize=10, transform=ax.transData)
-            ax.set_xlim(0, 1)
-            ax.set_ylim(0, 1) 
-            ax.set_zlim(0, 1)
-            ax.set_xticks([])
-            ax.set_yticks([])
-            ax.set_zticks([])
-            # ax.set_title(view_title, fontsize=12, fontweight='bold', pad=10)
-    
-    # Add main title
-    fig.suptitle(title, fontsize=14, fontweight='bold', y=0.98)
-    
-    # Add colorbar
-    if colorbar:
-
-        
-        norm = Normalize(vmin=vmin, vmax=vmax)
-        sm = ScalarMappable(norm=norm, cmap=cmap)
-        sm.set_array([])
-        
-        # Position colorbar
-        cbar_ax = fig.add_axes([0.87, 0.15, 0.025, 0.7])
-        cbar = fig.colorbar(sm, cax=cbar_ax)
-        cbar.set_label('Data Values', fontsize=10, fontweight='bold')
-        cbar.ax.tick_params(labelsize=9)
-    
-    # Adjust layout to minimize white space - very aggressive spacing
-    plt.tight_layout(pad=0.0, h_pad=-0.5, w_pad=-0.5)
-    if colorbar:
-        plt.subplots_adjust(right=0.9, hspace=-0.2, wspace=-0.25)
-    else:
-        plt.subplots_adjust(hspace=-0.2, wspace=-0.25)
-    
-    # Add data statistics as text (optional)
-    if show_stats:
-        stats_text = f"Data Range: [{np.min(data_vector):.3f}, {np.max(data_vector):.3f}]\n"
-        stats_text += f"Mean: {np.mean(data_vector):.3f}, Std: {np.std(data_vector):.3f}\n"
-        stats_text += f"Parcellation: {parcellation.replace('_', ' ').title()}\n"
-        stats_text += f"Surface: {surface}"
-        
-        fig.text(0.02, 0.02, stats_text, fontsize=8, 
-                 bbox=dict(boxstyle="round,pad=0.3", facecolor='lightblue', alpha=0.7),
-                 verticalalignment='bottom')
-    
-    # Save figure if path provided
-    if save_path:
-        plt.savefig(save_path, dpi=dpi, bbox_inches='tight', 
-                   facecolor='white', edgecolor='none')
-        print(f"Figure saved to: {save_path}")
-    
-    return fig, axes
 
 
 def plot_subject_timeseries_heatmap(raw_data, scan_string,
@@ -1544,7 +843,7 @@ def plot_subject_timeseries_heatmap(raw_data, scan_string,
     try:
         subject_parts = [p for p in scan_string.split('_') if p.startswith(('sub-', 'scan-'))]
         subtitle = ', '.join(subject_parts)
-    except:
+    except Exception:
         subtitle = scan_string
     
     # ============== CREATE FIGURE ==============
@@ -1691,121 +990,312 @@ def plot_subject_timeseries_heatmap(raw_data, scan_string,
     return fig, tuple(axes)
 
 
-def plot_hierarchy_correlation(brain_map, data_dict, which_moment='var', yeo_systems=None, deflection_baseline=None, ncols=4):
+# =============================================================================
+# Lollipop plots (PET / feature correlation summaries)
+# =============================================================================
+
+def _draw_lollipop(ax, plot_delta, sig_either, color_map, nonsig_color,
+                   linewidth, markersize, sig_alpha, nonsig_alpha,
+                   absolute_delta, delta_label, delta_title, xlim, fontsize):
+    """Draw a single horizontal lollipop panel onto ax."""
+    order = plot_delta.sort_values(ascending=False).index.tolist()
+    y_positions = np.arange(len(order))
+
+    for y, feature in zip(y_positions, order):
+        dr  = plot_delta[feature]
+        sig = sig_either[feature]
+        color = color_map[feature] if sig else nonsig_color
+        alpha = sig_alpha if sig else nonsig_alpha
+        ax.hlines(y, 0, dr, color=color, linewidth=linewidth, alpha=alpha)
+        ax.plot(dr, y, 'o', color=color, markersize=markersize, alpha=alpha)
+
+    ax.axvline(0, color='black', linewidth=0.6, linestyle='--', alpha=0.4)
+    ax.set_xlim(xlim)
+    ax.set_ylim(-0.8, len(order) - 0.2)
+    ax.set_yticks(y_positions)
+    stripped = [f.split('_', 1)[1] if '_' in f else f for f in order]
+    ax.set_yticklabels(stripped, fontsize=fontsize - 1)
+    ax.set_xlabel(delta_label, fontsize=fontsize - 1)
+    ax.set_title(delta_title, fontsize=fontsize, fontweight='bold')
+    ax.tick_params(axis='x', labelsize=fontsize - 1)
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+
+
+def plot_faceted_lollipops(df_r, df_p, category_colors=None, figsize=None,
+                            markersize=5, linewidth=1.2, alpha=1.0,
+                            nonsig_alpha=0.75, xlim=None,
+                            rank_reference='Rest', show_legend=True,
+                            annotate_sig=False, annotation_fontsize=5,
+                            annotation_offset=0.02, fontsize=8):
     """
-    Plot SA-axis correlations with automatic subplot layout based on number of conditions.
-    
-    Parameters:
-    -----------
-    brain_map : array-like
-        Sensory-association axis values for brain regions
-    data_dict : dict
-        Dictionary of experimental conditions with neural data
-    which_moment : str
-        Statistical moment to compute ('var', 'mean', 'median', 'std', 'range', 'skewness', 'kurtosis')
-    deflection_baseline : str, optional
-        Baseline condition to subtract from others
-    ncols : int, default 4
-        Number of columns in the subplot grid
-    
-    Returns:
-    --------
-    fig, axes : matplotlib objects
-        Figure and axes objects
+    Horizontal faceted lollipop plot of correlations.
+
+    One panel per column in df_r, sorted by r within each panel.
+    Colors assigned by feature category (prefix before first '_').
+
+    Parameters
+    ----------
+    df_r             : pd.DataFrame — correlations (features × conditions)
+    df_p             : pd.DataFrame — p-values matching df_r
+    category_colors  : dict, list, or None
+    rank_reference   : str or None — column to use for ranking panels by ρ
+    show_legend      : bool
+    annotate_sig     : bool — annotate lollipop tips with *, **, ns
+    fontsize         : base font size
+
+    Returns
+    -------
+    fig, axes
     """
-    
-    # Define a sophisticated color palette
-    # colors = ['#2E86AB', '#A23B72', '#F18F01', '#C73E1D', '#6A994E', '#BC5090', '#FFB627', '#7209B7']    
-    
-    if which_moment == 'var':
-        stat_func = np.var
-        y_axis_label = 'INT Variance'
-    elif which_moment == 'mean':
-        stat_func = np.nanmean
-        y_axis_label = 'INT Mean'
-    elif which_moment == 'median':
-        stat_func = np.nanmedian
-        y_axis_label = 'INT Median'
-    elif which_moment == 'std':
-        stat_func = np.std
-        y_axis_label = 'INT Standard Deviation'
-    elif which_moment == 'range':
-        stat_func = np.ptp
-        y_axis_label = 'INT Range'
-    elif which_moment == 'skewness':
-        stat_func = sp.stats.skew
-        y_axis_label = 'INT Skewness'
-    elif which_moment == 'kurtosis':
-        stat_func = sp.stats.kurtosis
-        y_axis_label = 'INT Kurtosis'
+    features       = df_r.index.tolist()
+    all_conditions = df_r.columns.tolist()
+
+    rank_ref_active = rank_reference is not None and rank_reference in all_conditions
+    if rank_reference is not None and not rank_ref_active:
+        warnings.warn(
+            f"rank_reference='{rank_reference}' not found in df_r columns. "
+            "Panel ordering skipped.", UserWarning, stacklevel=2)
+
+    if rank_ref_active:
+        other = [c for c in all_conditions if c != rank_reference]
+        rhos  = {c: sp.stats.spearmanr(df_r[rank_reference], df_r[c])[0] for c in other}
+        conditions = [rank_reference] + sorted(other, key=lambda c: rhos[c], reverse=True)
     else:
-        raise ValueError("Invalid moment type specified. Choose from 'var', 'mean', 'median', 'std', 'range', 'skewness', or 'kurtosis'.")
-        
-    # Get experimental condition names
-    condition_names = list(data_dict.keys())
-    data_dict_copy = data_dict.copy()
-    
-    if deflection_baseline is None:
-        for condition in condition_names:
-            data_dict_copy[condition] = stat_func(data_dict_copy[condition], axis=0)
-    else:
-        baseline_data = stat_func(data_dict_copy[deflection_baseline], axis=0)
-        for condition in condition_names:
-            if condition != deflection_baseline:
-                data_dict_copy[condition] = stat_func(data_dict_copy[condition], axis=0) - baseline_data
-        # Remove baseline from conditions to plot
-        condition_names.remove(deflection_baseline)
-        del data_dict_copy[deflection_baseline]
-        y_axis_label += ' (deflection: {0})'.format(deflection_baseline)
-    
-    # Storage for correlation results
-    correlation_results = []
-    for condition in condition_names:
-        correlation_results.append(np.abs(sp.stats.spearmanr(brain_map, data_dict_copy[condition])[0]))
-    correlation_results = np.array(correlation_results)
-    sorted_idx = np.argsort(correlation_results)[::-1]
-    condition_names = np.array(condition_names)[sorted_idx]
-    
-    # Calculate number of conditions to plot
-    n_conditions = len(condition_names)
-    
-    # Calculate number of rows needed based on specified columns
-    nrows = int(np.ceil(n_conditions / ncols))
-    
-    # Calculate figure size proportional to grid size
-    # Base size: 3.33 inches per column, 4 inches per row
-    fig_width = max(ncols * 4.5, 10)  # Minimum width of 10 inches
-    fig_height = max(nrows * 3.5, 2.5)     # Minimum height of 6 inches
-    
-    # Create subplots
-    fig, axes = plt.subplots(nrows, ncols, figsize=(fig_width, fig_height), dpi=300)
-    
-    # Always convert to a flat list for consistent indexing
-    if nrows * ncols == 1:
+        conditions = all_conditions
+
+    categories        = [f.split('_')[0] for f in features]
+    unique_categories = list(dict.fromkeys(categories))
+
+    if category_colors is None:
+        cmap = mpl.colormaps['tab10']
+        category_colors = {cat: cmap(i) for i, cat in enumerate(unique_categories)}
+    elif isinstance(category_colors, (list, tuple)):
+        category_colors = {cat: category_colors[i] for i, cat in enumerate(unique_categories)}
+
+    color_map = {f: category_colors[cat] for f, cat in zip(features, categories)}
+
+    if xlim is None:
+        absmax = np.nanmax(np.abs(df_r.values))
+        bound  = round(absmax + 0.15, 1)
+        xlim   = (-bound, bound)
+
+    n_conditions = len(conditions)
+    n_features   = len(features)
+    if figsize is None:
+        figsize = (2.8 * n_conditions, max(4, n_features * 0.18))
+
+    fig, axes = plt.subplots(1, n_conditions, figsize=figsize, sharey=False, dpi=300)
+    if n_conditions == 1:
         axes = [axes]
+
+    for ax, condition in zip(axes, conditions):
+        r_vals = df_r[condition]
+        p_vals = df_p[condition]
+        order  = r_vals.sort_values(ascending=False).index.tolist()
+        y_pos  = np.arange(len(order))
+
+        for y, feature in zip(y_pos, order):
+            r     = r_vals[feature]
+            p     = p_vals[feature]
+            color = color_map[feature]
+            a     = alpha if p < 0.05 else nonsig_alpha
+            ax.hlines(y, 0, r, color=color, linewidth=linewidth, alpha=a)
+            ax.plot(r, y, 'o', color=color, markersize=markersize, alpha=a)
+            if annotate_sig:
+                label = '**' if p < 0.001 else ('*' if p < 0.05 else 'ns')
+                xoff  = annotation_offset if r >= 0 else -annotation_offset
+                ax.text(r + xoff, y, label, ha='left' if r >= 0 else 'right',
+                        va='center', fontsize=annotation_fontsize, color=color, alpha=a)
+
+        ax.axvline(0, color='black', linewidth=0.6, linestyle='--', alpha=0.4)
+        ax.set_xlim(xlim)
+        ax.set_ylim(-0.8, len(order) - 0.2)
+        ax.set_yticks(y_pos)
+        ax.set_yticklabels([f.split('_', 1)[1] if '_' in f else f for f in order],
+                            fontsize=fontsize - 1)
+
+        if rank_ref_active and condition != rank_reference:
+            rho   = sp.stats.spearmanr(df_r[rank_reference], df_r[condition])[0]
+            title = f"{condition}\n$\\rho_{{rank}}$ = {rho:.2f} (vs. {rank_reference})"
+        else:
+            title = condition
+
+        ax.set_title(title, fontsize=fontsize, fontweight='bold')
+        ax.set_xlabel('Correlation', fontsize=fontsize - 1)
+        ax.tick_params(axis='x', labelsize=fontsize - 1)
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+
+    legend_handles = [mpatches.Patch(color=category_colors[cat], label=cat)
+                      for cat in unique_categories]
+    if show_legend:
+        leg = fig.legend(handles=legend_handles, loc='lower center', ncol=1,
+                         fontsize=fontsize - 1, frameon=False, bbox_to_anchor=(0.5, 0))
+        fig.canvas.draw()
+        leg_height = leg.get_window_extent().height / fig.bbox.height
+        fig.tight_layout(rect=[0, leg_height + 0.02, 1, 1])
     else:
-        axes = np.atleast_1d(axes).flatten()
-    
-    # Plot each experimental condition in its own subplot
-    for i, condition in enumerate(condition_names):
-        ax = plot_correlation(brain_map, data_dict_copy[condition], ax=axes[i], data_group=yeo_systems, show_stats=True,
-                              font_size=10, x_label='SA Axis Rank', y_label=y_axis_label, method='spearman',
-                              auto_polynomial=True, models_to_test=[1, 2], model_selection_metric='variance_explained')
-        # Add title with condition name and statistics
-        ax.set_title(f'{condition}', fontsize=12, fontweight='bold', pad=10)
-    
-    # Hide empty subplots if any
-    total_subplots = nrows * ncols
-    for i in range(n_conditions, total_subplots):
-        if i < len(axes):
-            axes[i].set_visible(False)
-    
-    # Add overall title
-    fig.suptitle('SA-Axis vs Experimental Condition Correlations (400 Brain Regions)', 
-                 fontsize=18, fontweight='bold', y=0.98)
-    fig.tight_layout()
-    
+        fig.tight_layout()
+
     return fig, axes
+
+
+def plot_two_condition_supplement(df_r, df_p, reference, sig_threshold=0.05,
+                                   category_colors=None, figsize=None,
+                                   markersize=5, linewidth=1.2,
+                                   sig_alpha=1.0, nonsig_alpha=0.25,
+                                   nonsig_color='#aaaaaa',
+                                   annotate_scatter=False, annotation_fontsize=5,
+                                   absolute_delta=False, show_lollipop=True,
+                                   split_lollipop=False, show_legend=True,
+                                   fontsize=8):
+    """
+    Scatter + optional lollipop supplement for a two-condition correlation table.
+
+    Left panel: scatter of r(reference) vs r(task).
+    Right panel(s): horizontal lollipop of Δr, sorted descending.
+
+    Parameters
+    ----------
+    df_r          : pd.DataFrame — 2 columns, one of which is `reference`
+    df_p          : pd.DataFrame — matching p-values
+    reference     : str — column name of the reference condition
+    show_lollipop : bool — show lollipop panel(s) alongside the scatter
+    split_lollipop: bool — split lollipop by sign of r(reference)
+    show_legend   : bool
+
+    Returns
+    -------
+    fig, tuple of axes
+    """
+    if df_r.shape[1] != 2:
+        raise ValueError('plot_two_condition_supplement requires exactly 2 conditions.')
+    if reference not in df_r.columns:
+        raise ValueError(f"Reference '{reference}' not found in df_r columns.")
+
+    task     = [c for c in df_r.columns if c != reference][0]
+    features = df_r.index.tolist()
+
+    categories        = [f.split('_')[0] for f in features]
+    unique_categories = list(dict.fromkeys(categories))
+    if category_colors is None:
+        cmap = mpl.colormaps['tab10']
+        category_colors = {cat: cmap(i) for i, cat in enumerate(unique_categories)}
+    color_map  = {f: category_colors[cat] for f, cat in zip(features, categories)}
+    sig_either = (df_p[reference] < sig_threshold) | (df_p[task] < sig_threshold)
+
+    if figsize is None:
+        n_features = len(features)
+        figsize = (12, max(4, n_features * 0.18)) if show_lollipop else (5, max(4, n_features * 0.18))
+
+    fig = plt.figure(figsize=figsize, dpi=300)
+
+    if not show_lollipop:
+        ax_scatter   = fig.add_subplot(1, 1, 1)
+        lollipop_axes = []
+    elif not split_lollipop:
+        gs = gridspec.GridSpec(1, 2, figure=fig, width_ratios=[1, 0.33])
+        ax_scatter    = fig.add_subplot(gs[0, 0])
+        ax_lollipop   = fig.add_subplot(gs[0, 1])
+        lollipop_axes = [ax_lollipop]
+    else:
+        pos_features = df_r.index[df_r[reference] >= 0].tolist()
+        neg_features = df_r.index[df_r[reference] <  0].tolist()
+        gs = gridspec.GridSpec(1, 3, figure=fig, width_ratios=[2, 1, 1])
+        ax_scatter      = fig.add_subplot(gs[0, 0])
+        ax_loll_neg     = fig.add_subplot(gs[0, 1])
+        ax_loll_pos     = fig.add_subplot(gs[0, 2])
+        lollipop_axes   = [ax_loll_neg, ax_loll_pos]
+
+    if show_lollipop:
+        delta_r    = df_r[task] - df_r[reference]
+        plot_delta = delta_r.abs() if absolute_delta else delta_r
+        delta_label = (f'|Δr|  (|{task} − {reference}|)' if absolute_delta
+                       else f'Δr  ({task} − {reference})')
+        delta_title_base = (f'Absolute change\n(|{task} − {reference}|)' if absolute_delta
+                            else f'Change in correlation\n({task} − {reference})')
+        lollipop_xlim = (
+            -0.05 if absolute_delta else min(-0.1, plot_delta.min() - 0.05),
+            max(0.1, plot_delta.max() + 0.05),
+        )
+        lollipop_subsets = (
+            [(plot_delta, delta_title_base)] if not split_lollipop
+            else [(plot_delta.loc[neg_features], f'r({reference}) < 0'),
+                  (plot_delta.loc[pos_features], f'r({reference}) ≥ 0')]
+        )
+        for ax_l, (subset_delta, title) in zip(lollipop_axes, lollipop_subsets):
+            _draw_lollipop(ax_l, subset_delta, sig_either, color_map, nonsig_color,
+                           linewidth, markersize, sig_alpha, nonsig_alpha,
+                           absolute_delta, delta_label, title, lollipop_xlim, fontsize)
+
+    absmax = max(np.abs(df_r.values).max(), 0.1)
+    bound  = round(absmax + 0.05, 1)
+    ax_scatter.set_xlim(-bound, bound)
+    ax_scatter.set_ylim(-bound, bound)
+
+    texts, x_coords, y_coords = [], [], []
+    for feature in features:
+        r_ref  = df_r.loc[feature, reference]
+        r_task = df_r.loc[feature, task]
+        sig    = sig_either[feature]
+        color  = color_map[feature] if sig else nonsig_color
+        a      = sig_alpha if sig else nonsig_alpha
+        ax_scatter.plot(r_ref, r_task, 'o', color=color, markersize=markersize, alpha=a)
+        x_coords.append(r_ref)
+        y_coords.append(r_task)
+        if annotate_scatter:
+            label = '_'.join(feature.split('_')[1:])
+            texts.append(ax_scatter.text(r_ref, r_task, label,
+                                          fontsize=annotation_fontsize, color=color, alpha=a))
+
+    if annotate_scatter and texts:
+        if adjustText is not None:
+            adjustText.adjust_text(texts, x=x_coords, y=y_coords, ax=ax_scatter,
+                                    expand=(1.5, 2.0), force_text=(0.5, 1.0),
+                                    force_points=(0.5, 1.0), ensure_inside_axes=True,
+                                    arrowprops=dict(arrowstyle='-', color='grey', lw=0.4, alpha=0.5))
+
+    ax_scatter.plot([-bound, bound], [-bound, bound], color='black', lw=0.7, ls='--', alpha=0.4)
+    ax_scatter.axhline(0, color='grey', lw=0.4, alpha=0.3)
+    ax_scatter.axvline(0, color='grey', lw=0.4, alpha=0.3)
+    ax_scatter.set_xlabel(f'r  ({reference})', fontsize=fontsize - 1)
+    ax_scatter.set_ylabel(f'r  ({task})', fontsize=fontsize - 1)
+    ax_scatter.set_title(f'{reference} vs. {task}', fontsize=fontsize, fontweight='bold')
+    ax_scatter.tick_params(labelsize=fontsize - 1)
+    ax_scatter.set_aspect('equal', adjustable='box')
+    ax_scatter.spines['top'].set_visible(False)
+    ax_scatter.spines['right'].set_visible(False)
+
+    legend_handles = [mpatches.Patch(color=category_colors[cat], label=cat)
+                      for cat in unique_categories]
+    legend_handles.append(mpatches.Patch(color=nonsig_color, alpha=nonsig_alpha,
+                                           label=f'p ≥ {sig_threshold} (both conditions)'))
+    fig.tight_layout()
+
+    if show_lollipop and split_lollipop:
+        fig.canvas.draw()
+        scatter_bbox = ax_scatter.get_position()
+        for ax_l in lollipop_axes:
+            pos = ax_l.get_position()
+            ax_l.set_position([pos.x0, scatter_bbox.y0, pos.width, scatter_bbox.height])
+
+    if show_legend:
+        fig.canvas.draw()
+        renderer    = fig.canvas.get_renderer()
+        fig_h_px    = fig.get_size_inches()[1] * fig.dpi
+        all_axes    = [ax_scatter] + list(lollipop_axes)
+        min_bot_fig = min(ax.get_tightbbox(renderer).y0 for ax in all_axes) / fig_h_px
+        fig.legend(handles=legend_handles, loc='upper center',
+                   ncol=len(legend_handles), fontsize=fontsize - 1, frameon=False,
+                   bbox_to_anchor=(0.5, min_bot_fig - 0.01))
+
+    if not show_lollipop:
+        return fig, (ax_scatter,)
+    elif not split_lollipop:
+        return fig, (ax_scatter, ax_lollipop)
+    else:
+        return fig, (ax_scatter, ax_loll_pos, ax_loll_neg)
 
 
 # ==================== Support Utility Functions ====================
@@ -1832,7 +1322,7 @@ def create_sydnor_sa_colormap():
     # Register the colormap with matplotlib so it can be used by name
     try:
         plt.colormaps.register(cmap=sydnor_sa, name='sydnor_sa')
-    except:
+    except Exception:
         pass
     
     return sydnor_sa
@@ -1847,7 +1337,7 @@ def _drop_index_column(df):
 
 def _create_color_mapping(color_vector, colormap):
     """Create color mapping from color vector using specified colormap."""
-    cmap = plt.cm.get_cmap(colormap)
+    cmap = plt.get_cmap(colormap)
     unique_values = np.unique(color_vector)
     n_unique = len(unique_values)
     
@@ -1873,5 +1363,5 @@ def _add_colorbar(ax, cmap, vmin, vmax, label, shrink=0.8):
 def _calculate_annotation_height(data_values, y_min, y_max, offset_fraction=0.05):
     """Calculate height for annotations above data."""
     y_range = y_max - y_min
-    data_max = np.max(data_values)
+    data_max = np.nanmax(data_values)
     return data_max + y_range * offset_fraction
