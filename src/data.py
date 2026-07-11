@@ -8,13 +8,12 @@ import pandas as pd
 import nibabel as nib
 import yaml
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
 from sklearn.linear_model import LinearRegression
 from collections import defaultdict
 
-import warnings
-warnings.simplefilter(action='ignore', category=FutureWarning)
+from src.utils import apply_frequency_filter
 
 logger = logging.getLogger(__name__)
 
@@ -248,15 +247,125 @@ def _behavior_hcp_unrestricted_restricted(loader: 'DataLoader') -> pd.DataFrame:
     return df
 
 
-def _behavior_hcp_d_socdem(loader: 'DataLoader') -> pd.DataFrame:
-    path = loader.config.base_path / 'behavior' / 'socdem01.txt'
-    df = pd.read_csv(path, skiprows=[1], delimiter='\t')
-    df = df[['src_subject_id', 'interview_age', 'sex']]
-    df.rename(columns={'src_subject_id': 'subject_id', 'interview_age': 'age'}, inplace=True)
-    df['subject_id'] = [f'{s}V1MR' for s in df['subject_id']]
-    df['age'] = df['age'] / 12
+def _load_hcpd_beh_file(beh_dir: Path, fname: str, cols: list,
+                         rename: dict = None, missing_vals: list = None) -> pd.DataFrame:
+    """Load one HCP-D behavioral TSV and return a tidy DataFrame indexed by subject_id."""
+    path = beh_dir / fname
+    try:
+        hdr = pd.read_csv(path, sep='\t', nrows=0)
+    except FileNotFoundError:
+        logger.warning('HCP-D behavioral file not found: %s', path)
+        return pd.DataFrame()
+    available = [c for c in cols if c in hdr.columns]
+    if not available:
+        return pd.DataFrame()
+    df = pd.read_csv(path, sep='\t', skiprows=[1], usecols=['src_subject_id'] + available)
+    df['subject_id'] = df['src_subject_id'].astype(str) + 'V1MR'
+    df = (df.drop(columns='src_subject_id')
+            .set_index('subject_id')
+            .loc[lambda x: ~x.index.duplicated(keep='first')])
+    df = df.apply(pd.to_numeric, errors='coerce')
+    if missing_vals:
+        for mv in missing_vals:
+            df = df.replace(mv, np.nan)
+    if rename:
+        df = df.rename(columns=rename)
+    return df
+
+
+def _behavior_hcp_d(loader: 'DataLoader') -> pd.DataFrame:
+    beh_dir  = loader.config.base_path / 'behavior'
+    proc_dir = loader.rawdata_dir  # .../HCP_D/processed
+
+    # --- Demographics ---
+    df = pd.read_csv(beh_dir / 'socdem01.txt', skiprows=[1], delimiter='\t',
+                     usecols=['src_subject_id', 'interview_age', 'sex'])
+    df['subject_id'] = df['src_subject_id'].astype(str) + 'V1MR'
+    df['age'] = df['interview_age'] / 12
     df['sex'] = (df['sex'] == 'M').astype(int)
-    df.set_index('subject_id', inplace=True)
+    df = df.drop(columns=['src_subject_id', 'interview_age']).set_index('subject_id')
+
+    # --- Mean framewise displacement ---
+    df = df.join(pd.read_csv(loader.config.base_path / 'HCP-D_meanFD.csv', index_col=0),
+                 how='left')
+
+    # --- Behavioral measures ---
+    lf = lambda *a, **kw: _load_hcpd_beh_file(beh_dir, *a, **kw)
+
+    # NIH Toolbox — Cognition
+    for frame in [
+        lf('cogcomp01.txt', ['nih_fluidcogcomp_unadjusted', 'nih_crycogcomp_unadjusted']),
+        lf('dccs01.txt',    ['nih_dccs_ageadjusted']),
+        lf('flanker01.txt', ['nih_flanker_ageadjusted']),
+        lf('lswmt01.txt',   ['tbx_ls']),
+        lf('orrt01.txt',    ['tbx_reading_score']),
+        lf('tpvt01.txt',    ['tbx_vocab_theta']),
+        lf('pcps01.txt',    ['nih_patterncomp_ageadjusted']),
+    ]:
+        df = df.join(frame, how='left')
+
+    # Emotion recognition
+    df = df.join(
+        lf('er4001.txt', ['er40_c_cr', 'er40_c_ang', 'er40_c_fear', 'er40_c_hap', 'er40_c_sad']),
+        how='left')
+
+    # Psychopathology
+    for frame in [
+        lf('cbcl01.txt', ['cbcl_internal_raw', 'cbcl_external_raw', 'cbcl_total_raw',
+                           'cbcl_attention_raw', 'cbcl_anxiety_raw', 'cbcl_aggressive_raw']),
+        lf('ysr01.txt',  ['cbcl_internal', 'cbcl_external', 'cbcl_total'],
+                          rename={'cbcl_internal': 'ysr_internal',
+                                  'cbcl_external': 'ysr_external',
+                                  'cbcl_total':    'ysr_total'}),
+    ]:
+        df = df.join(frame, how='left')
+
+    # Pubertal development — coalesce sex-specific scores into one column
+    pds = lf('pds01.txt', ['pds_boy_rs', 'pds_girl_rs'], missing_vals=[999])
+    if not pds.empty and 'pds_boy_rs' in pds.columns:
+        pds['pds_score'] = pds['pds_boy_rs'].combine_first(pds['pds_girl_rs'])
+        pds = pds[['pds_score']]
+    df = df.join(pds, how='left')
+
+    # Personality / temperament / impulsivity
+    for frame in [
+        lf('bisbas01.txt', ['bissc_total', 'bas_drive', 'bas_fs', 'bas_rr']),
+        lf('upps01.txt',   ['premed_score', 'senseek_score', 'persev_score']),
+    ]:
+        df = df.join(frame, how='left')
+
+    # Stress / affect / wellbeing
+    for frame in [
+        lf('pss01.txt',            ['pss_totalscore']),
+        lf('tlbx_fearanx01.txt',   ['nih_tlbx_tscore'], rename={'nih_tlbx_tscore': 'fearanx_tscore'}),
+        lf('tlbx_wellbeing01.txt', ['nih_tlbx_tscore'], rename={'nih_tlbx_tscore': 'wellbeing_tscore'}),
+        lf('tlbx_sensation01.txt', ['nih_tlbx_tscore'], rename={'nih_tlbx_tscore': 'sensation_tscore'}),
+    ]:
+        df = df.join(frame, how='left')
+
+    # Outlier filter on fluid cognition composite (known extreme outliers in raw data)
+    if 'nih_fluidcogcomp_unadjusted' in df.columns:
+        col = df['nih_fluidcogcomp_unadjusted']
+        df['nih_fluidcogcomp_unadjusted'] = col.where(col.sub(col.mean()).abs() <= 3 * col.std())
+
+    # --- CARIT nogo accuracy (from per-subject EVs) ---
+    def _ev_count(path):
+        try:
+            with open(path) as f:
+                return sum(1 for line in f if line.strip())
+        except FileNotFoundError:
+            return 0
+
+    carit = {}
+    for subj in df.index:
+        ev_dir = (proc_dir / split_hcpd_string(subj)
+                  / 'MNINonLinear' / 'Results' / 'tfMRI_CARIT_PA' / 'EVs')
+        n_fa = (_ev_count(ev_dir / 'nogoFAWin.txt') + _ev_count(ev_dir / 'nogoFALose.txt'))
+        n_cr = (_ev_count(ev_dir / 'nogoCRWin.txt') + _ev_count(ev_dir / 'nogoCRLose.txt'))
+        total = n_fa + n_cr
+        carit[subj] = n_cr / total if total > 0 else np.nan
+    df['carit_nogo_acc'] = pd.Series(carit)
+
     return df
 
 
@@ -294,6 +403,27 @@ def _behavior_penn_lead(loader: 'DataLoader') -> pd.DataFrame:
     df['age'] = df['age'] / 12
     df['sex'] = (df['sex'] == 'M').astype(int)
     df.set_index('subject_id', inplace=True)
+
+    # Compute session-specific ages from BIDS sessions.tsv acquisition times.
+    # The acq_time values are anonymised (anchored to ~year 1800) but the
+    # time *differences* between sessions are preserved, so we can derive each
+    # subject's age at later sessions as:  age_sesN = age_ses1 + Δt(ses1→sesN).
+    bids_dir = loader.config.base_path / 'bids'
+    for subject_id in df.index:
+        ses_tsv = bids_dir / f'sub-{subject_id}' / f'sub-{subject_id}_sessions.tsv'
+        if not ses_tsv.exists():
+            continue
+        df_ses = pd.read_csv(ses_tsv, sep='\t')
+        if 'acq_time' not in df_ses.columns:
+            continue
+        df_ses['acq_time'] = pd.to_datetime(df_ses['acq_time'], format='mixed')
+        df_ses = df_ses.sort_values('session_id').reset_index(drop=True)
+        base_time = df_ses.iloc[0]['acq_time']
+        for _, row in df_ses.iterrows():
+            ses_label = row['session_id'].replace('ses-', '')
+            delta_years = (row['acq_time'] - base_time).days / 365.25
+            df.loc[subject_id, f'age_ses{ses_label}'] = df.loc[subject_id, 'age'] + delta_years
+
     return df
 
 
@@ -310,7 +440,7 @@ def _behavior_hbn_rbc(loader: 'DataLoader') -> pd.DataFrame:
 
 BEHAVIOR_HANDLERS = {
     'hcp_unrestricted_restricted': _behavior_hcp_unrestricted_restricted,
-    'hcp_d_socdem': _behavior_hcp_d_socdem,
+    'hcp_d': _behavior_hcp_d,
     'pnc_rbc': _behavior_pnc_rbc,
     'penn_lead': _behavior_penn_lead,
     'hbn_rbc': _behavior_hbn_rbc,
@@ -455,22 +585,30 @@ TASK_EVENTS_HANDLERS = {
 # ==============================================================================
 
 class DataLoader:
-    """
-    Loads and manages preprocessed neural timeseries data across multiple datasets.
+    """Load and manage preprocessed neural timeseries data across multiple datasets.
 
-    Dataset-specific knowledge (file paths, naming conventions, TRs, behavior
-    and event file locations) lives in YAML configs under src/configs/datasets/.
-    This class is a generic engine that reads those configs.
+    Dataset-specific knowledge (file paths, naming conventions, TRs, behavior and
+    event file locations) lives in YAML configs under src/configs/datasets/. This
+    class is a generic engine that reads those configs.
 
-    Attributes:
-        dataset (str): Name of the dataset (e.g. 'HCP-YA').
-        config (DatasetConfig): Parsed YAML configuration for this dataset.
-        base_dir (Path): Root data directory for this dataset.
-        rawdata_dir (Path): Raw BIDS data directory.
-        derivdata_dir (Path): Derivatives directory.
-        output_dir (Path): Directory for writing outputs.
-        df_behavior (pd.DataFrame | None): Subject-level behavioral/demographic data.
-        scan_registry (list[ScanInfo]): Registered scans available for loading.
+    Attributes
+    ----------
+    dataset : str
+        Name of the dataset (e.g. 'HCP-YA').
+    config : DatasetConfig
+        Parsed YAML configuration for this dataset.
+    base_dir : Path
+        Root data directory for this dataset.
+    rawdata_dir : Path
+        Raw BIDS data directory.
+    derivdata_dir : Path
+        Derivatives directory.
+    output_dir : Path
+        Directory for writing outputs.
+    df_behavior : pd.DataFrame or None
+        Subject-level behavioral/demographic data.
+    scan_registry : list of ScanInfo
+        Registered scans available for loading.
     """
 
     def __init__(
@@ -480,15 +618,18 @@ class DataLoader:
         load_behavior: bool = True,
         verbose: bool = True,
     ):
-        """
-        Initialise DataLoader for a specific dataset.
+        """Initialise DataLoader for a specific dataset.
 
-        Args:
-            dataset: Name of the dataset (must match a YAML file in configs/datasets/).
-            output_dir: Directory for saving outputs.
-                        Defaults to the project root (parent of src/).
-            load_behavior: Whether to load behavioral/demographic data on init.
-            verbose: Print initialisation summary.
+        Parameters
+        ----------
+        dataset : str
+            Name of the dataset (must match a YAML file in configs/datasets/).
+        output_dir : str or None
+            Directory for saving outputs. Defaults to the project root (parent of src/).
+        load_behavior : bool
+            Whether to load behavioral/demographic data on init.
+        verbose : bool
+            Print initialisation summary.
         """
         self.dataset = dataset
         self.config = load_dataset_config(dataset)
@@ -548,19 +689,27 @@ class DataLoader:
         seg: str,
         modality: str,
     ) -> List[ScanInfo]:
-        """
-        Register scans for all combinations of subjects × sessions × tasks.
+        """Register scans for all combinations of subjects × sessions × tasks.
 
-        Args:
-            subject_ids: Subject IDs (without 'sub-' prefix).
-            sessions: Session labels; use [None] for sessionless datasets.
-            tasks: Task names (BIDS task-entity values).
-            space: MNI/surface space label.
-            seg: Parcellation/segmentation label.
-            modality: One of the modalities defined in this dataset's config.
+        Parameters
+        ----------
+        subject_ids : list of str
+            Subject IDs (without 'sub-' prefix).
+        sessions : list of str
+            Session labels; use [None] for sessionless datasets.
+        tasks : list of str
+            Task names (BIDS task-entity values).
+        space : str
+            MNI/surface space label.
+        seg : str
+            Parcellation/segmentation label.
+        modality : str
+            One of the modalities defined in this dataset's config.
 
-        Returns:
-            List of newly registered ScanInfo objects.
+        Returns
+        -------
+        list of ScanInfo
+            The newly registered scans.
         """
         tr = self.get_tr(modality)
         registered = []
@@ -591,8 +740,7 @@ class DataLoader:
         verbose: bool = True,
         remove_incomplete_subjects: bool = False,
     ) -> Dict[str, List]:
-        """
-        Check which registered scans exist on disk and remove missing ones.
+        """Check which registered scans exist on disk and remove missing ones.
 
         A scan is considered valid when:
           - Its timeseries file exists, AND
@@ -601,13 +749,18 @@ class DataLoader:
           - If task_events_handler is null: only file existence is checked
             (handles rest-only or events-unavailable datasets cleanly).
 
-        Args:
-            verbose: Print detailed validation report.
-            remove_incomplete_subjects: If True, remove all scans for any
-                subject that had at least one missing scan.
+        Parameters
+        ----------
+        verbose : bool
+            Print detailed validation report.
+        remove_incomplete_subjects : bool
+            If True, remove all scans for any subject that had at least one
+            missing scan.
 
-        Returns:
-            Dict with keys 'existing', 'missing', 'removed_subjects'.
+        Returns
+        -------
+        dict
+            Keys 'existing', 'missing', 'removed_subjects'.
         """
         if not self.scan_registry:
             if verbose:
@@ -726,24 +879,30 @@ class DataLoader:
     # --------------------------------------------------------------------------
 
     def get_scan_filepath(self, scan: ScanInfo) -> Path:
-        """
-        Construct the expected filepath for a scan's timeseries file.
+        """Construct the expected filepath for a scan's timeseries file.
 
         Uses the filename_template and dir_template from the dataset YAML config.
-        For datasets with use_glob=True (e.g. NKI), the glob is resolved here
-        and the first match is returned; FileNotFoundError is raised if no match.
-        For datasets with filename_template_fallbacks (e.g. PNC), fallbacks are
-        tried in order after the primary template.
+        For datasets with use_glob=True (e.g. NKI), the glob is resolved here and
+        the first match is returned; FileNotFoundError is raised if no match. For
+        datasets with filename_template_fallbacks (e.g. PNC), fallbacks are tried
+        in order after the primary template.
 
-        Args:
-            scan: ScanInfo object.
+        Parameters
+        ----------
+        scan : ScanInfo
+            The scan to locate.
 
-        Returns:
+        Returns
+        -------
+        Path
             Path to the timeseries file (resolved for glob patterns).
 
-        Raises:
-            FileNotFoundError: If use_glob=True and no file matches the pattern.
-            ValueError: If the modality is not recognised for this dataset.
+        Raises
+        ------
+        FileNotFoundError
+            If use_glob=True and no file matches the pattern.
+        ValueError
+            If the modality is not recognised for this dataset.
         """
         if scan.modality not in self.config.modalities:
             raise ValueError(
@@ -841,18 +1000,20 @@ class DataLoader:
     # --------------------------------------------------------------------------
 
     def load_subject_ids(self, filename: str = 'subject_ids.txt') -> List[str]:
-        """
-        Load subject IDs from a text file in base_dir.
+        """Load subject IDs from a text file in base_dir.
 
-        Automatically:
-          - Strips 'sub-' prefix if present.
-          - Removes underscores for HCP-D (subject_id_rawdata_transform = split_hcpd).
+        Automatically strips a 'sub-' prefix if present, and removes underscores
+        for HCP-D (subject_id_rawdata_transform = split_hcpd).
 
-        Args:
-            filename: Name of the text file relative to base_dir.
+        Parameters
+        ----------
+        filename : str
+            Name of the text file relative to base_dir.
 
-        Returns:
-            List of subject ID strings ready for register_scans().
+        Returns
+        -------
+        list of str
+            Subject ID strings ready for register_scans().
         """
         path = self.base_dir / filename
         subject_ids = np.loadtxt(str(path), dtype=str).tolist()
@@ -871,24 +1032,44 @@ class DataLoader:
         self,
         scan: ScanInfo,
         cache: bool = True,
+        detrend: bool = True,
         nuisance_regression: bool = True,
+        frequency_filter: bool = True,
+        lowpass: Optional[float] = 0.08,
+        highpass: Optional[float] = 0.01,
         standardize: bool = False,
         verbose: bool = False,
         dry_load: bool = False,
     ) -> Optional[np.ndarray]:
-        """
-        Load and preprocess the timeseries for a single scan.
+        """Load and preprocess the timeseries for a single scan.
 
-        Args:
-            scan: ScanInfo object.
-            cache: Cache the loaded array (keyed by str(scan)).
-            nuisance_regression: Regress out global signal, its derivative,
-                                 and their squares (4 regressors total).
-            standardize: Z-score across timepoints after regression.
-            verbose: Print filepath and shape on load.
-            dry_load: Return None without loading or caching.
+        Parameters
+        ----------
+        scan : ScanInfo
+            The scan to load.
+        cache : bool
+            Cache the loaded array (keyed by str(scan)).
+        detrend : bool
+            Remove linear trend along the time axis.
+        nuisance_regression : bool
+            Regress out the global signal (mean across parcels at each timepoint).
+        frequency_filter : bool
+            Apply a frequency filter via apply_frequency_filter. Requires scan.tr
+            to be set correctly.
+        lowpass : float or None
+            Lowpass cutoff in Hz (default 0.08). Ignored if frequency_filter=False.
+        highpass : float or None
+            Highpass cutoff in Hz (default 0.01). Ignored if frequency_filter=False.
+        standardize : bool
+            Z-score across timepoints after regression.
+        verbose : bool
+            Print filepath and shape on load.
+        dry_load : bool
+            Return None without loading or caching.
 
-        Returns:
+        Returns
+        -------
+        np.ndarray or None
             Array of shape (n_parcels, n_timepoints), or None if dry_load=True.
         """
         if dry_load:
@@ -921,13 +1102,22 @@ class DataLoader:
 
         timeseries = timeseries.astype(np.float32)
 
+        if detrend:
+            timeseries = sp.signal.detrend(timeseries, axis=0, type='linear')
+
         if nuisance_regression:
             gs = np.mean(timeseries, axis=1).reshape(-1, 1)
-            gs_diff = np.append(0, np.diff(gs, axis=0)).reshape(-1, 1)
-            nuis = np.concatenate([gs, gs_diff, gs ** 2, gs_diff ** 2], axis=1)
+            # gs_diff = np.append(0, np.diff(gs, axis=0)).reshape(-1, 1)
+            # nuis = np.concatenate([gs, gs_diff, gs ** 2, gs_diff ** 2], axis=1)
+            nuis = gs
             regr = LinearRegression()
             regr.fit(nuis, timeseries)
             timeseries = timeseries - regr.predict(nuis)
+
+        if frequency_filter:
+            timeseries = apply_frequency_filter(
+                timeseries.T, 1.0 / scan.tr, lowpass=lowpass, highpass=highpass
+            ).T
 
         if standardize:
             timeseries = sp.stats.zscore(timeseries, axis=0)
@@ -950,32 +1140,56 @@ class DataLoader:
         conditions: Optional[List[str]] = None,
         seg: Optional[str] = None,
         cache: bool = False,
+        detrend: bool = True,
         nuisance_regression: bool = True,
+        frequency_filter: bool = True,
+        lowpass: Optional[float] = 0.08,
+        highpass: Optional[float] = 0.01,
         standardize: bool = False,
         verbose: bool = True,
         dry_load: bool = False,
     ) -> Dict[str, Optional[np.ndarray]]:
-        """
-        Load timeseries for all scans in the registry, with optional filters.
+        """Load timeseries for all scans in the registry, with optional filters.
 
-        Args:
-            subjects: Restrict to these subject IDs.
-            modalities: Restrict to these modalities.
-            conditions: Restrict to these conditions ('rest', 'task').
-            seg: Restrict to this segmentation label.
-            cache: Cache loaded arrays.
-            nuisance_regression: Apply global-signal nuisance regression.
-            standardize: Z-score timeseries after regression.
-            verbose: Print progress.
-            dry_load: Return {scan_key: None} without loading.
+        Parameters
+        ----------
+        subjects : list of str or None
+            Restrict to these subject IDs.
+        modalities : list of str or None
+            Restrict to these modalities.
+        conditions : list of str or None
+            Restrict to these conditions ('rest', 'task').
+        seg : str or None
+            Restrict to this segmentation label.
+        cache : bool
+            Cache loaded arrays.
+        detrend : bool
+            Remove linear trend along the time axis.
+        nuisance_regression : bool
+            Apply global-signal nuisance regression.
+        frequency_filter : bool
+            Apply frequency filter (lowpass/highpass/bandpass).
+        lowpass : float or None
+            Lowpass cutoff in Hz (default 0.08). Ignored if frequency_filter=False.
+        highpass : float or None
+            Highpass cutoff in Hz (default 0.01). Ignored if frequency_filter=False.
+        standardize : bool
+            Z-score timeseries after regression.
+        verbose : bool
+            Print progress.
+        dry_load : bool
+            Return {scan_key: None} without loading.
 
-        Returns:
-            Dict mapping scan string keys to (n_parcels, n_timepoints) arrays,
-            or to None if dry_load=True.
+        Returns
+        -------
+        dict
+            Maps scan string keys to (n_parcels, n_timepoints) arrays, or to None
+            if dry_load=True.
         """
+        subject_set = {str(x) for x in subjects} if subjects else None
         scans_to_load = [
             s for s in self.scan_registry
-            if (not subjects or s.subject_id in [str(x) for x in subjects])
+            if (subject_set is None or s.subject_id in subject_set)
             and (not modalities or s.modality in modalities)
             and (not conditions or s.condition in conditions)
             and (not seg or s.seg == seg)
@@ -999,6 +1213,10 @@ class DataLoader:
                     cache=cache,
                     verbose=False,
                     nuisance_regression=nuisance_regression,
+                    detrend=detrend,
+                    frequency_filter=frequency_filter,
+                    lowpass=lowpass,
+                    highpass=highpass,
                     standardize=standardize,
                     dry_load=dry_load,
                 )
@@ -1098,6 +1316,70 @@ class DataLoader:
 # Standalone utility functions (also used by timescales.py)
 # ==============================================================================
 
+def get_longitudinal_array(
+    data_dict: Dict[str, Optional[np.ndarray]],
+    scan_registry: List['ScanInfo'],
+    sessions: List[str],
+    task: str,
+) -> Tuple[np.ndarray, List[str]]:
+    """
+    Reshape a flat data_dict into a longitudinal array.
+
+    For each subject in the registry, looks up the data for each requested
+    session and stacks the result into a single array.  Entries missing from
+    data_dict (subject never had that session, or it failed to load) are
+    filled with NaN so the subject axis is always fully populated.
+
+    Parameters
+    ----------
+    data_dict:
+        Flat dict mapping scan-key strings to 1-D region arrays (n_regions,).
+        Typically ``timescales_processor.timescales_dict``.
+    scan_registry:
+        List of ScanInfo objects (e.g. ``data_loader.scan_registry``).
+    sessions:
+        Ordered list of session labels to include (e.g. ['1', '2']).
+    task:
+        Task name to select (e.g. 'rest' or 'nback').
+
+    Returns
+    -------
+    array : np.ndarray, shape (n_subjects, n_sessions, n_regions)
+        NaN where data is absent for a given subject/session combination.
+    subject_ids : list of str
+        Subject IDs corresponding to axis 0, in registry order.
+    """
+    # Unique subjects in registry order
+    subject_ids = list(dict.fromkeys(
+        s.subject_id for s in scan_registry if s.task == task
+    ))
+
+    # Infer n_regions from the first available entry
+    n_regions = None
+    for v in data_dict.values():
+        if v is not None:
+            n_regions = v.shape[0]
+            break
+    if n_regions is None:
+        raise ValueError("data_dict contains no non-None entries.")
+
+    array = np.full((len(subject_ids), len(sessions), n_regions), np.nan)
+
+    # Build a lookup: (subject_id, session) -> scan key
+    lookup: Dict[Tuple[str, str], str] = {}
+    for scan in scan_registry:
+        if scan.task == task and scan.session in sessions:
+            lookup[(scan.subject_id, scan.session)] = str(scan)
+
+    for i, subject_id in enumerate(subject_ids):
+        for j, session in enumerate(sessions):
+            key = lookup.get((subject_id, session))
+            if key and key in data_dict and data_dict[key] is not None:
+                array[i, j, :] = data_dict[key]
+
+    return array, subject_ids
+
+
 def parse_scan_string(scan_string: str) -> Dict[str, str]:
     """
     Parse a key-value formatted scan string into a dictionary.
@@ -1124,7 +1406,7 @@ def build_scan_string(**kwargs) -> str:
         build_scan_string(sub='100307', modality='MRI3T', task='rfMRIREST1LR')
         -> "sub-100307_modality-MRI3T_task-rfMRIREST1LR"
     """
-    key_order = ['sub', 'modality', 'task', 'seg', 'stat']
+    key_order = ['sub', 'ses', 'modality', 'task', 'space', 'seg', 'run', 'stat']
     parts = [
         f"{key}-{kwargs[key]}"
         for key in key_order
