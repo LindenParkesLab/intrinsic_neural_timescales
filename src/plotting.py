@@ -12,6 +12,8 @@ import matplotlib.patches as mpatches
 from matplotlib.colors import Normalize
 from matplotlib.cm import ScalarMappable
 
+from snaplab_tools.plotting.utils import create_sydnor_sa_colormap, determine_significance
+
 try:
     import adjustText
 except ImportError:  # optional; scatter labels fall back to no repulsion
@@ -1118,7 +1120,7 @@ def plot_faceted_lollipops(df_r, df_p, category_colors=None, figsize=None,
             ax.hlines(y, 0, r, color=color, linewidth=linewidth, alpha=a)
             ax.plot(r, y, 'o', color=color, markersize=markersize, alpha=a)
             if annotate_sig:
-                label = '**' if p < 0.001 else ('*' if p < 0.05 else 'ns')
+                label = determine_significance(p)
                 xoff  = annotation_offset if r >= 0 else -annotation_offset
                 ax.text(r + xoff, y, label, ha='left' if r >= 0 else 'right',
                         va='center', fontsize=annotation_fontsize, color=color, alpha=a)
@@ -1320,37 +1322,6 @@ def plot_two_condition_supplement(df_r, df_p, reference, sig_threshold=0.05,
 
 
 # ==================== Support Utility Functions ====================
-def create_sydnor_sa_colormap():
-    """Create the Sydnor S-A colormap (orange sensorimotor pole -> white -> purple association).
-
-    Also registers it with matplotlib under the name 'sydnor_sa'.
-
-    Returns
-    -------
-    matplotlib.colors.LinearSegmentedColormap
-        The custom colormap.
-    """
-    
-    # Define the colors for the colormap
-    # Format: (position, (R, G, B))
-    colors = [
-        (0.0, '#FFA500'),   # Orange/yellow (sensorimotor pole, low rank)
-        (0.5, "#FFFFFF"),   # White (middle, 0 point)
-        (1.0, '#8A2BE2')    # Purple (association pole, high rank)
-    ]
-    
-    # Create the colormap
-    sydnor_sa = mcolors.LinearSegmentedColormap.from_list('sydnor_sa', colors, N=256)
-    
-    # Register the colormap with matplotlib so it can be used by name
-    try:
-        plt.colormaps.register(cmap=sydnor_sa, name='sydnor_sa')
-    except Exception:
-        pass
-    
-    return sydnor_sa
-
-
 def _drop_index_column(df):
     """Remove first column if it's just an index."""
     if df.columns[0] in ['', 'Unnamed: 0'] or df.iloc[:, 0].dtype in ['int64', 'int32']:
