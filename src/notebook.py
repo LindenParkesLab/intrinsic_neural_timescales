@@ -7,7 +7,7 @@ from scipy.spatial import distance
 
 from src.timescales import Timescales
 from src.timescales import filter_data_dict
-from src.plotting import create_sydnor_sa_colormap
+from snaplab_tools.plotting.utils import create_sydnor_sa_colormap
 
 from snaplab_tools.topology import threshold_adjacency_consistency, volume_normalize_adjacency
 from snaplab_tools.utils import normalize_x
