@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from sklearn.linear_model import LinearRegression
 from collections import defaultdict
 
-from src.utils import apply_frequency_filter
+from snaplab_tools.signal import apply_frequency_filter
 
 logger = logging.getLogger(__name__)
 
