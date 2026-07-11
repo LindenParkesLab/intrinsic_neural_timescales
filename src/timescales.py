@@ -15,7 +15,7 @@ import statsmodels.api as sm
 pyfftw.interfaces.cache.enable()  # cache FFT plans
 
 from src.data import DataLoader, ScanInfo, parse_scan_string, build_scan_string
-from src.utils import apply_frequency_filter
+from snaplab_tools.signal import apply_frequency_filter
 import logging
 logger = logging.getLogger(__name__)
 
