@@ -1,19 +1,18 @@
-import os, sys, glob, pickle, pyfftw
+import os
 import numpy as np
 import scipy as sp
 import pandas as pd
+import pyfftw
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union, Any
+from typing import Dict, List, Optional, Tuple, Any
 from tqdm import tqdm
 from nilearn.glm.first_level import make_first_level_design_matrix
-pyfftw.interfaces.cache.enable()  # Cache FFT plans
-from pyfftw.interfaces.numpy_fft import rfft, irfft
-from scipy.optimize import curve_fit
-from statsmodels.tsa.stattools import acf
+from scipy.optimize import curve_fit, OptimizeWarning
 from collections import defaultdict
 from joblib import Parallel, delayed
-from scipy.optimize import curve_fit, OptimizeWarning
 import statsmodels.api as sm
+
+pyfftw.interfaces.cache.enable()  # cache FFT plans
 
 from src.data import DataLoader, ScanInfo, parse_scan_string, build_scan_string
 from src.utils import apply_frequency_filter
@@ -76,19 +75,6 @@ def _ts_method_B_murray_par_lag5mins(acf, tr, inst, **kw):
     _, B = inst._compute_tau_murray_parallel(acf[:, :n_tp], tr=tr, n_jobs=int(os.cpu_count() / 2))
     return B
 
-def _ts_method_exponential_tau(acf, tr, inst, **kw):
-    n_lags = acf.shape[1]
-    lags = np.arange(n_lags) * tr
-    tau = np.full(acf.shape[0], np.nan)
-    for i in range(acf.shape[0]):
-        try:
-            result = fit_exponential_decay(lags, acf[i])
-            if result['success']:
-                tau[i] = result['tau']
-        except Exception:
-            pass
-    return tau
-
 TIMESCALE_METHODS = {
     'zero_crossing':              _ts_method_zero_crossing,
     'zero_crossing_robust_nc2':   _ts_method_zero_crossing_robust_nc2,
@@ -104,7 +90,6 @@ TIMESCALE_METHODS = {
     'B_murray_par_lag3mins':      _ts_method_B_murray_par_lag3mins,
     'B_murray_par_lag4mins':      _ts_method_B_murray_par_lag4mins,
     'B_murray_par_lag5mins':      _ts_method_B_murray_par_lag5mins,
-    'exponential_tau':            _ts_method_exponential_tau,
 }
 
 
@@ -116,6 +101,19 @@ class Timescales(DataLoader):
         load_behavior: bool = True,
         verbose: bool = True
     ):
+        """Initialise Timescales for a dataset and its per-scan timeseries.
+
+        Parameters
+        ----------
+        dataset : str
+            Dataset name (passed to DataLoader).
+        timeseries_data : dict
+            Mapping scan_key -> (n_parcels, n_timepoints) array. May be None.
+        load_behavior : bool
+            Whether DataLoader should load behavioral data on init.
+        verbose : bool
+            Print an initialisation summary.
+        """
         # Call the parent class's constructor
         super().__init__(dataset=dataset, load_behavior=load_behavior, verbose=verbose)
         
@@ -143,26 +141,38 @@ class Timescales(DataLoader):
         suffix: str = '.npy',
         mode: str = 'load'
     ) -> Path:
-        """
-        Generate standardized filepath for subject-specific outputs using key-value naming.
+        """Generate a standardized filepath for subject-specific outputs (key-value naming).
 
-        The filename includes every field that uniquely identifies a scan so
-        that outputs for different sessions, spaces, or runs never collide.
+        The filename includes every field that uniquely identifies a scan so that
+        outputs for different sessions, spaces, or runs never collide.
 
-        Args:
-            subject_id: Subject identifier
-            output_type: Type of output (e.g., 'autocorr', 'timescale_acf')
-            task: Task/run label (e.g., 'rfMRIREST1LR')
-            modality: Modality string (e.g., 'MRI3T')
-            seg: Atlas/parcellation name
-            space: Template space (e.g., 'fsLR', 'MNI152NLin2009cAsym')
-            session: Session label (e.g., '1', '01') — required for longitudinal data
-            run: Run label (e.g., '01') — included when present
-            suffix: File extension
-            mode: 'save' creates parent dirs; 'load' does not
+        Parameters
+        ----------
+        subject_id : str
+            Subject identifier.
+        output_type : str
+            Type of output (e.g. 'autocorr', 'timescale_acf').
+        task : str
+            Task/run label (e.g. 'rfMRIREST1LR').
+        modality : str
+            Modality string (e.g. 'MRI3T').
+        seg : str
+            Atlas/parcellation name.
+        space : str
+            Template space (e.g. 'fsLR', 'MNI152NLin2009cAsym').
+        session : str
+            Session label (e.g. '1', '01'); required for longitudinal data.
+        run : str
+            Run label (e.g. '01'); included when present.
+        suffix : str
+            File extension.
+        mode : {'load', 'save'}
+            'save' creates parent dirs; 'load' does not.
 
-        Returns:
-            Path object for the output file
+        Returns
+        -------
+        Path
+            Path to the output file.
         """
         # Create output subdirectory structure
         output_subdir = self.output_dir / 'data' / 'timescales_outputs' / self.dataset / output_type
@@ -305,14 +315,18 @@ class Timescales(DataLoader):
         return False
 
     def _parse_scan_string(self, scan_key: str) -> Dict[str, str]:
-        """
-        Parse scan key using key-value format.
-        
-        Args:
-            scan_key: String like "sub-100307_modality-MRI3T_scan-rfMRIREST1LR_atlas-Schaefer4007"
-        
-        Returns:
-            Dictionary with parsed values
+        """Parse a scan key using key-value format.
+
+        Parameters
+        ----------
+        scan_key : str
+            Scan-key string, e.g.
+            "sub-100307_modality-MRI3T_task-rfMRIREST1LR_seg-Schaefer4007".
+
+        Returns
+        -------
+        dict
+            Parsed key-value pairs (see parse_scan_string).
         """
         return parse_scan_string(scan_key)
 
@@ -431,6 +445,29 @@ class Timescales(DataLoader):
         highpass: float = None,
         verbose: bool = True,
     ):
+        """Compute (or load) the ACF for every scan into self.autocorr_dict.
+
+        Runs compute_acf per scan via _run_for_all_scans, caching results to disk.
+        lowpass/highpass affect only the output_type name (filtering is applied at
+        load time, not here).
+
+        Parameters
+        ----------
+        use_fft : bool
+            Use the FFT-based ACF path in compute_acf.
+        force_recompute : bool
+            Ignore cached files and recompute.
+        save_outputs : bool
+            Persist results to disk.
+        suffix : str or None
+            Extra tag appended to output_type.
+        use_residuals : bool
+            Use self.timeseries_residuals for task scans instead of raw timeseries.
+        lowpass, highpass : float or None
+            Used only for output naming (see above).
+        verbose : bool
+            Print summary counts.
+        """
         output_type = 'autocorr'
         if highpass is not None and lowpass is not None:
             output_type = f'autocorr_bp-{highpass}-{lowpass}hz'
@@ -465,7 +502,28 @@ class Timescales(DataLoader):
         use_residuals: bool = False,
         verbose: bool = True
     ) -> Dict[str, Any]:
-        """Compute timescale measures from autocorrelation functions."""
+        """Compute timescale measures from the autocorrelation functions.
+
+        Applies the chosen method from TIMESCALE_METHODS to each scan's ACF in
+        self.autocorr_dict, storing results in self.timescales_dict (with disk
+        caching). Requires compute_autocorrelation_function to have been run.
+
+        Parameters
+        ----------
+        method : str
+            Key into TIMESCALE_METHODS (e.g. 'zero_crossing', 'tau').
+        force_recompute : bool
+            Ignore cached files and recompute.
+        save_outputs : bool
+            Persist results to disk.
+        suffix : str or None
+            Extra tag appended to output_type.
+        use_residuals : bool
+            Accepted for API symmetry; ignored here (residual handling is upstream
+            in compute_autocorrelation_function).
+        verbose : bool
+            Print summary counts.
+        """
         if not hasattr(self, 'autocorr_dict') or self.autocorr_dict is None:
             raise ValueError("Must compute autocorrelation first")
 
@@ -555,6 +613,24 @@ class Timescales(DataLoader):
         use_residuals: bool = False,
         verbose: bool = True,
     ):
+        """Compute a per-scan timeseries metric into self.data_dict.
+
+        Supports 'tsnr' (temporal SNR) and 'var' (temporal variance), applied per
+        scan via _run_for_all_scans with disk caching.
+
+        Parameters
+        ----------
+        method : {'tsnr', 'var'}
+            Metric to compute.
+        force_recompute : bool
+            Ignore cached files and recompute.
+        save_outputs : bool
+            Persist results to disk.
+        use_residuals : bool
+            Use self.timeseries_residuals for task scans instead of raw timeseries.
+        verbose : bool
+            Print summary counts.
+        """
         output_type = f'metric_{method}'
         if use_residuals:
             output_type = f'{output_type}_resids'
@@ -762,18 +838,30 @@ class Timescales(DataLoader):
 
     # ==================== Deconfounding Functions ====================
     def regress_task_structure(self):
+        """Regress task-evoked structure out of every task scan's timeseries.
+
+        For each task scan, builds a nilearn design matrix from its events
+        (HRF-convolved for fMRI; raw for MEG), fits a per-region GLM, and keeps the
+        residuals. Also stores the events, design matrices, per-condition beta
+        contrast maps, and the ACF of the flattened task regressor. Rest scans and
+        any failures are stored as None.
+
+        Sets self.timeseries_residuals, self.task_events, self.design_matrices,
+        self.task_events_acf, and self.task_contrasts (all keyed by scan_key).
+        """
         timeseries_residuals = dict().fromkeys(self.timeseries_data)
         task_events = dict().fromkeys(self.timeseries_data)
         design_matrices = dict().fromkeys(self.timeseries_data)
         task_events_acf = dict().fromkeys(self.timeseries_data)
-        
+        task_contrasts = dict().fromkeys(self.timeseries_data)
+
         for scan_key in tqdm(self.scans, desc=f"Regressing task structure out of timeseries"):
             # Parse scan key
             kv_dict = self._parse_scan_string(scan_key)
             condition = kv_dict.get('condition', '')
             modality = kv_dict.get('modality', '')
             tr = kv_dict.get('tr', '')
-            
+
             if condition == 'task':
                 try:
                     timeseries = self.timeseries_data[scan_key]
@@ -801,18 +889,28 @@ class Timescales(DataLoader):
                     tsk_evnts = self.get_task_events(scan_info)
                     # replace all trials with a single trial types
                     # tsk_evnts['trial_type'] = 'trial'
-                    design_matrix = create_design_matrix_nilearn(tsk_evnts, n_timepoints, tr, 
+                    design_matrix = create_design_matrix_nilearn(tsk_evnts, n_timepoints, tr,
                                                                  hrf_model=hrf_model, drift_model=drift_model
                                                                  )
                     # Fit GLM using nilearn approach
                     timeseries_residuals[scan_key], predicted, betas = fit_glm(timeseries, design_matrix)
                     task_events[scan_key] = tsk_evnts
                     design_matrices[scan_key] = design_matrix
-                    
+
+                    # Extract task-based contrasts (beta maps) for each condition.
+                    # Nuisance columns (drift_*, constant) are excluded; each remaining
+                    # column's beta vector is a parcel-wise contrast map.
+                    dm_columns = design_matrix.columns.tolist()
+                    task_cols = [col for col in dm_columns
+                                 if not col.startswith('drift_') and col != 'constant']
+                    task_contrasts[scan_key] = {
+                        col: betas[:, dm_columns.index(col)] for col in task_cols
+                    }
+
                     # get autocorrelation of task events
                     tsk_evnts_flat = tsk_evnts.copy()
                     tsk_evnts_flat['trial_type'] = 'trial'
-                    design_matrix_flat = create_design_matrix_nilearn(tsk_evnts_flat, n_timepoints, tr, 
+                    design_matrix_flat = create_design_matrix_nilearn(tsk_evnts_flat, n_timepoints, tr,
                                                                       hrf_model=hrf_model, drift_model=drift_model
                                                                       )
                     task_events_acf[scan_key] = compute_acf(design_matrix_flat['trial'].values)
@@ -821,19 +919,27 @@ class Timescales(DataLoader):
                     task_events[scan_key] = None
                     design_matrices[scan_key] = None
                     task_events_acf[scan_key] = None
+                    task_contrasts[scan_key] = None
             else:
                 timeseries_residuals[scan_key] = None
                 task_events[scan_key] = None
                 design_matrices[scan_key] = None
                 task_events_acf[scan_key] = None
+                task_contrasts[scan_key] = None
 
         self.timeseries_residuals = timeseries_residuals
         self.task_events = task_events
         self.design_matrices = design_matrices
         self.task_events_acf = task_events_acf
+        self.task_contrasts = task_contrasts
     
     # ==================== Analysis Functions ====================        
     def match_registry_to_behavior(self):
+        """Subset behavioral data to the subjects present in the scan registry.
+
+        Builds self.df_behavior_matched: one row per unique registry subject that
+        also appears in self.df_behavior, preserving registry order.
+        """
         df_behavior_matched = pd.DataFrame(columns=self.df_behavior.columns)
         df_behavior_matched.index.name = 'subject_id'
         
@@ -850,14 +956,15 @@ class Timescales(DataLoader):
         self,
         output_type: str = 'zero_crossing'
     ) -> Dict[str, Any]:
-        """
-        Get pre-computed measures.
-        
-        Args:
-            method: Method to use ('zero_crossing', 'auc', 'decay_time')
-        
-        Returns:
-            Dictionary of measures for each scan
+        """Load previously saved per-scan outputs into self.data_dict.
+
+        Iterates the scan registry and loads each scan's saved output_type file
+        (if present) via _load_subject_output; scans with no saved file map to None.
+
+        Parameters
+        ----------
+        output_type : str
+            Output type to load (e.g. 'zero_crossing', 'timescale_tau').
         """
         data_dict = {}
 
@@ -891,21 +998,21 @@ class Timescales(DataLoader):
 
     # ==================== Utility Functions ====================
     def get_min_scan_length_per_subject(self):
-        """
-        Parse timeseries data to find the shortest scan length for each subject.
-        
-        This method examines all scans in timeseries_data, extracts the number of
-        timepoints (frames) for each scan, and identifies the minimum scan length
-        for each subject. Useful for determining truncation length for analyses
-        requiring equal-length timeseries.
-        
-        Stores:
-        -------
-        self.scan_lengths_df : pd.DataFrame
-            Full scan length information with columns: ['scan_key', 'subject_id', 
-            'task', 'modality', 'condition', 'n_frames'] for all scans
-        self.min_scan_lengths : pd.Series
-            Series indexed by subject_id containing minimum scan length in frames
+        """Find the shortest scan length (in frames) for each subject.
+
+        Examines all scans in timeseries_data, extracts each scan's number of
+        timepoints, and takes the per-subject minimum. Useful for choosing a
+        truncation length for analyses requiring equal-length timeseries. Results
+        are stored on the instance:
+
+        - self.scan_lengths_df : per-scan DataFrame with columns
+          ['scan_key', 'subject_id', 'task', 'modality', 'condition', 'n_frames'].
+        - self.min_scan_lengths : Series indexed by subject_id, minimum n_frames.
+
+        Raises
+        ------
+        ValueError
+            If timeseries_data is empty or no scan has a determinable length.
         """
         if len(self.timeseries_data) == 0:
             raise ValueError("timeseries_data is empty.")
@@ -966,24 +1073,27 @@ def compute_acf(
         data,
         use_fft: bool = False,
     ):
-    """
-    Compute autocorrelation function for time series data with optional frequency filtering.
-    
-    Parameters:
-    -----------
-    data : array-like
-        2D array (n_parcels, n_timepoints) or 1D array (single time series)
-    use_fft : bool, default=False
-        Whether to use FFT for computation
-        
-    Returns:
-    --------
-    autocorr : ndarray
-        Autocorrelation function(s)
+    """Compute the autocorrelation function for timeseries data.
+
+    Each series is mean/std standardized before the ACF is computed, then
+    normalized by its lag-0 value. Series with zero variance return all-NaN.
+
+    Parameters
+    ----------
+    data : ndarray
+        2D array (n_parcels, n_timepoints), or 1D array (single series).
+    use_fft : bool
+        Use an FFT-based computation instead of np.correlate.
+
+    Returns
+    -------
+    ndarray
+        Autocorrelation functions, shape (n_parcels, n_lags).
     """
     
     if data.ndim == 1:
         data = data.reshape(1, -1)
+    n = data.shape[1]
     
     autocorr_list = []
     
@@ -991,7 +1101,6 @@ def compute_acf(
         if np.std(timeseries) > 0:  # Avoid division by zero
             # Standardize the (potentially filtered) time series
             standardized = (timeseries - np.mean(timeseries)) / np.std(timeseries)
-            n = len(standardized)
             
             if use_fft:
                 # Pad to next power of 2 for optimal FFT performance
@@ -1158,20 +1267,29 @@ def create_design_matrix_nilearn(
     high_pass=0.01,
     add_regs=None
     ):
-    """
-    Create design matrix using nilearn's implementation.
-    
-    Parameters:
-    - events: pandas DataFrame with events (onset, duration, trial_type)
-    - n_timepoints: number of timepoints
-    - tr: repetition time in seconds
-    - hrf_model: HRF model ('glover', 'spm', 'glover + derivative', etc.)
-    - drift_model: drift model ('polynomial', 'cosine', None)
-    - high_pass: high-pass filter cutoff in Hz
-    - add_regs: additional regressors (optional)
-    
-    Returns:
-    - design_matrix: nilearn DesignMatrix object
+    """Create a first-level design matrix using nilearn.
+
+    Parameters
+    ----------
+    events : pd.DataFrame
+        Events with columns onset, duration, trial_type.
+    n_timepoints : int
+        Number of timepoints (frames).
+    tr : float
+        Repetition time in seconds.
+    hrf_model : str
+        HRF model ('glover', 'spm', 'glover + derivative', ...).
+    drift_model : str or None
+        Drift model ('polynomial', 'cosine', or None).
+    high_pass : float
+        High-pass filter cutoff in Hz.
+    add_regs : ndarray or None
+        Additional regressors.
+
+    Returns
+    -------
+    pd.DataFrame
+        nilearn design matrix (task regressors, drift terms, constant).
     """
     
     # Create frame times
@@ -1190,18 +1308,26 @@ def create_design_matrix_nilearn(
     return design_matrix
 
 def fit_glm(data, design_matrix):
-    """
-    Fit GLM with masking for NaN and zero-variance regions.
-    
-    Parameters:
-    - data: 2D array (n_parcels, n_timepoints)
-    - design_matrix: nilearn DesignMatrix object
-    
-    Returns:
-    - residuals: residual time series after GLM fitting
-    - predicted: predicted time series
-    - betas: regression coefficients
-    - valid_mask: boolean mask indicating which regions were included in fitting
+    """Fit a GLM per region, masking NaN and zero-variance regions.
+
+    Regions with any NaN or zero temporal variance are excluded from the fit and
+    returned as NaN in all three outputs.
+
+    Parameters
+    ----------
+    data : ndarray
+        2D array (n_parcels, n_timepoints).
+    design_matrix : pd.DataFrame
+        nilearn design matrix.
+
+    Returns
+    -------
+    residuals : ndarray
+        Residual timeseries after GLM fitting (NaN for excluded regions).
+    predicted : ndarray
+        Predicted timeseries (NaN for excluded regions).
+    betas : ndarray
+        Regression coefficients, shape (n_parcels, n_regressors).
     """
     
     # Convert design matrix to numpy array
@@ -1220,7 +1346,7 @@ def fit_glm(data, design_matrix):
     
     if np.sum(valid_mask) == 0:
         # No valid regions - return all NaNs
-        return residuals, predicted, betas, valid_mask
+        return residuals, predicted, betas
     
     # Fit GLM only for valid regions
     data_valid = data[valid_mask, :]
@@ -1240,11 +1366,24 @@ def fit_glm(data, design_matrix):
     return residuals, predicted, betas
 
 def fit_exponential_decay(lags, acf):
-    """
-    Fit exponential decay function to ACF: ACF(t) = exp(-t/tau)
-    
-    This is done by linear regression in log space: log(ACF) = -t/tau + const
-    Following Gao et al. 2020 methodology.
+    """Fit an exponential decay ACF(t) = exp(-t / tau) by log-linear regression.
+
+    Fits log(ACF) = -t / tau + const over positive ACF values up to the first
+    zero crossing (lag 0 excluded), following Gao et al. 2020.
+
+    Parameters
+    ----------
+    lags : ndarray
+        Lag times (seconds), same length as acf.
+    acf : ndarray
+        Autocorrelation values (acf[0] ~ 1).
+
+    Returns
+    -------
+    tau : float
+        Estimated timescale, or NaN if the fit failed or the slope was non-negative.
+    fit_info : dict
+        Fit diagnostics (slope, intercept, r_squared, n_points, error, ...).
     """
     
     # Find first zero crossing to limit fit range (positive ACF only)
@@ -1567,6 +1706,31 @@ def fit_acf_exp(acf_vals, tr,
 
 # ==================== Standalone Utility Functions (for use in notebooks) ====================
 def compute_deflections(rest_timescales, task_timescales, nuisance_regression=False, standardize=False, absolute=False):
+    """Compute task-vs-rest timescale deflections (task minus rest).
+
+    Works on 1-D (n,) vectors or 2-D (n_subjects, n_regions) matrices; in matrix
+    mode each subject is processed independently.
+
+    Parameters
+    ----------
+    rest_timescales, task_timescales : array-like
+        Matching-shaped timescale values (1-D or 2-D). Series/DataFrame are
+        converted to arrays.
+    nuisance_regression : bool
+        If True, regress rest timescales out of the deflection (per subject in
+        matrix mode); subjects with < 2 valid regions become NaN.
+    standardize : bool or {'separate', 'pooled'}
+        Z-score before differencing: True/'separate' scales rest and task
+        independently; 'pooled' scales them on a shared mean/std.
+    absolute : bool
+        Return the absolute value of the deflection.
+
+    Returns
+    -------
+    ndarray
+        Deflections, shape (n_subjects, n_regions) in matrix mode or (n,) in
+        vector mode.
+    """
     # Normalise input types — convert Series/DataFrame to numpy arrays
     if isinstance(rest_timescales, (pd.Series, pd.DataFrame)):
         rest_timescales = rest_timescales.to_numpy()
@@ -1660,6 +1824,27 @@ def compute_deflections(rest_timescales, task_timescales, nuisance_regression=Fa
 
 
 def compute_deflections_glm(rest_timescales, task_timescales, features, standardize=False):
+    """Regress task timescales on each feature plus rest timescales (per feature).
+
+    For each column of features, fits OLS task ~ const + feature + rest and reports
+    the feature coefficient and stats. Also returns partial residuals of task and
+    feature after removing rest (for residual scatter plots).
+
+    Parameters
+    ----------
+    rest_timescales, task_timescales : array-like
+        Per-region timescale vectors (n_regions,). Series are converted to arrays.
+    features : pd.Series, pd.DataFrame, or ndarray
+        One or more region-wise predictors; each column is modelled separately.
+    standardize : bool
+        Z-score rest, task, and each feature before fitting.
+
+    Returns
+    -------
+    dict
+        feature_name -> dict of model, coef, pvalue, tstat, conf_int, r_squared,
+        r_squared_adj, task_partial_resid, feature_partial_resid, valid_mask.
+    """
     if isinstance(rest_timescales, pd.Series):
         rest_timescales = rest_timescales.to_numpy()
     if isinstance(task_timescales, pd.Series):
@@ -1729,6 +1914,38 @@ def compute_deflections_glm(rest_timescales, task_timescales, features, standard
 def compute_regional_corrs(rest_data, task_data, behavior_data,
                            nuisance_regression, deflection_method,
                            standardize=False, absolute=True, verbose=False, return_pval=False):
+    """Correlate rest, task, and deflection timescales with a behavior, per region.
+
+    For each region, computes the Pearson correlation of the behavior with rest,
+    task, and the task-vs-rest deflection across subjects (subjects with missing
+    behavior are dropped first; regions with < 3 valid subjects are skipped).
+
+    Parameters
+    ----------
+    rest_data, task_data : ndarray
+        (n_subjects, n_regions) timescale matrices.
+    behavior_data : ndarray
+        (n_subjects,) behavioral values.
+    nuisance_regression : bool
+        Passed to compute_deflections (regress rest out of the deflection).
+    deflection_method : {'simple', 'matrix'}
+        'simple' computes each region's deflection independently; 'matrix' computes
+        deflections across all regions jointly, then indexes per region.
+    standardize : bool or str
+        Passed to compute_deflections.
+    absolute : bool
+        Use absolute deflections (passed to compute_deflections).
+    verbose : bool
+        Print the valid-subject count.
+    return_pval : bool
+        Also return the three p-value arrays.
+
+    Returns
+    -------
+    tuple of ndarray
+        (rest_corr, task_corr, deflection_corr), each (n_regions,); plus the
+        matching p-value arrays when return_pval is True.
+    """
     n_regions = rest_data.shape[1]
     rest_correlations       = np.full(n_regions, np.nan)
     task_correlations       = np.full(n_regions, np.nan)
@@ -2000,6 +2217,25 @@ def create_ints_dataframe_custom_grouping(
     return df
 
 def sort_and_group_timescales(timescales, brain_map, ntile=10):
+    """Sort regions by a brain map and average them into equal-sized ntiles.
+
+    Reorders regions by ascending brain_map value, then averages consecutive
+    equal-sized blocks into `ntile` bins (nanmean across regions in each bin).
+
+    Parameters
+    ----------
+    timescales : ndarray
+        (n_subjects, n_regions) values.
+    brain_map : ndarray
+        (n_regions,) values used to sort regions (e.g. the S-A axis).
+    ntile : int
+        Number of equal-sized bins.
+
+    Returns
+    -------
+    ndarray
+        (n_subjects, ntile) block-averaged values.
+    """
     n_nodes = len(brain_map)
     brain_map_sort_idx = np.argsort(brain_map)
     
@@ -2009,12 +2245,36 @@ def sort_and_group_timescales(timescales, brain_map, ntile=10):
     step_size = int(n_nodes / ntile)
     counter = 0
     for i in np.arange(0, n_nodes, step_size):
-        timescales_sorted_dec[:, counter] = timescales_sorted[:, i:i+step_size].mean(axis=1)
+        # timescales_sorted_dec[:, counter] = timescales_sorted[:, i:i+step_size].mean(axis=1)
+        timescales_sorted_dec[:, counter] = np.nanmean(timescales_sorted[:, i:i+step_size], axis=1)
         counter += 1
         
     return timescales_sorted_dec
 
 def convert_data_dict(data_dict, scan_registry, brain_map=None, verbose=True):
+    """Regroup a flat scan_key -> array dict into a task -> stacked-array dict.
+
+    For each unique task in the registry, stacks that task's per-subject arrays.
+    If brain_map is given, each task's stack is additionally sorted and binned via
+    sort_and_group_timescales.
+
+    Parameters
+    ----------
+    data_dict : dict
+        scan_key -> 1-D region array.
+    scan_registry : list of ScanInfo
+        Registry used to enumerate tasks and their scan keys.
+    brain_map : ndarray or None
+        If given, apply sort_and_group_timescales per task.
+    verbose : bool
+        Print each task's output shape.
+
+    Returns
+    -------
+    dict
+        task -> (n_subjects, n_regions) array, or (n_subjects, ntile) if brain_map
+        was provided.
+    """
     unique_tasks = list(dict.fromkeys(scan.task for scan in scan_registry))
     data_dict_converted = dict.fromkeys(unique_tasks)
 
