@@ -12,7 +12,7 @@ modalities:
     file_ext: .ptseries.nii
     task_events_handler: hcp_fmri
 behavior:
-  handler: hcp_d_socdem
+  handler: hcp_d
 rbc: false
 # Subject IDs stored without underscores (e.g. HCD0001305V1MR), but the rawdata
 # directory uses the underscore form (HCD0001305_V1_MR). The split_hcpd transform
