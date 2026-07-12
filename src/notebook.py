@@ -79,8 +79,8 @@ DATASET_PARAMS = {
     },
     'PNC': {
         'modalities':  ['MRI3T'],
-        'seg':         'Schaefer2018p400n17',
-        'space':       'MNI152NLin6ASym',
+        'seg':         '4S456Parcels',
+        'space':       'fsLR',
         'sessions':    ['PNC1'],
         'tasks': {
             'MRI3T': ['rest', 'frac2back'],

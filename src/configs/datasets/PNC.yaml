@@ -6,14 +6,14 @@ paths:
 modalities:
   MRI3T:
     tr: 3.0
-    data_subdir: rbc_cpac/cpac_RBCv0
+    data_subdir: xcp-d
     dir_template: "sub-{subject_id}/ses-{session}/func"
-    # Primary filename template (no acquisition label).
-    # Fallback adds acq-singleband for older preprocessed scans.
-    filename_template: "sub-{subject_id}_ses-{session}_task-{task}_atlas-{seg}_space-{space}_reg-36Parameter_desc-Mean_timeseries{ext}"
+    # Primary filename template (no acquisition label; matches frac2back, idemo).
+    # Fallback adds acq-singleband, used for the resting-state scan.
+    filename_template: "sub-{subject_id}_ses-{session}_task-{task}_space-{space}_seg-{seg}_stat-mean_timeseries{ext}"
     filename_template_fallbacks:
-      - "sub-{subject_id}_ses-{session}_task-{task}_acq-singleband_atlas-{seg}_space-{space}_reg-36Parameter_desc-Mean_timeseries{ext}"
-    file_ext: .1D
+      - "sub-{subject_id}_ses-{session}_task-{task}_acq-singleband_space-{space}_seg-{seg}_stat-mean_timeseries{ext}"
+    file_ext: .tsv
     task_events_handler: bids_tsv
     task_events_file_template: "sub-{subject_id}_ses-{session}_task-{task}*_events.tsv"
     task_events_use_glob: true
