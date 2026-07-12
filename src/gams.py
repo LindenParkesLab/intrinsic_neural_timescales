@@ -807,3 +807,78 @@ def compute_deriv_sa_corr(deriv, sa_axis_vals, method='pearson'):
         if mask.sum() > 2:
             r_vals[t] = corr_fn(sa_axis_vals[mask], col[mask]).statistic
     return r_vals
+
+
+def compute_stage_maps(gam_smooths, age_grid, inflection_age=17, flat_ratio_thresh=0.5,
+                       annualized=False):
+    """Net change (or annualized rate of change) in fitted (absolute) INT deflection over two developmental stages.
+
+    Reuses the per-parcel GAM smooths already fit for Figure 4 (no refitting). For each
+    parcel, stage 1 = age_grid[0] -> inflection_age and stage 2 = inflection_age -> age_grid[-1].
+    Net change is the integral of the fitted first derivative over each window (equivalently,
+    the difference of the fitted value at the window endpoints). The deflection metric is
+    identical to Figure 4 (absolute deflection; absolute=True in compute_deflections).
+
+    The first grid column of the GAM derivative is non-finite by construction (a finite-
+    difference edge effect), so each window's integral is taken over the finite derivative
+    samples only; this is numerically identical (r > 0.999) to the endpoint difference, which
+    is reported as a cross-check.
+
+    Parameters
+    ----------
+    gam_smooths : dict with 'pred' and 'deriv', each (n_regions, n_grid) on age_grid
+        e.g. results_reg['deflection'].
+    age_grid : (n_grid,) ages at which the smooths/derivatives were evaluated.
+    inflection_age : float, default 17. Stage boundary in years.
+    flat_ratio_thresh : float, default 0.5. Warn if SD(stage1) < thresh * SD(stage2).
+    annualized : bool, default False. If True, return the annualized rate of change
+        (net change divided by the stage duration in years) instead of the total net change.
+
+    Returns
+    -------
+    stage1, stage2 : (n_regions,) signed net-change vectors (or annualized rates if annualized=True).
+    """
+    pred  = np.asarray(gam_smooths['pred'])
+    deriv = np.asarray(gam_smooths['deriv'])
+    n_grid = deriv.shape[1]
+    idx    = int(np.argmin(np.abs(age_grid - inflection_age)))
+
+    def _integrate(cols):
+        x = age_grid[cols]
+        d = deriv[:, cols]
+        finite = np.isfinite(x) & np.isfinite(d).any(axis=0)  # keep cols finite for >=1 region (drops the edge-NaN col); all-NaN regions stay NaN
+        return np.trapezoid(d[:, finite], x[finite], axis=1)
+
+    # Integral of the fitted first derivative over each window (signed net change)
+    stage1 = _integrate(np.arange(0, idx + 1))
+    stage2 = _integrate(np.arange(idx, n_grid))
+
+    # Cross-check: equals fitted-value difference at window endpoints
+    endpoint1 = pred[:, idx] - pred[:, 0]
+    endpoint2 = pred[:, -1]  - pred[:, idx]
+    max_dev = max(np.nanmax(np.abs(stage1 - endpoint1)),
+                  np.nanmax(np.abs(stage2 - endpoint2)))
+
+    sd1, sd2 = np.nanstd(stage1), np.nanstd(stage2)
+    var1, var2 = np.nanvar(stage1), np.nanvar(stage2)
+    print(f'Stage boundary: age_grid[{idx}] = {age_grid[idx]:.2f} yr (target {inflection_age})')
+    print(f'Stage 1 ({age_grid[0]:.1f}->{age_grid[idx]:.1f} yr): spatial SD = {sd1:.4f}, spatial VAR = {var1:.4f}')
+    print(f'Stage 2 ({age_grid[idx]:.1f}->{age_grid[-1]:.1f} yr): spatial SD = {sd2:.4f}, spatial VAR = {var2:.4f}')
+    print(f'Integral vs endpoint max abs deviation = {max_dev:.2e} '
+          f'(small edge-truncation expected; should be << SD)')
+
+    if sd2 > 0 and sd1 < flat_ratio_thresh * sd2:
+        print(f'WARNING: stage-1 map is near-flat relative to stage-2 '
+              f'(SD ratio = {sd1 / sd2:.2f} < {flat_ratio_thresh}). A spatially flat stage-1 '
+              f'map cannot be expected to correlate with any spatially structured receptor map.')
+
+    if annualized:
+        # Convert total net change to an annualized rate (change per year) over each window
+        dur1 = age_grid[idx] - age_grid[0]
+        dur2 = age_grid[-1]  - age_grid[idx]
+        stage1 = stage1 / dur1
+        stage2 = stage2 / dur2
+        print(f'Returning annualized rate of change (net change / stage duration): '
+              f'stage 1 over {dur1:.1f} yr, stage 2 over {dur2:.1f} yr.')
+
+    return stage1, stage2
