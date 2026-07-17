@@ -16,6 +16,7 @@ pyfftw.interfaces.cache.enable()  # cache FFT plans
 
 from src.data import DataLoader, ScanInfo, parse_scan_string, build_scan_string
 from snaplab_tools.signal import apply_frequency_filter
+from snaplab_tools.stats import partial_pearsonr
 import logging
 logger = logging.getLogger(__name__)
 
@@ -1705,122 +1706,51 @@ def fit_acf_exp(acf_vals, tr,
         }
 
 # ==================== Standalone Utility Functions (for use in notebooks) ====================
-def compute_deflections(rest_timescales, task_timescales, nuisance_regression=False, standardize=False, absolute=False):
+def compute_deflections(rest_timescales, task_timescales, absolute=False):
     """Compute task-vs-rest timescale deflections (task minus rest).
 
-    Works on 1-D (n,) vectors or 2-D (n_subjects, n_regions) matrices; in matrix
-    mode each subject is processed independently.
+    Elementwise, so it works on any pair of matching-shaped arrays — typically 1-D
+    (n_subjects,) for a single region, or 2-D (n_subjects, n_regions).
 
     Parameters
     ----------
     rest_timescales, task_timescales : array-like
-        Matching-shaped timescale values (1-D or 2-D). Series/DataFrame are
-        converted to arrays.
-    nuisance_regression : bool
-        If True, regress rest timescales out of the deflection (per subject in
-        matrix mode); subjects with < 2 valid regions become NaN.
-    standardize : bool or {'separate', 'pooled'}
-        Z-score before differencing: True/'separate' scales rest and task
-        independently; 'pooled' scales them on a shared mean/std.
+        Matching-shaped timescale values. Series/DataFrame are converted to arrays.
     absolute : bool
-        Return the absolute value of the deflection.
+        Return |task - rest| rather than the signed difference. Note that task
+        shortens INT in ~95% of subject x region cells (HCP-YA WM), so the signed
+        deflection is near-unidirectional and abs() is close to a sign flip; the
+        signed value is directly interpretable as "amount of INT shortening".
 
     Returns
     -------
     ndarray
-        Deflections, shape (n_subjects, n_regions) in matrix mode or (n,) in
-        vector mode.
+        Deflections, same shape as the inputs.
+
+    Notes
+    -----
+    This function deliberately has no rest-INT control. Regressing rest out of
+    (task - rest) is algebraically identical to residualising task on rest — the
+    subtraction cancels exactly — which silently turns a deflection into a residual
+    and destroys the S-A structure that fig2 tests. Control for rest INT at the
+    analysis step instead (see compute_regional_corrs's `covariate`).
     """
-    # Normalise input types — convert Series/DataFrame to numpy arrays
     if isinstance(rest_timescales, (pd.Series, pd.DataFrame)):
         rest_timescales = rest_timescales.to_numpy()
     if isinstance(task_timescales, (pd.Series, pd.DataFrame)):
         task_timescales = task_timescales.to_numpy()
 
-    # Always copy so that standardize='pooled' (in-place row assignment) never
-    # mutates the caller's arrays when the input is already float64.
-    rest_timescales = np.array(rest_timescales, dtype=float)
-    task_timescales = np.array(task_timescales, dtype=float)
+    rest_timescales = np.asarray(rest_timescales, dtype=float)
+    task_timescales = np.asarray(task_timescales, dtype=float)
 
-    if rest_timescales.ndim not in (1, 2) or task_timescales.ndim not in (1, 2):
-        raise ValueError("rest_timescales and task_timescales must be 1-D or 2-D arrays.")
     if rest_timescales.shape != task_timescales.shape:
         raise ValueError(
             f"rest_timescales and task_timescales must have the same shape; "
             f"got {rest_timescales.shape} and {task_timescales.shape}."
         )
 
-    # Matrix mode: (n_subjects, n_regions) — each subject processed independently.
-    # Vector mode: (n,) — reshape to (n, 1) for uniform internal handling.
-    matrix_mode = rest_timescales.ndim == 2
-    if not matrix_mode:
-        rest_timescales = rest_timescales.reshape(-1, 1)
-        task_timescales = task_timescales.reshape(-1, 1)
-
-    if standardize is True or standardize == 'separate':
-        if matrix_mode:
-            # Per-subject z-score over regions (axis=1)
-            rest_timescales = (rest_timescales - np.nanmean(rest_timescales, axis=1, keepdims=True)) / np.nanstd(rest_timescales, axis=1, keepdims=True)
-            task_timescales = (task_timescales - np.nanmean(task_timescales, axis=1, keepdims=True)) / np.nanstd(task_timescales, axis=1, keepdims=True)
-        else:
-            rest_timescales = (rest_timescales - np.nanmean(rest_timescales)) / np.nanstd(rest_timescales)
-            task_timescales = (task_timescales - np.nanmean(task_timescales)) / np.nanstd(task_timescales)
-    elif standardize == 'pooled':
-        if matrix_mode:
-            # Per-subject pooled z-score (rest and task scaled together)
-            for j in range(rest_timescales.shape[0]):
-                pooled = np.concatenate([rest_timescales[j, :], task_timescales[j, :]])
-                mu, sigma = np.nanmean(pooled), np.nanstd(pooled)
-                rest_timescales[j, :] = (rest_timescales[j, :] - mu) / sigma
-                task_timescales[j, :] = (task_timescales[j, :] - mu) / sigma
-        else:
-            pooled = np.concatenate([rest_timescales, task_timescales])
-            pooled_mean = np.nanmean(pooled)
-            pooled_std = np.nanstd(pooled)
-            rest_timescales = (rest_timescales - pooled_mean) / pooled_std
-            task_timescales = (task_timescales - pooled_mean) / pooled_std
-    elif standardize is not False:
-        raise ValueError(f"standardize must be False, True, 'separate', or 'pooled'; got '{standardize}'")
-
     int_deflections = task_timescales - rest_timescales
-
-    if nuisance_regression:
-        if matrix_mode:
-            # Subject-specific spatial nuisance regression:
-            # for each subject, regress their rest timescales (across regions)
-            # out of their deflections (across regions).
-            for j in range(rest_timescales.shape[0]):
-                rest_j = rest_timescales[j, :]
-                def_j  = int_deflections[j, :]
-                valid  = ~(np.isnan(rest_j) | np.isnan(def_j))
-                if valid.sum() < 2:
-                    # Too few valid regions to fit — mark entire subject as NaN
-                    # rather than silently returning unresidualised values.
-                    int_deflections[j, :] = np.nan
-                    continue
-                X_valid = np.column_stack([rest_j[valid], np.ones(valid.sum())])
-                beta    = np.linalg.lstsq(X_valid, def_j[valid], rcond=None)[0]
-                X_full  = np.column_stack([rest_j, np.ones(len(rest_j))])
-                int_deflections[j, :] = def_j - X_full @ beta
-        else:
-            valid_mask = ~(np.isnan(rest_timescales[:, 0]) | np.isnan(int_deflections[:, 0]))
-            X_full = np.concatenate((rest_timescales, np.ones((rest_timescales.shape[0], 1))), axis=1)
-
-            X_valid = X_full[valid_mask]
-            y_valid = int_deflections[valid_mask]
-
-            beta    = np.linalg.lstsq(X_valid, y_valid, rcond=None)[0]
-            predicted = X_full @ beta
-
-            int_deflections = int_deflections - predicted
-
-    if absolute:
-        int_deflections = np.abs(int_deflections)
-
-    if matrix_mode:
-        return int_deflections  # (n_subjects, n_regions)
-    else:
-        return int_deflections[:, 0]  # (n,)
+    return np.abs(int_deflections) if absolute else int_deflections
 
 
 def compute_deflections_glm(rest_timescales, task_timescales, features, standardize=False):
@@ -1912,13 +1842,13 @@ def compute_deflections_glm(rest_timescales, task_timescales, features, standard
 
 
 def compute_regional_corrs(rest_data, task_data, behavior_data,
-                           nuisance_regression, deflection_method,
-                           standardize=False, absolute=True, verbose=False, return_pval=False):
+                           covariate=None, absolute=False, verbose=False, return_pval=False):
     """Correlate rest, task, and deflection timescales with a behavior, per region.
 
-    For each region, computes the Pearson correlation of the behavior with rest,
-    task, and the task-vs-rest deflection across subjects (subjects with missing
-    behavior are dropped first; regions with < 3 valid subjects are skipped).
+    For each region, correlates the behavior with rest, task, and the task-vs-rest
+    deflection across subjects. Subjects with missing behavior are dropped first;
+    regions with < 3 valid subjects are skipped. All three correlations for a region
+    use the same subject set, so they are directly comparable.
 
     Parameters
     ----------
@@ -1926,15 +1856,21 @@ def compute_regional_corrs(rest_data, task_data, behavior_data,
         (n_subjects, n_regions) timescale matrices.
     behavior_data : ndarray
         (n_subjects,) behavioral values.
-    nuisance_regression : bool
-        Passed to compute_deflections (regress rest out of the deflection).
-    deflection_method : {'simple', 'matrix'}
-        'simple' computes each region's deflection independently; 'matrix' computes
-        deflections across all regions jointly, then indexes per region.
-    standardize : bool or str
-        Passed to compute_deflections.
+    covariate : ndarray or None
+        (n_subjects,) subject-level covariate. When given, every correlation becomes a
+        partial correlation controlling for it (df = n - 3).
+
+        Intended use is each subject's MEAN rest INT, np.nanmean(rest_data, axis=1) —
+        one scalar per subject, constant across regions, so it removes global INT
+        differences without reshaping the regional map. This matches the nuisance
+        covariate used by fig4's GAMs.
+
+        Do NOT pass a region-specific rest vector. rest_data[:, r] carries the S-A
+        gradient, so regressing it out strips the S-A structure these correlations are
+        used to test — empirically it collapses fig2's S-A coupling from r ~ +0.56 to
+        r ~ -0.18 (see the diagnostics cell in timescales_analysis_fig2.ipynb).
     absolute : bool
-        Use absolute deflections (passed to compute_deflections).
+        Use |task - rest| instead of the signed deflection (see compute_deflections).
     verbose : bool
         Print the valid-subject count.
     return_pval : bool
@@ -1954,49 +1890,48 @@ def compute_regional_corrs(rest_data, task_data, behavior_data,
     task_pvalues            = np.full(n_regions, np.nan)
     deflection_pvalues      = np.full(n_regions, np.nan)
 
-    if deflection_method not in ('simple', 'matrix'):
-        raise ValueError(f"deflection_method must be 'simple' or 'matrix'; got '{deflection_method}'")
+    behavior_data = np.asarray(behavior_data, dtype=float)
 
-    beh_valid = ~np.isnan(behavior_data)
+    beh_valid      = ~np.isnan(behavior_data)
     behavior_clean = behavior_data[beh_valid]
     rest_clean     = rest_data[beh_valid, :]
     task_clean     = task_data[beh_valid, :]
 
+    covariate_clean = None
+    if covariate is not None:
+        covariate = np.asarray(covariate, dtype=float)
+        if covariate.shape != behavior_data.shape:
+            raise ValueError(
+                f"covariate must be one value per subject, matching behavior_data "
+                f"{behavior_data.shape}; got {covariate.shape}. Pass a subject-level "
+                f"scalar such as np.nanmean(rest_data, axis=1), not a regional vector."
+            )
+        covariate_clean = covariate[beh_valid]
+
     if verbose:
         print(f"  Valid subjects: {np.sum(beh_valid)}/{len(behavior_data)}")
 
-    if deflection_method == 'matrix':
-        defl = compute_deflections(rest_clean, task_clean,
-                                   nuisance_regression=nuisance_regression,
-                                   standardize=standardize, absolute=absolute)
+    deflections = compute_deflections(rest_clean, task_clean, absolute=absolute)
 
     for region_idx in range(n_regions):
         rest_region = rest_clean[:, region_idx]
         task_region = task_clean[:, region_idx]
 
+        # Joint mask so rest / task / deflection all describe the same subject set.
+        # (isnan(deflection) is exactly isnan(rest) | isnan(task).)
         valid = ~(np.isnan(rest_region) | np.isnan(task_region))
         if valid.sum() < 3:
             continue
 
-        rest_correlations[region_idx], rest_pvalues[region_idx] = sp.stats.pearsonr(
-            rest_region[valid], behavior_clean[valid])
-        task_correlations[region_idx], task_pvalues[region_idx] = sp.stats.pearsonr(
-            task_region[valid], behavior_clean[valid])
+        behavior_v  = behavior_clean[valid]
+        covariate_v = None if covariate_clean is None else covariate_clean[valid]
 
-        if deflection_method == 'simple':
-            defl = compute_deflections(rest_region, task_region,
-                                       nuisance_regression=nuisance_regression,
-                                       standardize=standardize, absolute=absolute)
-            valid_d = ~np.isnan(defl)
-            if valid_d.sum() >= 3:
-                deflection_correlations[region_idx], deflection_pvalues[region_idx] = sp.stats.pearsonr(
-                    defl[valid_d], behavior_clean[valid_d])
-        elif deflection_method == 'matrix':
-            defl_region = defl[:, region_idx]
-            valid_d = ~np.isnan(defl_region)
-            if valid_d.sum() >= 3:
-                deflection_correlations[region_idx], deflection_pvalues[region_idx] = sp.stats.pearsonr(
-                    defl_region[valid_d], behavior_clean[valid_d])
+        rest_correlations[region_idx], rest_pvalues[region_idx], _ = partial_pearsonr(
+            rest_region[valid], behavior_v, covariate_v)
+        task_correlations[region_idx], task_pvalues[region_idx], _ = partial_pearsonr(
+            task_region[valid], behavior_v, covariate_v)
+        deflection_correlations[region_idx], deflection_pvalues[region_idx], _ = partial_pearsonr(
+            deflections[valid, region_idx], behavior_v, covariate_v)
 
     if return_pval:
         return (rest_correlations, task_correlations, deflection_correlations,
