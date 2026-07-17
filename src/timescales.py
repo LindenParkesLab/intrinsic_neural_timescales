@@ -444,6 +444,7 @@ class Timescales(DataLoader):
         use_residuals: bool = False,
         lowpass: float = None,
         highpass: float = None,
+        resampled: bool = False,
         verbose: bool = True,
     ):
         """Compute (or load) the ACF for every scan into self.autocorr_dict.
@@ -466,16 +467,23 @@ class Timescales(DataLoader):
             Use self.timeseries_residuals for task scans instead of raw timeseries.
         lowpass, highpass : float or None
             Used only for output naming (see above).
+        resampled : bool
+            Used only for output naming: append '_resampled' so ACFs computed from
+            TR-resampled timeseries are stored separately from native-TR ACFs.
         verbose : bool
             Print summary counts.
         """
+        # Token order mirrors the processing order: resampling is applied before
+        # filtering, so '_resampled' precedes the frequency-filter token.
         output_type = 'autocorr'
+        if resampled:
+            output_type = f'{output_type}_resampled'
         if highpass is not None and lowpass is not None:
-            output_type = f'autocorr_bp-{highpass}-{lowpass}hz'
+            output_type = f'{output_type}_bp-{highpass}-{lowpass}hz'
         elif highpass is not None:
-            output_type = f'autocorr_hp-{highpass}hz'
+            output_type = f'{output_type}_hp-{highpass}hz'
         elif lowpass is not None:
-            output_type = f'autocorr_lp-{lowpass}hz'
+            output_type = f'{output_type}_lp-{lowpass}hz'
         if suffix:
             output_type = f'{output_type}_{suffix}'
         if use_residuals:
@@ -612,6 +620,7 @@ class Timescales(DataLoader):
         force_recompute: bool = False,
         save_outputs: bool = True,
         use_residuals: bool = False,
+        resampled: bool = False,
         verbose: bool = True,
     ):
         """Compute a per-scan timeseries metric into self.data_dict.
@@ -629,10 +638,15 @@ class Timescales(DataLoader):
             Persist results to disk.
         use_residuals : bool
             Use self.timeseries_residuals for task scans instead of raw timeseries.
+        resampled : bool
+            Used only for output naming: append '_resampled' so metrics computed from
+            TR-resampled timeseries are stored separately from native-TR metrics.
         verbose : bool
             Print summary counts.
         """
         output_type = f'metric_{method}'
+        if resampled:
+            output_type = f'{output_type}_resampled'
         if use_residuals:
             output_type = f'{output_type}_resids'
 
@@ -729,10 +743,17 @@ class Timescales(DataLoader):
         return zero_crossings_agg
     
     def _compute_auc(self, acf: np.ndarray, max_lag: int = None, threshold: float = 0) -> np.ndarray:
-        """Compute area under curve up to some max lag (or zero crossing)."""
+        """Compute area under curve up to some max lag (or zero crossing).
+
+        Integrates via the trapezoidal rule (np.trapezoid). dx is left at its
+        default of 1: the callers in TIMESCALE_METHODS scale the result by tr, so
+        the returned value times tr equals the trapezoidal area with dx=tr. This
+        replaces the earlier left Riemann sum (np.sum), which overestimated the
+        area by ~tr/2 and injected a TR-dependent bias into the timescale.
+        """
         n_parcels = acf.shape[0]
         auc = np.zeros(n_parcels)
-        
+
         for i in range(n_parcels):
             try:
                 if max_lag is not None:
@@ -740,11 +761,10 @@ class Timescales(DataLoader):
                 else:
                     max_lag_i = np.where(acf[i] < threshold)[0][0]
 
-                # auc[i] = np.trapezoid(acf[i, :max_lag_i], dx=tr)
-                auc[i] = np.sum(acf[i, :max_lag_i])
+                auc[i] = np.trapezoid(acf[i, :max_lag_i])
             except Exception:
                 auc[i] = np.nan
-        
+
         return auc
     
     def _compute_decay_time(self, acf: np.ndarray, tr: float, threshold: float = 1.0 / np.e) -> np.ndarray:

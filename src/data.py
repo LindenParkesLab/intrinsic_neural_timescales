@@ -10,6 +10,7 @@ import yaml
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
+from fractions import Fraction
 from sklearn.linear_model import LinearRegression
 from collections import defaultdict
 
@@ -650,6 +651,9 @@ class DataLoader:
         self.scan_registry: List[ScanInfo] = []
         self.df_behavior: Optional[pd.DataFrame] = None
         self._data_cache: Dict[str, np.ndarray] = {}
+        # When set (via enable_hcpya_3t_resampling), HCP-YA MRI3T timeseries are
+        # resampled onto this TR grid at load time. None disables resampling.
+        self.resample_to_tr: Optional[float] = None
 
         if load_behavior:
             self.load_behavioral_data()
@@ -675,6 +679,29 @@ class DataLoader:
                 f"Available: {list(self.config.modalities)}"
             )
         return self.config.modalities[modality].tr
+
+    def enable_hcpya_3t_resampling(self, target_modality: str = 'MRI7T') -> float:
+        """Resample HCP-YA 3T timeseries onto the target modality's TR grid at load time.
+
+        Sets ``self.resample_to_tr`` so that every subsequent load of an HCP-YA
+        MRI3T scan (rest and task) is resampled from its native TR
+        (``get_tr('MRI3T')``) onto the target modality's TR (default MRI7T = 1.0 s).
+        The ``tr`` of every MRI3T scan already in the registry is rewritten to the
+        target so that cache keys, the exported scan registry, and all output
+        filenames consistently reflect the resampled sampling grid. The native TR
+        used to compute the resampling ratio is always read from the config, so it
+        remains recoverable after this rewrite.
+
+        Only valid for HCP-YA. Returns the target TR (seconds).
+        """
+        if self.dataset != 'HCP-YA':
+            raise ValueError("3T->7T resampling is only defined for HCP-YA.")
+        target_tr = self.get_tr(target_modality)
+        self.resample_to_tr = target_tr
+        for scan in self.scan_registry:
+            if scan.modality == 'MRI3T':
+                scan.tr = target_tr
+        return target_tr
 
     # --------------------------------------------------------------------------
     # Registration
@@ -1114,9 +1141,28 @@ class DataLoader:
             regr.fit(nuis, timeseries)
             timeseries = timeseries - regr.predict(nuis)
 
+        # Optional TR resampling (HCP-YA 3T -> 7T grid only). Applied after nuisance
+        # regression and before frequency filtering, so the filter uses the new
+        # sampling rate. Only ever touches HCP-YA MRI3T scans; everything else is a
+        # no-op. The native TR is read from the config so it survives the registry
+        # tr-rewrite done by enable_hcpya_3t_resampling.
+        effective_tr = scan.tr
+        if (self.resample_to_tr is not None and self.dataset == 'HCP-YA'
+                and scan.modality == 'MRI3T'):
+            native_tr = self.get_tr(scan.modality)
+            if not np.isclose(native_tr, self.resample_to_tr):
+                ratio = Fraction(native_tr / self.resample_to_tr).limit_denominator(1000)
+                up, down = ratio.numerator, ratio.denominator
+                n_before = timeseries.shape[0]
+                timeseries = sp.signal.resample_poly(timeseries, up, down, axis=0)
+                effective_tr = self.resample_to_tr
+                if verbose:
+                    print(f"    Resampled {native_tr}s -> {self.resample_to_tr}s "
+                          f"(up={up}, down={down}): {n_before} -> {timeseries.shape[0]} frames")
+
         if frequency_filter:
             timeseries = apply_frequency_filter(
-                timeseries.T, 1.0 / scan.tr, lowpass=lowpass, highpass=highpass
+                timeseries.T, 1.0 / effective_tr, lowpass=lowpass, highpass=highpass
             ).T
 
         if standardize:
