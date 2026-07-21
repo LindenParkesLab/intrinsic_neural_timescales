@@ -1,14 +1,23 @@
 """GAM fitting and visualisation utilities for intrinsic neural timescales."""
+from contextlib import nullcontext
 import numpy as np
 import scipy as sp
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 import pygam
+from joblib import Parallel, delayed
 
 try:
     from tqdm.auto import tqdm
 except ImportError:  # tqdm is optional; the bootstrap runs without a progress bar
     tqdm = None
+
+try:
+    # Pin BLAS to one thread per worker so N parallel processes don't oversubscribe the
+    # cores (each GAM's linear algebra is tiny; process-level parallelism is the win).
+    from threadpoolctl import threadpool_limits
+except ImportError:
+    threadpool_limits = None
 
 
 # =============================================================================
@@ -616,70 +625,138 @@ def plot_deriv_sa_correlation(results, sa_axis, method='spearman', deflections_o
     return fig
 
 
-def bootstrap_deriv_sa_corr(deflection, age, sa_axis_vals, age_grid,
-                             n_splines=4, lam=0.1, demean=True, nuisance=None,
-                             n_boot=200, method='pearson', random_state=None,
-                             verbose=True):
-    """Bootstrap CI for the derivative-SA correlation curve.
+def _stage_windows(age_grid, inflection_age):
+    """Column indices and durations for the two developmental stages (see compute_stage_maps)."""
+    infl_ix = int(np.argmin(np.abs(age_grid - inflection_age)))
+    cols1   = np.arange(0, infl_ix + 1)
+    cols2   = np.arange(infl_ix, len(age_grid))
+    dur1    = age_grid[infl_ix] - age_grid[0]
+    dur2    = age_grid[-1]      - age_grid[infl_ix]
+    return cols1, cols2, dur1, dur2
 
-    Each iteration resamples subjects with replacement, refits the deflection
-    GAMs for all regions, and computes the derivative-SA correlation at each age
-    point.
+
+def _integrate_deriv(deriv, age_grid, cols):
+    """Trapezoidal integral of a (n_regions, n_grid) derivative over `cols` (net change)."""
+    x = age_grid[cols]
+    d = deriv[:, cols]
+    finite = np.isfinite(x) & np.isfinite(d).any(axis=0)  # drop the edge-NaN derivative column
+    return np.trapezoid(d[:, finite], x[finite], axis=1)
+
+
+def _bootstrap_one(idx, deflection, age, nuisance, age_grid, n_splines, lam, demean,
+                   sa_axis_vals, method, stage_windows, annualized):
+    """One bootstrap resample: refit the deflection GAMs (all regions) once, then reduce the
+    derivative stack to the requested summaries. Runs in a worker process; BLAS pinned to one
+    thread so many workers don't oversubscribe cores.
+
+    Returns (sa_curve or None, stage1 or None, stage2 or None).
+    """
+    age_b  = age[idx]
+    defl_b = deflection[idx]
+    nuis_b = nuisance[idx] if nuisance is not None else None
+    n_regions = deflection.shape[1]
+    n_grid    = len(age_grid)
+    derivs = np.full((n_regions, n_grid), np.nan)
+
+    with (threadpool_limits(1) if threadpool_limits is not None else nullcontext()):
+        for i in range(n_regions):
+            y = defl_b[:, i].copy()
+            if demean:
+                y = y - np.nanmean(y)
+            _, _, _, deriv, _ = fit_gam(age_b, y, age_grid, n_splines=n_splines, lam=lam,
+                                        nuisance=nuis_b)
+            derivs[i] = deriv
+
+    sa_curve = (compute_deriv_sa_corr(derivs, sa_axis_vals, method=method)
+                if sa_axis_vals is not None else None)
+    if stage_windows is not None:
+        cols1, cols2, dur1, dur2 = stage_windows
+        s1 = _integrate_deriv(derivs, age_grid, cols1)
+        s2 = _integrate_deriv(derivs, age_grid, cols2)
+        if annualized:
+            s1, s2 = s1 / dur1, s2 / dur2
+    else:
+        s1 = s2 = None
+    return sa_curve, s1, s2
+
+
+def bootstrap_gam_maps(deflection, age, age_grid, *, sa_axis_vals=None, inflection_age=None,
+                       n_splines=4, lam=0.1, demean=True, nuisance=None, n_boot=200,
+                       annualized=True, method='pearson', random_state=None,
+                       n_jobs=-1, verbose=True):
+    """Subject bootstrap of the deflection GAMs, reduced to the summaries fig4/fig5 need.
+
+    Each iteration resamples subjects with replacement and refits the per-region deflection
+    GAMs **once**, then reduces the derivative stack to (optionally) the derivative x S-A axis
+    correlation curve and/or the stage-1/stage-2 net-change maps. Computing both from the same
+    refit removes the duplicated fitting that fig4 (SA-corr CI) and fig5 (enrichment stage maps)
+    previously performed separately.
+
+    Iterations run in parallel over subject resamples (joblib). Resample indices are drawn once
+    in the main process from ``random_state``, so the result is identical for any ``n_jobs`` and
+    matches the previous serial implementation for the same seed (cache-stable).
 
     Parameters
     ----------
     deflection : (n_subjects, n_regions) ndarray
-        Per-subject deflection values.
     age : (n_subjects,) ndarray
-        Subject ages.
-    sa_axis_vals : (n_regions,) ndarray
-        SA values in parcellation order.
     age_grid : (n_grid,) ndarray
-        Evaluation points.
-    nuisance : (n_subjects, n_nuisance) ndarray or None
-        Covariates passed through to fit_gam.
-    n_boot : int
-        Number of bootstrap iterations.
-    method : {'pearson', 'spearman'}
-        Correlation type.
-    random_state : int or None
-        Seed for the resampling RNG.
-    verbose : bool
-        Show a tqdm progress bar if tqdm is installed.
+    sa_axis_vals : (n_regions,) ndarray or None
+        If given, return the derivative x S-A correlation curve per bootstrap.
+    inflection_age : float or None
+        If given, return the stage-1/stage-2 net-change maps per bootstrap.
+    annualized : bool
+        Divide each stage's net change by its duration in years (matches compute_stage_maps).
+    n_jobs : int
+        joblib worker count (-1 = all cores).
+    Other parameters mirror fit_gam / fit_series.
 
     Returns
     -------
-    boot_curves : (n_boot, n_grid) ndarray
-        Bootstrap distribution of correlation curves.
+    dict with any of:
+        'sa_curves' : (n_boot, n_grid)           -- if sa_axis_vals is given
+        'stage1', 'stage2' : (n_boot, n_regions) -- if inflection_age is given
     """
-    rng        = np.random.default_rng(random_state)
-    n_subs, n_regions = deflection.shape
-    n_grid     = len(age_grid)
-    boot_curves = np.full((n_boot, n_grid), np.nan)
+    if sa_axis_vals is None and inflection_age is None:
+        raise ValueError("Request at least one of sa_axis_vals or inflection_age.")
 
-    iterations = range(n_boot)
-    if verbose and tqdm is not None:
-        iterations = tqdm(iterations, desc='Bootstrap')
+    rng     = np.random.default_rng(random_state)
+    n_subs  = deflection.shape[0]
+    idx_all = [rng.integers(0, n_subs, size=n_subs) for _ in range(n_boot)]
 
-    for b in iterations:
-        idx    = rng.integers(0, n_subs, size=n_subs)
-        age_b  = age[idx]
-        defl_b = deflection[idx]
-        nuis_b = nuisance[idx] if nuisance is not None else None
+    stage_windows = (_stage_windows(age_grid, inflection_age)
+                     if inflection_age is not None else None)
 
-        derivs = np.full((n_regions, n_grid), np.nan)
-        for i in range(n_regions):
-            y = defl_b[:, i].copy()
-            if demean:
-                y -= np.nanmean(y)
-            _, _, _, deriv, _ = fit_gam(age_b, y, age_grid,
-                                        n_splines=n_splines, lam=lam,
-                                        nuisance=nuis_b)
-            derivs[i] = deriv
+    results = Parallel(n_jobs=n_jobs, verbose=(10 if verbose else 0))(
+        delayed(_bootstrap_one)(
+            idx, deflection, age, nuisance, age_grid, n_splines, lam, demean,
+            sa_axis_vals, method, stage_windows, annualized)
+        for idx in idx_all)
 
-        boot_curves[b] = compute_deriv_sa_corr(derivs, sa_axis_vals, method=method)
+    out = {}
+    if sa_axis_vals is not None:
+        out['sa_curves'] = np.asarray([r[0] for r in results])
+    if inflection_age is not None:
+        out['stage1'] = np.asarray([r[1] for r in results])
+        out['stage2'] = np.asarray([r[2] for r in results])
+    return out
 
-    return boot_curves
+
+def bootstrap_deriv_sa_corr(deflection, age, sa_axis_vals, age_grid,
+                             n_splines=4, lam=0.1, demean=True, nuisance=None,
+                             n_boot=200, method='pearson', random_state=None,
+                             verbose=True, n_jobs=-1):
+    """Bootstrap CI for the derivative-SA correlation curve.
+
+    Thin backward-compatible wrapper over :func:`bootstrap_gam_maps` (parallel). For a given
+    ``random_state`` it returns the same ``(n_boot, n_grid)`` curves as the previous serial
+    implementation.
+    """
+    return bootstrap_gam_maps(
+        deflection, age, age_grid, sa_axis_vals=sa_axis_vals, inflection_age=None,
+        n_splines=n_splines, lam=lam, demean=demean, nuisance=nuisance, n_boot=n_boot,
+        annualized=True, method=method, random_state=random_state,
+        n_jobs=n_jobs, verbose=verbose)['sa_curves']
 
 
 def add_sa_decile_colorbar(fig, ax_ref, cmap, n_deciles,
