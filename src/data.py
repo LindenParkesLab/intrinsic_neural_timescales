@@ -541,7 +541,14 @@ def _events_bids_tsv(loader: 'DataLoader', scan: ScanInfo) -> pd.DataFrame:
 
 
 def _events_ucla_bids_tsv(loader: 'DataLoader', scan: ScanInfo) -> pd.DataFrame:
-    """UCLA events loader with task-specific post-processing for stopsignal and bart."""
+    """UCLA events loader with task-specific post-processing.
+
+    Handled tasks: stopsignal, bart, scap, pamenc, pamret. All return the three
+    BIDS columns onset/duration/trial_type with trial_type coerced to string so
+    nilearn's design matrix yields string-named regressor columns (numeric
+    trial_type codes, e.g. scap's load conditions, otherwise become np.int64
+    column labels that break downstream contrast handling).
+    """
     mod_config = loader.config.modalities[scan.modality]
     rawdata_dir = loader.config.base_path / loader.config.rawdata_subdir
     func_dir = rawdata_dir / f'sub-{scan.subject_id}' / 'func'
@@ -556,9 +563,17 @@ def _events_ucla_bids_tsv(loader: 'DataLoader', scan: ScanInfo) -> pd.DataFrame:
 
     df = pd.read_csv(matches[0], sep='\t')
 
-    if scan.task == 'stopsignal':
-        return df[['onset', 'duration', 'trial_type']].loc[df['trial_type'].notna()]
-    elif scan.task == 'bart':
+    def _clean(events: pd.DataFrame) -> pd.DataFrame:
+        """Drop rows with missing timing/label and stringify trial_type."""
+        events = events[['onset', 'duration', 'trial_type']].dropna(
+            subset=['onset', 'duration', 'trial_type']
+        ).reset_index(drop=True)
+        events['trial_type'] = events['trial_type'].astype(str)
+        return events
+
+    if scan.task == 'bart':
+        # BART events are split across multiple rows per balloon trial; collapse
+        # each trial_number into a single event spanning its full duration.
         rows = []
         for _, trial in df[['onset', 'duration', 'trial_type', 'trial_number']].groupby('trial_number'):
             trial = trial.reset_index(drop=True)
@@ -567,9 +582,10 @@ def _events_ucla_bids_tsv(loader: 'DataLoader', scan: ScanInfo) -> pd.DataFrame:
                 'duration': trial['duration'].sum(),
                 'trial_type': trial['trial_type'].iloc[0],
             })
-        return pd.DataFrame(rows)
+        return _clean(pd.DataFrame(rows))
     else:
-        return df[['onset', 'duration', 'trial_type']]
+        # stopsignal, scap, pamenc, pamret: one row per trial already.
+        return _clean(df)
 
 
 TASK_EVENTS_HANDLERS = {
