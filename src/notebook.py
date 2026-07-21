@@ -97,7 +97,7 @@ DATASET_PARAMS = {
         'space':       'MNI152NLin2009cAsym',
         'sessions':    [None],
         'tasks': {
-            'MRI3T': ['rest', 'bart', 'stopsignal'],
+            'MRI3T': ['rest', 'bart', 'stopsignal', 'scap'],
         },
         'subject_ids_file': 'subject_ids_not1_hc.txt',
         'detrend':             False,
