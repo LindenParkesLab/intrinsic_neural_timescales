@@ -22,7 +22,6 @@ from snaplab_tools.nulls import (
     residualize,
     correlate_family,
     network_enrichment,
-    yeo_network_enrichment,
 )
 
 __all__ = [
@@ -34,7 +33,6 @@ __all__ = [
     "corr_with_covar_null",
     "correlate_family",
     "network_enrichment",
-    "yeo_network_enrichment",
     "residualize",
     "surrogate_cache_dir",
 ]
