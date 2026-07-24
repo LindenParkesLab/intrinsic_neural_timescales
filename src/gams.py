@@ -1,23 +1,21 @@
-"""GAM fitting and visualisation utilities for intrinsic neural timescales."""
-from contextlib import nullcontext
+"""S-A axis, two-stage developmental maps, and figure utilities for intrinsic neural timescales.
+
+Generic GAM fitting, change-point detection, and the bootstrap engine live in
+``snaplab_tools.gams``; this module keeps only the project-specific pieces (S-A axis correlations,
+two-stage net-change maps, and the figure builders) and wires the generic bootstrap engine to the
+S-A / stage reductions that fig4 and fig5 need.
+"""
+import functools
+
 import numpy as np
 import scipy as sp
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
-import pygam
-from joblib import Parallel, delayed
 
-try:
-    from tqdm.auto import tqdm
-except ImportError:  # tqdm is optional; the bootstrap runs without a progress bar
-    tqdm = None
-
-try:
-    # Pin BLAS to one thread per worker so N parallel processes don't oversubscribe the
-    # cores (each GAM's linear algebra is tiny; process-level parallelism is the win).
-    from threadpoolctl import threadpool_limits
-except ImportError:
-    threadpool_limits = None
+from snaplab_tools.gams import (
+    fit_series, detect_change_point, integrate_derivative, segment_windows_at,
+    bootstrap_gam_fits, SIGNALS, _DEFAULT_LAM_GRID,
+)
 
 
 # =============================================================================
@@ -55,172 +53,6 @@ def apply_region_mask(region_mask, *arrays, sa_axis=None):
 # GAM fitting
 # =============================================================================
 
-# Grid searched by fit_gam when lam='gcv' (log-spaced smoothing penalties).
-_DEFAULT_LAM_GRID = np.logspace(-3, 3, 25)
-# _DEFAULT_LAM_GRID = np.logspace(-5, 1, 25)
-
-def fit_gam(age, y, age_grid, n_splines=4, lam=0.1, show_ci=False, nuisance=None,
-            lam_grid=_DEFAULT_LAM_GRID):
-    """Fit a GAM to (age, y) and evaluate on age_grid.
-
-    NaN values in y are excluded from fitting (per-subject missingness). A region
-    with fewer than n_splines valid subjects cannot be fit and yields NaN curves
-    and gam=None.
-
-    Parameters
-    ----------
-    age : (n_subjects,) ndarray
-        Subject ages.
-    y : (n_subjects,) ndarray
-        Outcome for a single region/series.
-    age_grid : (n_grid,) ndarray
-        Evaluation points.
-    n_splines : int
-        Spline basis dimension for the age smooth.
-    lam : float or 'gcv'
-        Smoothing penalty for the age smooth. A float fixes it (original behaviour).
-        'gcv' selects it by grid search over lam_grid (generalized cross-validation);
-        the chosen value is readable from the returned gam.lam.
-    show_ci : bool
-        Whether to compute 95% prediction intervals.
-    nuisance : (n_subjects, n_nuisance) ndarray or None
-        Covariates entered as linear terms l() in the GAM. When predicting on
-        age_grid, nuisance values are fixed at their within-sample means so the
-        curve reflects the age smooth only.
-    lam_grid : array-like
-        Candidate penalties searched when lam='gcv'; ignored otherwise. Defaults to
-        _DEFAULT_LAM_GRID.
-
-    Returns
-    -------
-    pred : (n_grid,) ndarray
-        Predicted values.
-    ci_lo : (n_grid,) ndarray or None
-        Lower 95% CI, or None when show_ci is False.
-    ci_hi : (n_grid,) ndarray or None
-        Upper 95% CI, or None when show_ci is False.
-    deriv : (n_grid,) ndarray
-        Backward-difference derivative (units / year); NaN at index 0.
-    gam : pygam.LinearGAM or None
-        Fitted model, or None if the region had too few valid subjects.
-    """
-    mask = ~np.isnan(y)
-    Y    = y[mask]
-
-    # Some parcellations (e.g. Schaefer-1000) contain regions with no usable
-    # BOLD signal, so a region column can be entirely (or nearly) NaN. pygam
-    # raises on an empty target, so skip these and return NaN curves; downstream
-    # consumers (compute_deriv_sa_corr, compute_partial_r2_age) already tolerate
-    # NaN regions.
-    if mask.sum() < n_splines:
-        nan_curve = np.full(len(age_grid), np.nan)
-        return nan_curve, None, None, nan_curve.copy(), None
-
-    # 'gcv' selects lam by grid search below; build the terms with a numeric placeholder.
-    _is_gcv   = isinstance(lam, str) and lam == 'gcv'
-    if isinstance(lam, str) and not _is_gcv:
-        raise ValueError(f"lam must be a float or 'gcv'; got {lam!r}")
-    _term_lam = 0.6 if _is_gcv else lam
-
-    if nuisance is not None:
-        nuisance        = np.asarray(nuisance)
-        nuisance_masked = nuisance[mask]
-        X_fit           = np.column_stack([age[mask], nuisance_masked])
-        terms           = pygam.s(0, n_splines=n_splines, lam=_term_lam)
-        for i in range(1, nuisance.shape[1] + 1):
-            terms = terms + pygam.l(i)
-        nuisance_means = nuisance_masked.mean(axis=0)
-        X_pred = np.column_stack([
-            age_grid,
-            np.tile(nuisance_means, (len(age_grid), 1)),
-        ])
-    else:
-        X_fit  = age[mask].reshape(-1, 1)
-        terms  = pygam.s(0, n_splines=n_splines, lam=_term_lam)
-        X_pred = age_grid.reshape(-1, 1)
-
-    gam = pygam.LinearGAM(terms)
-    if _is_gcv:
-        gam.gridsearch(X_fit, Y, lam=lam_grid, progress=False)
-    else:
-        gam.fit(X_fit, Y)
-    pred  = gam.predict(X_pred)
-    dt    = np.diff(age_grid)
-    deriv = np.concatenate([[np.nan], np.diff(pred) / dt])
-
-    ci_lo, ci_hi = None, None
-    if show_ci:
-        ci    = gam.confidence_intervals(X_pred, width=0.95)
-        ci_lo = ci[:, 0]
-        ci_hi = ci[:, 1]
-
-    return pred, ci_lo, ci_hi, deriv, gam
-
-
-def fit_series(age, arr, age_grid,
-               n_splines=4, lam=0.1, demean=True, show_ci=False, nuisance=None,
-               lam_grid=_DEFAULT_LAM_GRID):
-    """Fit GAMs for every column (series) in arr.
-
-    Parameters
-    ----------
-    age : (n_subjects,) ndarray
-        Subject ages.
-    arr : (n_subjects, n_series) ndarray
-        One column per series to fit.
-    age_grid : (n_grid,) ndarray
-        Evaluation points.
-    n_splines, lam, show_ci, lam_grid : see fit_gam. lam may be 'gcv' to select the
-        smoothing penalty per series by grid search over lam_grid.
-    demean : bool
-        If True, each series is mean-centred (ignoring NaNs) before fitting.
-    nuisance : (n_subjects, n_nuisance) ndarray or None
-        Covariates passed through to fit_gam.
-
-    Returns
-    -------
-    dict
-        Keys 'pred' (n_series, n_grid), 'deriv' (n_series, n_grid),
-        'ci_lo'/'ci_hi' (n_series, n_grid) or None, 'gams' (list of n_series
-        fitted pygam.LinearGAM objects, None where a series had too few valid
-        subjects), and 'lams' (n_series) -- the age-smooth penalty actually used
-        for each series (the grid-searched value when lam='gcv'), NaN where unfit.
-        Freeze these to reuse the same smoothing in the bootstrap.
-    """
-    n_ser  = arr.shape[1]
-    preds  = np.full((n_ser, len(age_grid)), np.nan)
-    derivs = np.full((n_ser, len(age_grid)), np.nan)
-    ci_los = np.full((n_ser, len(age_grid)), np.nan) if show_ci else None
-    ci_his = np.full((n_ser, len(age_grid)), np.nan) if show_ci else None
-    lams   = np.full(n_ser, np.nan)
-    gams   = []
-
-    for i in range(n_ser):
-        y = arr[:, i].copy()
-        if demean:
-            y = y - np.nanmean(y)
-        pred, ci_lo, ci_hi, deriv, gam = fit_gam(
-            age, y, age_grid, n_splines=n_splines, lam=lam,
-            show_ci=show_ci, nuisance=nuisance, lam_grid=lam_grid)
-        preds[i]  = pred
-        derivs[i] = deriv
-        if show_ci:
-            ci_los[i] = ci_lo
-            ci_his[i] = ci_hi
-        if gam is not None:
-            lams[i] = float(np.ravel(gam.lam)[0])   # age-smooth penalty actually used
-        gams.append(gam)
-
-    return {
-        'pred':  preds,
-        'deriv': derivs,
-        'ci_lo': ci_los,
-        'ci_hi': ci_his,
-        'lams':  lams,
-        'gams':  gams,
-    }
-
-
 def fit_all_panels(age, rest, task, deflection, age_grid,
                    n_splines=4, lam=0.1, demean=True, show_ci=False, nuisance=None,
                    lam_grid=_DEFAULT_LAM_GRID):
@@ -253,85 +85,6 @@ def fit_all_panels(age, rest, task, deflection, age_grid,
     }
     results['age_grid'] = age_grid
     return results
-
-
-# =============================================================================
-# Partial R²
-# =============================================================================
-
-def compute_partial_r2_age(condition_data, age, gams, nuisance=None, demean=True):
-    """Compute partial R² of the age smooth for each region/series.
-
-    Uses the already-fitted full GAMs from fit_all_panels and compares them
-    against a reduced model that contains only the nuisance terms (or the
-    intercept when nuisance is None):
-
-        partial_R2_age = (R2_full - R2_reduced) / (1 - R2_reduced)
-
-    Regions with near-zero variance or too few valid subjects (gam is None) are
-    skipped and returned as NaN.
-
-    Parameters
-    ----------
-    condition_data : (n_subjects, n_regions) ndarray
-        Outcome values per region.
-    age : (n_subjects,) ndarray
-        Subject ages.
-    gams : list of pygam.LinearGAM or None
-        Fitted full models from fit_all_panels, one per region.
-    nuisance : (n_subjects, n_nuisance) ndarray or None
-        Covariates; must match those used during fitting.
-    demean : bool
-        Must match the demean flag used during fitting.
-
-    Returns
-    -------
-    partial_r2 : (n_regions,) ndarray
-        Partial R² of the age smooth; NaN for skipped regions.
-    """
-    n_subs, n_ser = condition_data.shape
-    partial_r2    = np.full(n_ser, np.nan)
-
-    for i in range(n_ser):
-        y = condition_data[:, i].copy()
-        if demean:
-            y = y - np.nanmean(y)
-        mask  = ~np.isnan(y)
-        Y     = y[mask]
-        age_m = age[mask]
-
-        SS_tot = np.sum((Y - Y.mean()) ** 2)
-        if SS_tot < 1e-12:
-            continue
-
-        gam_full = gams[i]
-        if gam_full is None:      # too few valid subjects to fit (see fit_gam)
-            continue
-        if nuisance is not None:
-            nuis_m     = nuisance[mask]
-            X_full     = np.column_stack([age_m, nuis_m])
-            y_hat_full = gam_full.predict(X_full)
-
-            # reduced model: nuisance only (linear terms, no age smooth)
-            nuis_terms = pygam.l(0)
-            for j in range(1, nuis_m.shape[1]):
-                nuis_terms = nuis_terms + pygam.l(j)
-            gam_red   = pygam.LinearGAM(nuis_terms).fit(nuis_m, Y)
-            y_hat_red = gam_red.predict(nuis_m)
-        else:
-            y_hat_full = gam_full.predict(age_m.reshape(-1, 1))
-            y_hat_red  = np.full(len(Y), Y.mean())
-
-        SS_res_full = np.sum((Y - y_hat_full) ** 2)
-        SS_res_red  = np.sum((Y - y_hat_red)  ** 2)
-
-        R2_full = 1 - SS_res_full / SS_tot
-        R2_red  = 1 - SS_res_red  / SS_tot
-        denom   = 1 - R2_red
-        if denom > 1e-10:
-            partial_r2[i] = (R2_full - R2_red) / denom
-
-    return partial_r2
 
 
 # =============================================================================
@@ -656,345 +409,35 @@ def plot_deriv_sa_correlation(results, sa_axis, method='spearman', deflections_o
 
 
 # =============================================================================
-# Data-driven developmental stage boundary (multivariate change point)
+# Bootstrap: S-A correlation curve + two-stage net-change maps (over the generic engine)
 # =============================================================================
 
-def build_stage_signal(pred, age_grid, signal):
-    """Derive the signal a stage boundary is detected on from the fitted GAM level.
-
-    Parameters
-    ----------
-    pred : (n_regions, n_grid) ndarray
-        Fitted GAM level on age_grid.
-    age_grid : (n_grid,) ndarray
-    signal : {'pred', 'deriv1', 'deriv2'}
-        'pred'   -> the fitted level itself,
-        'deriv1' -> first derivative  (rate of change),
-        'deriv2' -> second derivative (acceleration).
-        Derivatives are central differences w.r.t. age (np.gradient), so there is
-        no leading NaN and deriv2 is defined across the whole grid.
-
-    Returns
-    -------
-    (n_regions, n_grid) ndarray
-    """
-    pred = np.asarray(pred, float)
-    if signal == 'pred':
-        return pred
-    # edge_order=2 uses second-order one-sided differences at the grid ends; without it a
-    # double np.gradient compounds the boundary error and deriv2 hooks sharply at the extremes.
-    d1 = np.gradient(pred, age_grid, axis=1, edge_order=2)
-    if signal == 'deriv1':
-        return d1
-    if signal == 'deriv2':
-        return np.gradient(d1, age_grid, axis=1, edge_order=2)
-    raise ValueError(f"signal must be 'pred', 'deriv1' or 'deriv2'; got {signal!r}")
-
-
-def _normalize_regions(sig, mode):
-    """Per-region normalization across the age axis (axis=1), NaN-aware."""
-    if mode is None:
-        return sig
-    if mode == 'center':
-        return sig - np.nanmean(sig, axis=1, keepdims=True)
-    if mode == 'zscore':
-        mu = np.nanmean(sig, axis=1, keepdims=True)
-        sd = np.nanstd(sig, axis=1, keepdims=True)
-        return (sig - mu) / np.where(sd < 1e-12, 1.0, sd)
-    raise ValueError(f"normalize must be None, 'center' or 'zscore'; got {mode!r}")
-
-
-def _segment_costs(X):
-    """Single-change-point L2 cost, vectorized via cumulative sums.
-
-    X : (T, d) observations (one age per row). Returns (taus, costs) where
-    costs[k] is the within-segment SS of splitting into left=[0:taus[k]) and
-    right=[taus[k]:T), for every interior boundary taus[k] in 1..T-1.
-    """
-    T = X.shape[0]
-    S1 = np.cumsum(X, axis=0)
-    S2 = np.cumsum(X ** 2, axis=0)
-    tot1, tot2 = S1[-1], S2[-1]
-    taus = np.arange(1, T)
-    nL = taus[:, None].astype(float)
-    nR = (T - taus)[:, None].astype(float)
-    sumL, sqL = S1[taus - 1], S2[taus - 1]
-    sumR, sqR = tot1 - sumL, tot2 - sqL
-    ssL = (sqL - sumL ** 2 / nL).sum(axis=1)
-    ssR = (sqR - sumR ** 2 / nR).sum(axis=1)
-    return taus, ssL + ssR
-
-
-def _dynp_l2_costs(X, kmax):
-    """Exact DP segmentation (== ruptures Dynp, model='l2'). Best total within-segment
-    SS for K=1..kmax contiguous segments. X: (T, d)."""
-    T = X.shape[0]
-    S1 = np.vstack([np.zeros(X.shape[1]), np.cumsum(X, 0)])
-    S2 = np.vstack([np.zeros(X.shape[1]), np.cumsum(X ** 2, 0)])
-
-    def seg(i, j):
-        n = j - i
-        s, sq = S1[j] - S1[i], S2[j] - S2[i]
-        return float((sq - s ** 2 / n).sum())
-
-    dp = np.full((kmax + 1, T + 1), np.inf)
-    dp[0, 0] = 0.0
-    for k in range(1, kmax + 1):
-        for t in range(k, T + 1):
-            for s in range(k - 1, t):
-                c = dp[k - 1, s] + seg(s, t)
-                if c < dp[k, t]:
-                    dp[k, t] = c
-    return dp[1:kmax + 1, T]
-
-
-def _ruptures_bkps(X, model, min_size, n_bkps):
-    """n_bkps ordered breakpoint indices via ruptures Dynp (lazy import); trailing endpoint dropped."""
-    try:
-        import ruptures as rpt
-    except ImportError as e:  # ruptures is optional; only needed for cost != None or n_bkps > 1
-        raise ImportError("this code path requires the optional 'ruptures' package "
-                          "(pip install ruptures).") from e
-    algo = rpt.Dynp(model=model, min_size=min_size, jump=1).fit(np.ascontiguousarray(X))
-    return [int(b) for b in algo.predict(n_bkps=n_bkps)[:-1]]   # drop the final endpoint (== T)
-
-
-def detect_stage_boundary(pred, age_grid, *, signal='deriv1', normalize='zscore',
-                          min_segment_frac=0.10, search_bounds=None, cost=None, n_bkps=1):
-    """Data-driven developmental stage boundary via multivariate change-point detection.
-
-    Splits age_grid into contiguous stages at the age(s) minimising the within-stage
-    sum of squared deviations from each stage's per-region mean of ``signal``
-    (multivariate L2 cost == 1D-ordered k-means with a contiguity constraint ==
-    ruptures Dynp). Per-region z-scoring makes the boundary reflect reorganization of
-    the spatial PATTERN, not a few high-amplitude regions.
-
-    By default (n_bkps=1) it finds a single boundary (two stages). ``cost=None`` then
-    uses a fast exact vectorised L2 detector -- provably identical to ruptures
-    Dynp(model='l2', n_bkps=1) but ~9x faster, so it is the one used in the bootstrap
-    hot path. n_bkps > 1 (or a non-L2 ``cost`` string) routes to ruptures Dynp.
-
-    Parameters
-    ----------
-    pred : (n_regions, n_grid) ndarray
-        Fitted GAM level on age_grid.
-    age_grid : (n_grid,) ndarray
-    signal : {'deriv1', 'deriv2', 'pred'}
-        Detect on rate of change (default), acceleration, or level. See build_stage_signal.
-    normalize : {'zscore', 'center', None}
-        Per-region normalization across age before detection.
-    min_segment_frac : float
-        Minimum fraction of the grid each stage must span (guards the unreliable
-        derivative tails at the age extremes).
-    search_bounds : (age_lo, age_hi) or None
-        Optional hard age window the boundary must fall within. Exact single-boundary
-        (cost=None, n_bkps=1) backend only.
-    cost : None or str
-        None -> exact L2. A ruptures cost model string ('rbf', 'normal', 'cosine',
-        'l1', ...) detects with that cost via ruptures instead.
-    n_bkps : int
-        Number of change points to detect (>= 1). n_bkps > 1 requires ruptures and
-        returns that many ordered boundaries; the two-stage narrative uses n_bkps=1.
-
-    Returns
-    -------
-    dict
-        'boundary_age', 'boundary_idx' : the FIRST boundary (age and age_grid index),
-                                         kept for the single-boundary callers,
-        'boundary_ages', 'boundary_idxs' : all detected boundaries (length n_bkps),
-        'var_explained'                : 1 - SS(all stages)/SS(1 stage) of the normalized
-                                         signal (L2 readout, for comparability),
-        'cost_curve'                   : within-stage L2 SS per candidate boundary
-                                         (age_grid-aligned; None unless the exact single
-                                         backend ran).
-    """
-    if n_bkps < 1:
-        raise ValueError(f"n_bkps must be >= 1; got {n_bkps}")
-    sig = _normalize_regions(build_stage_signal(pred, age_grid, signal), normalize)
-    finite = np.all(np.isfinite(sig), axis=1)   # keep regions finite across the whole grid
-    X = sig[finite].T                           # (T=n_grid, n_valid_regions)
-    grid = np.asarray(age_grid)
-    T = X.shape[0]
-    min_size = max(1, int(np.ceil(min_segment_frac * T)))
-
-    if cost is None and n_bkps == 1:
-        taus, costs = _segment_costs(X)
-        adm = (taus >= min_size) & (taus <= T - min_size)
-        if search_bounds is not None:
-            a0, a1 = search_bounds
-            adm &= (grid[taus] >= a0) & (grid[taus] <= a1)
-        if not adm.any():
-            raise ValueError("No admissible boundary; relax min_segment_frac or search_bounds.")
-        idxs = [int(taus[adm][int(np.argmin(costs[adm]))])]
-        cost_curve = np.full(T, np.nan)
-        cost_curve[taus] = costs
-    else:
-        if search_bounds is not None:
-            raise ValueError("search_bounds is only supported for the exact L2 single-boundary "
-                             "backend (cost=None, n_bkps=1).")
-        idxs = sorted(_ruptures_bkps(X, cost or 'l2', min_size, n_bkps))
-        cost_curve = None
-
-    # L2 variance-explained of the full segmentation (descriptive; comparable across costs)
-    tot_ss = float((X.var(axis=0) * T).sum())
-    bnds = [0] + idxs + [T]
-    split_ss = float(sum(((X[a:b] - X[a:b].mean(0)) ** 2).sum() for a, b in zip(bnds[:-1], bnds[1:])))
-    ages = [float(grid[i]) for i in idxs]
-    return dict(boundary_age=ages[0], boundary_idx=idxs[0],
-                boundary_ages=ages, boundary_idxs=idxs,
-                var_explained=float(1 - split_ss / tot_ss) if tot_ss > 0 else np.nan,
-                cost_curve=cost_curve)
-
-
-def stage_segmentation_costs(pred, age_grid, *, signal='deriv1', normalize='zscore', kmax=4):
-    """Within-stage SS for K=1..kmax contiguous stages (exact DP; ruptures Dynp l2).
-
-    Diagnostic for how many developmental stages the data support. On smooth GAM
-    signals the SS falls off smoothly with K (no sharp elbow), so use this to
-    confirm that K=2 captures the dominant regime shift -- not to *select* K, which
-    would over-segment. Returns costs (kmax,) for K=1..kmax segments.
-    """
-    sig = _normalize_regions(build_stage_signal(pred, age_grid, signal), normalize)
-    X = sig[np.all(np.isfinite(sig), axis=1)].T
-    return np.asarray(_dynp_l2_costs(X, kmax))
-
-
-def select_n_stages(pred, age_grid, *, signal='deriv1', normalize='zscore', cost='l2',
-                    min_segment_frac=0.10, pen=None):
-    """Penalty-based selection of the number of developmental stages (ruptures Pelt).
-
-    Unlike stage_segmentation_costs (which returns the SS-vs-K curve for you to inspect),
-    this lets a penalty choose the breakpoint count directly. On smooth GAM signals the
-    result is penalty-sensitive and tends to over-segment at a plain BIC penalty, so treat
-    it as an exploratory robustness check on the two-stage assumption rather than an
-    authoritative K -- sweep ``pen`` and report the range. Requires the optional 'ruptures'
-    package.
-
-    Parameters
-    ----------
-    pred, age_grid, signal, normalize : as in detect_stage_boundary.
-    cost : str
-        ruptures cost model ('l2', 'rbf', 'normal', ...).
-    min_segment_frac : float
-        Minimum fraction of the grid per segment.
-    pen : float or None
-        Penalty per breakpoint. None -> a BIC-like default (n_regions * log(T)).
-
-    Returns
-    -------
-    dict
-        'n_stages'      : number of stages selected (breakpoints + 1),
-        'boundary_ages' : ages of the selected breakpoints,
-        'pen'           : penalty used.
-    """
-    try:
-        import ruptures as rpt
-    except ImportError as e:
-        raise ImportError("select_n_stages requires the optional 'ruptures' package "
-                          "(pip install ruptures).") from e
-    sig = _normalize_regions(build_stage_signal(pred, age_grid, signal), normalize)
-    X = sig[np.all(np.isfinite(sig), axis=1)].T
-    T = X.shape[0]
-    min_size = max(1, int(np.ceil(min_segment_frac * T)))
-    if pen is None:
-        pen = X.shape[1] * np.log(T)      # BIC-like default (dimension * log n)
-    algo = rpt.Pelt(model=cost, min_size=min_size, jump=1).fit(np.ascontiguousarray(X))
-    bkps = algo.predict(pen=pen)[:-1]     # drop the trailing endpoint (== T)
-    grid = np.asarray(age_grid)
-    return dict(n_stages=len(bkps) + 1,
-                boundary_ages=[float(grid[b]) for b in bkps],
-                pen=float(pen))
-
-
-def _stage_windows_at(age_grid, infl_ix):
-    """Column indices and durations for two stages split at grid index infl_ix."""
-    cols1 = np.arange(0, infl_ix + 1)
-    cols2 = np.arange(infl_ix, len(age_grid))
-    dur1  = age_grid[infl_ix] - age_grid[0]
-    dur2  = age_grid[-1]      - age_grid[infl_ix]
-    return cols1, cols2, dur1, dur2
-
-
-def _stage_windows(age_grid, inflection_age):
-    """Column indices and durations for the two developmental stages (see compute_stage_maps)."""
-    return _stage_windows_at(age_grid, int(np.argmin(np.abs(age_grid - inflection_age))))
-
-
-def _integrate_deriv(deriv, age_grid, cols):
-    """Trapezoidal integral of a (n_regions, n_grid) derivative over `cols` (net change)."""
-    x = age_grid[cols]
-    d = deriv[:, cols]
-    finite = np.isfinite(x) & np.isfinite(d).any(axis=0)  # drop the edge-NaN derivative column
-    return np.trapezoid(d[:, finite], x[finite], axis=1)
-
-
-def _bootstrap_one(idx, deflection, age, nuisance, age_grid, n_splines, lam, demean,
-                   sa_axis_vals, method, stage_windows, annualized,
-                   stage_signal, report_signals, boundary_cfg):
-    """One bootstrap resample: refit the deflection GAMs (all regions) once, then reduce the
-    fitted stack to the requested summaries. Runs in a worker process; BLAS pinned to one
-    thread so many workers don't oversubscribe cores.
-
-    stage_windows : precomputed integration windows (fixed-boundary mode), or None.
-    stage_signal  : if not None, auto-detect the boundary from this signal per resample and
-                    integrate the stage maps over the resample's own window (overrides
-                    stage_windows).
-    report_signals: signals to additionally detect + report a boundary age for (CI diagnostics).
-    boundary_cfg  : kwargs forwarded to detect_stage_boundary.
-    lam           : scalar (same for every region) or a per-region array of frozen penalties
-                    (e.g. GCV values selected once on the full sample) to reuse here.
-
-    Returns dict: 'sa_curve', 'stage1', 'stage2' (any may be None) and 'boundaries'
-    ({signal -> boundary_age}).
-    """
-    age_b  = age[idx]
-    defl_b = deflection[idx]
-    nuis_b = nuisance[idx] if nuisance is not None else None
-    n_regions = deflection.shape[1]
-    n_grid    = len(age_grid)
-    preds  = np.full((n_regions, n_grid), np.nan)
-    derivs = np.full((n_regions, n_grid), np.nan)
-    lam_per_region = np.ndim(lam) > 0   # frozen per-region penalties vs a single scalar
-
-    with (threadpool_limits(1) if threadpool_limits is not None else nullcontext()):
-        for i in range(n_regions):
-            y = defl_b[:, i].copy()
-            if demean:
-                y = y - np.nanmean(y)
-            lam_i = lam[i] if lam_per_region else lam
-            if lam_per_region and not np.isfinite(lam_i):
-                lam_i = 0.1     # region unfit on the full sample; harmless fallback
-            pred, _, _, deriv, _ = fit_gam(age_b, y, age_grid, n_splines=n_splines, lam=lam_i,
-                                           nuisance=nuis_b)
-            preds[i]  = pred
-            derivs[i] = deriv
-
-    out = {'sa_curve': None, 'stage1': None, 'stage2': None, 'boundaries': {}}
+def _reduce_sa_stage(preds, derivs, x_grid, *, sa_axis_vals, method, stage_signal,
+                     report_signals, boundary_cfg, stage_windows, annualized):
+    """Per-resample reduction for bootstrap_gam_maps: the derivative x S-A correlation curve, the
+    detected change-point location(s), and the stage-1/stage-2 net-change maps. Module-level so
+    joblib can pickle it (bootstrap_gam_maps wraps it in functools.partial)."""
+    out = {}
     if sa_axis_vals is not None:
         out['sa_curve'] = compute_deriv_sa_corr(derivs, sa_axis_vals, method=method)
 
-    # Data-driven boundary(ies): the signal used for the stage maps plus any extra CI signals.
     need = set(report_signals or ())
     if stage_signal is not None:
         need.add(stage_signal)
-    detected = {sig: detect_stage_boundary(preds, age_grid, signal=sig, **boundary_cfg)
-                for sig in need}
-    out['boundaries'] = {sig: r['boundary_age'] for sig, r in detected.items()}
+    detected = {sig: detect_change_point(preds, x_grid, signal=sig, **boundary_cfg) for sig in need}
+    for sig, r in detected.items():
+        out[f'boundary_{sig}'] = r['location']
 
-    # Stage maps: an auto per-resample window (overrides the fixed one) or the fixed window.
-    windows = (_stage_windows_at(age_grid, detected[stage_signal]['boundary_idx'])
+    windows = (segment_windows_at(x_grid, detected[stage_signal]['index'])
                if stage_signal is not None else stage_windows)
     if windows is not None:
         cols1, cols2, dur1, dur2 = windows
-        s1 = _integrate_deriv(derivs, age_grid, cols1)
-        s2 = _integrate_deriv(derivs, age_grid, cols2)
+        s1 = integrate_derivative(derivs, x_grid, cols1)
+        s2 = integrate_derivative(derivs, x_grid, cols2)
         if annualized:
             s1, s2 = s1 / dur1, s2 / dur2
         out['stage1'], out['stage2'] = s1, s2
     return out
-
-
-_STAGE_SIGNALS = ('pred', 'deriv1', 'deriv2')
 
 
 def bootstrap_gam_maps(deflection, age, age_grid, *, sa_axis_vals=None, inflection_age=None,
@@ -1002,18 +445,14 @@ def bootstrap_gam_maps(deflection, age, age_grid, *, sa_axis_vals=None, inflecti
                        annualized=True, method='pearson', random_state=None,
                        report_boundary_signals=(), boundary_kw=None,
                        n_jobs=-1, verbose=True):
-    """Subject bootstrap of the deflection GAMs, reduced to the summaries fig4/fig5 need.
+    """Subject bootstrap of the deflection GAMs, reduced to the S-A / stage summaries fig4/fig5 need.
 
-    Each iteration resamples subjects with replacement and refits the per-region deflection
-    GAMs **once**, then reduces the fitted stack to (optionally) the derivative x S-A axis
-    correlation curve, the stage-1/stage-2 net-change maps, and a data-driven stage boundary.
-    Computing all of these from the same refit removes the duplicated fitting that fig4 (SA-corr
-    CI) and fig5 (enrichment stage maps) previously performed separately.
-
-    Iterations run in parallel over subject resamples (joblib). Resample indices are drawn once
-    in the main process from ``random_state``, so the result is identical for any ``n_jobs``. The
-    'sa_curves'/'stage1'/'stage2' arrays match the previous implementation for a given seed
-    whenever a *fixed* inflection_age is used (boundary reporting is purely additive).
+    Thin project wrapper over ``snaplab_tools.gams.bootstrap_gam_fits``: it resamples subjects and
+    refits every region's deflection GAM once (the generic engine), then reduces each refit to the
+    derivative x S-A axis correlation curve, the stage-1/stage-2 net-change maps, and data-driven
+    change-point location(s) (via ``_reduce_sa_stage``). Computing all of these from the same refit
+    removes the duplicated fitting fig4 (SA-corr CI) and fig5 (enrichment stage maps) once did
+    separately.
 
     Parameters
     ----------
@@ -1021,81 +460,65 @@ def bootstrap_gam_maps(deflection, age, age_grid, *, sa_axis_vals=None, inflecti
     age : (n_subjects,) ndarray
     age_grid : (n_grid,) ndarray
     sa_axis_vals : (n_regions,) ndarray or None
-        If given, return the derivative x S-A correlation curve per bootstrap.
-    inflection_age : float, {'pred', 'deriv1', 'deriv2'}, or None
-        Controls the stage-1/stage-2 net-change maps:
-          * float  -> fixed boundary at that age (previous behaviour),
-          * signal -> detect the boundary per resample from that signal (data-driven; each
-                      resample integrates over its own stage windows),
-          * None   -> no stage maps.
-    report_boundary_signals : sequence of {'pred', 'deriv1', 'deriv2'}
-        Extra signals to detect + report a boundary age for per resample (for boundary CIs),
-        beyond the one driving the stage maps. Detection reuses the same refit, so this is cheap.
+        If given, return the derivative x S-A correlation curve per bootstrap ('sa_curves').
+    inflection_age : float, one of SIGNALS, or None
+        float -> fixed stage boundary; a signal ('pred'/'deriv1'/'deriv2') -> detect the boundary
+        per resample from that signal; None -> no stage maps.
+    report_boundary_signals : sequence of SIGNALS
+        Extra signals to also detect + report a change-point location for per resample (boundary
+        CIs), beyond the one driving the stage maps.
+    lam : float, 'gcv', or (n_regions,) array
+        Per-region smoothing; an array freezes penalties (e.g. GCV values from the full sample).
     boundary_kw : dict or None
-        Forwarded to detect_stage_boundary (normalize, min_segment_frac, search_bounds).
-        Defaults to dict(normalize='zscore', min_segment_frac=0.10).
-    annualized : bool
-        Divide each stage's net change by its duration in years (matches compute_stage_maps).
-    n_jobs : int
-        joblib worker count (-1 = all cores).
-    Other parameters mirror fit_gam / fit_series.
+        Forwarded to detect_change_point (normalize, min_segment_frac, search_bounds).
 
     Returns
     -------
     dict with any of:
         'sa_curves' : (n_boot, n_grid)             -- if sa_axis_vals is given
         'stage1', 'stage2' : (n_boot, n_regions)   -- if inflection_age is given
-        'boundary_<signal>' : (n_boot,)            -- detected boundary ages per resample, for
-                                                      the stage-map signal and each requested
-                                                      report_boundary_signals entry
+        'boundary_<signal>' : (n_boot,)            -- change-point location per resample
     """
     boundary_cfg = dict(normalize='zscore', min_segment_frac=0.10)
     if boundary_kw:
         boundary_cfg.update(boundary_kw)
 
     if isinstance(inflection_age, str):
-        if inflection_age not in _STAGE_SIGNALS:
-            raise ValueError(f"inflection_age signal must be one of {_STAGE_SIGNALS}; "
-                             f"got {inflection_age!r}")
+        if inflection_age not in SIGNALS:
+            raise ValueError(f"inflection_age signal must be one of {SIGNALS}; got {inflection_age!r}")
         stage_signal, stage_windows, want_stage_maps = inflection_age, None, True
     elif inflection_age is not None:
-        stage_signal = None
-        stage_windows = _stage_windows(age_grid, inflection_age)
+        stage_signal    = None
+        stage_windows   = segment_windows_at(age_grid, int(np.argmin(np.abs(age_grid - inflection_age))))
         want_stage_maps = True
     else:
         stage_signal, stage_windows, want_stage_maps = None, None, False
 
     report_signals = tuple(report_boundary_signals or ())
-    bad = set(report_signals) - set(_STAGE_SIGNALS)
+    bad = set(report_signals) - set(SIGNALS)
     if bad:
-        raise ValueError(f"report_boundary_signals must be subset of {_STAGE_SIGNALS}; got {bad}")
+        raise ValueError(f"report_boundary_signals must be subset of {SIGNALS}; got {bad}")
 
     if sa_axis_vals is None and not want_stage_maps and not report_signals:
         raise ValueError("Request at least one of sa_axis_vals, inflection_age, "
                          "or report_boundary_signals.")
 
-    rng     = np.random.default_rng(random_state)
-    n_subs  = deflection.shape[0]
-    idx_all = [rng.integers(0, n_subs, size=n_subs) for _ in range(n_boot)]
-
-    results = Parallel(n_jobs=n_jobs, verbose=(10 if verbose else 0))(
-        delayed(_bootstrap_one)(
-            idx, deflection, age, nuisance, age_grid, n_splines, lam, demean,
-            sa_axis_vals, method, stage_windows, annualized,
-            stage_signal, report_signals, boundary_cfg)
-        for idx in idx_all)
+    reduce = functools.partial(
+        _reduce_sa_stage, sa_axis_vals=sa_axis_vals, method=method, stage_signal=stage_signal,
+        report_signals=report_signals, boundary_cfg=boundary_cfg, stage_windows=stage_windows,
+        annualized=annualized)
+    stacked = bootstrap_gam_fits(deflection, age, age_grid, reduce=reduce, n_boot=n_boot,
+                                 n_splines=n_splines, lam=lam, nuisance=nuisance, demean=demean,
+                                 random_state=random_state, n_jobs=n_jobs, verbose=verbose)
 
     out = {}
     if sa_axis_vals is not None:
-        out['sa_curves'] = np.asarray([r['sa_curve'] for r in results])
+        out['sa_curves'] = stacked['sa_curve']
     if want_stage_maps:
-        out['stage1'] = np.asarray([r['stage1'] for r in results])
-        out['stage2'] = np.asarray([r['stage2'] for r in results])
-    boundary_sigs = set(report_signals)
-    if stage_signal is not None:
-        boundary_sigs.add(stage_signal)
-    for sig in sorted(boundary_sigs):
-        out[f'boundary_{sig}'] = np.asarray([r['boundaries'].get(sig, np.nan) for r in results])
+        out['stage1'], out['stage2'] = stacked['stage1'], stacked['stage2']
+    for k in stacked:
+        if k.startswith('boundary_'):
+            out[k] = stacked[k]
     return out
 
 
