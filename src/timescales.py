@@ -1,4 +1,3 @@
-import os
 import numpy as np
 import scipy as sp
 import pandas as pd
@@ -29,60 +28,9 @@ logger = logging.getLogger(__name__)
 # Project-specific INT estimators
 #
 # Same contract as snaplab_tools.timescales: fn(acf, tr) -> (n_regions,) in seconds,
-# where acf is (n_regions, n_lags). Anything defined here is deliberately NOT in the
-# library — either because it is an unpublished variant (zero_crossing_robust) or
-# because it is an exponential-fit estimator the library does not implement.
+# where acf is (n_regions, n_lags). What lives here are the exponential-fit
+# estimators the library does not implement.
 # ---------------------------------------------------------------------------
-
-def zero_crossing_robust(acf, tr=1.0, n_crossings=3, max_gap=20, aggregation='mean'):
-    """Average the first few zero crossings instead of taking only the first.
-
-    A single first crossing is noisy when the ACF hovers around zero. This samples up to
-    `n_crossings` early crossings and averages them, stopping early once consecutive crossings
-    are more than `max_gap` lags apart (i.e. once they stop being one quick oscillation).
-
-    Parameters
-    ----------
-    acf : (n_regions, n_lags) or (n_lags,) array-like
-        Autocorrelation function(s).
-    tr : float
-        Repetition time in seconds. The default of 1.0 returns lags.
-    n_crossings : int
-        Maximum number of early crossings to sample.
-    max_gap : int
-        Stop collecting once the gap between consecutive crossings exceeds this many lags.
-    aggregation : {'mean', 'median'}
-        How to combine the selected crossings.
-
-    Returns
-    -------
-    float or (n_regions,) ndarray
-        Aggregated crossing time, NaN where the ACF never goes negative.
-    """
-    if aggregation not in ('mean', 'median'):
-        raise ValueError(f"aggregation must be 'mean' or 'median', got {aggregation!r}")
-    reduce = np.mean if aggregation == 'mean' else np.median
-
-    acf = np.asarray(acf, dtype=float)
-    was_1d = acf.ndim == 1
-    if was_1d:
-        acf = acf[np.newaxis, :]
-
-    out = np.full(acf.shape[0], np.nan)
-    for i, row in enumerate(acf):
-        negative = np.where(row < 0)[0]
-        if negative.size == 0:
-            continue
-        selected = [negative[0]]
-        for j in range(1, min(negative.size, n_crossings)):
-            if negative[j] - negative[j - 1] > max_gap:
-                break
-            selected.append(negative[j])
-        out[i] = reduce(selected)
-
-    out *= tr
-    return float(out[0]) if was_1d else out
-
 
 def tau_from_acf(acf, tr, version='loglin'):
     """Per-region exponential-decay timescale, fit region by region.
@@ -156,29 +104,15 @@ def tau_murray_parallel(acf, tr, n_jobs=-1):
     return np.array([r[0] for r in results]), np.array([r[1] for r in results])
 
 
-def _murray_B_over(minutes):
-    """Registry entry returning Murray B fit over the first `minutes` of the ACF."""
-    def method(acf, tr):
-        n_lags = int(minutes * 60 / tr)
-        _, B = tau_murray_parallel(acf[:, :n_lags], tr=tr, n_jobs=max(1, os.cpu_count() // 2))
-        return B
-    return method
-
-
 #: Named INT estimators, each callable as ``fn(acf, tr)``. The library's generic estimators
 #: (zero_crossing, auc_*, decay_time*, lag_one) come straight from snaplab_tools; the rest are
 #: defined above. Keys are stable and used in output filenames, so renaming one orphans its cache.
 TIMESCALE_METHODS = {
     **_LIBRARY_TIMESCALE_METHODS,
-    'zero_crossing_robust_nc2': lambda acf, tr: zero_crossing_robust(acf, tr, n_crossings=2),
-    'zero_crossing_robust_nc3': lambda acf, tr: zero_crossing_robust(acf, tr, n_crossings=3),
-    'tau':                      lambda acf, tr: tau_from_acf(acf, tr, version='loglin'),
-    'tau_howell':               lambda acf, tr: tau_from_acf(acf, tr, version='howell'),
-    'tau_murray_par':           lambda acf, tr: tau_murray_parallel(acf, tr, n_jobs=-1)[0],
-    'B_murray_par':             lambda acf, tr: tau_murray_parallel(acf, tr, n_jobs=-1)[1],
-    'B_murray_par_lag3mins':    _murray_B_over(3),
-    'B_murray_par_lag4mins':    _murray_B_over(4),
-    'B_murray_par_lag5mins':    _murray_B_over(5),
+    'tau':            lambda acf, tr: tau_from_acf(acf, tr, version='loglin'),
+    'tau_howell':     lambda acf, tr: tau_from_acf(acf, tr, version='howell'),
+    'tau_murray_par': lambda acf, tr: tau_murray_parallel(acf, tr, n_jobs=-1)[0],
+    'B_murray_par':   lambda acf, tr: tau_murray_parallel(acf, tr, n_jobs=-1)[1],
 }
 
 
