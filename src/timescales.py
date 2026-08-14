@@ -2,7 +2,6 @@ import os
 import numpy as np
 import scipy as sp
 import pandas as pd
-import pyfftw
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 from tqdm import tqdm
@@ -12,85 +11,174 @@ from collections import defaultdict
 from joblib import Parallel, delayed
 import statsmodels.api as sm
 
-pyfftw.interfaces.cache.enable()  # cache FFT plans
-
 from src.data import DataLoader, ScanInfo, parse_scan_string, build_scan_string
 from snaplab_tools.signal import apply_frequency_filter
 from snaplab_tools.stats import partial_pearsonr
+# ACF construction and the four generic INT estimators live in snaplab_tools; this module keeps
+# only the estimators the library does not have (robust zero crossing, the exponential tau fits)
+# and the per-scan caching layer around them. compute_acf is re-exported so
+# `from src.timescales import compute_acf` keeps working.
+from snaplab_tools.timescales import (
+    TIMESCALE_METHODS as _LIBRARY_TIMESCALE_METHODS,
+    compute_acf,
+)
 import logging
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Timescale method registry
-# Each entry is a callable: (acf: np.ndarray, tr: float, **kwargs) -> np.ndarray
-# Add new methods here without touching Timescales.compute_timescale_measures.
+# Project-specific INT estimators
+#
+# Same contract as snaplab_tools.timescales: fn(acf, tr) -> (n_regions,) in seconds,
+# where acf is (n_regions, n_lags). Anything defined here is deliberately NOT in the
+# library — either because it is an unpublished variant (zero_crossing_robust) or
+# because it is an exponential-fit estimator the library does not implement.
 # ---------------------------------------------------------------------------
 
-def _ts_method_zero_crossing(acf, tr, inst, **kw):
-    return inst._compute_zero_crossing(acf) * tr
+def zero_crossing_robust(acf, tr=1.0, n_crossings=3, max_gap=20, aggregation='mean'):
+    """Average the first few zero crossings instead of taking only the first.
 
-def _ts_method_zero_crossing_robust_nc2(acf, tr, inst, **kw):
-    return inst._compute_zero_crossing_robust(acf, n_crossings=2) * tr
+    A single first crossing is noisy when the ACF hovers around zero. This samples up to
+    `n_crossings` early crossings and averages them, stopping early once consecutive crossings
+    are more than `max_gap` lags apart (i.e. once they stop being one quick oscillation).
 
-def _ts_method_zero_crossing_robust_nc3(acf, tr, inst, **kw):
-    return inst._compute_zero_crossing_robust(acf, n_crossings=3) * tr
+    Parameters
+    ----------
+    acf : (n_regions, n_lags) or (n_lags,) array-like
+        Autocorrelation function(s).
+    tr : float
+        Repetition time in seconds. The default of 1.0 returns lags.
+    n_crossings : int
+        Maximum number of early crossings to sample.
+    max_gap : int
+        Stop collecting once the gap between consecutive crossings exceeds this many lags.
+    aggregation : {'mean', 'median'}
+        How to combine the selected crossings.
 
-def _ts_method_auc_zero_crossing(acf, tr, inst, **kw):
-    return inst._compute_auc(acf, threshold=0.0) * tr
+    Returns
+    -------
+    float or (n_regions,) ndarray
+        Aggregated crossing time, NaN where the ACF never goes negative.
+    """
+    if aggregation not in ('mean', 'median'):
+        raise ValueError(f"aggregation must be 'mean' or 'median', got {aggregation!r}")
+    reduce = np.mean if aggregation == 'mean' else np.median
 
-def _ts_method_auc_half_crossing(acf, tr, inst, **kw):
-    return inst._compute_auc(acf, threshold=0.5) * tr
+    acf = np.asarray(acf, dtype=float)
+    was_1d = acf.ndim == 1
+    if was_1d:
+        acf = acf[np.newaxis, :]
 
-def _ts_method_decay_time_half(acf, tr, inst, **kw):
-    return inst._compute_decay_time(acf, tr=tr, threshold=0.5)
+    out = np.full(acf.shape[0], np.nan)
+    for i, row in enumerate(acf):
+        negative = np.where(row < 0)[0]
+        if negative.size == 0:
+            continue
+        selected = [negative[0]]
+        for j in range(1, min(negative.size, n_crossings)):
+            if negative[j] - negative[j - 1] > max_gap:
+                break
+            selected.append(negative[j])
+        out[i] = reduce(selected)
 
-def _ts_method_lag_one(acf, tr, inst, **kw):
-    return acf[:, 1]
+    out *= tr
+    return float(out[0]) if was_1d else out
 
-def _ts_method_tau(acf, tr, inst, **kw):
-    return inst._compute_tau_from_acf(acf, tr=tr, version='loglin')
 
-def _ts_method_tau_howell(acf, tr, inst, **kw):
-    return inst._compute_tau_from_acf(acf, tr=tr, version='howell')
+def tau_from_acf(acf, tr, version='loglin'):
+    """Per-region exponential-decay timescale, fit region by region.
 
-def _ts_method_tau_murray_par(acf, tr, inst, **kw):
-    tau, _ = inst._compute_tau_murray_parallel(acf, tr=tr, n_jobs=-1)
+    Parameters
+    ----------
+    acf : (n_regions, n_lags) ndarray
+        Autocorrelation functions.
+    tr : float
+        Repetition time in seconds.
+    version : {'loglin', 'howell'}
+        'loglin' is the log-linear fit in :func:`fit_tau`; 'howell' is the constrained
+        Murray-form curve fit in :func:`fit_acf_exp`.
+
+    Returns
+    -------
+    (n_regions,) ndarray
+        Estimated tau in seconds; NaN for regions whose fit failed.
+    """
+    acf = np.atleast_2d(np.asarray(acf, dtype=float))
+    tau = np.full(acf.shape[0], np.nan)
+
+    for i, row in enumerate(acf):
+        try:
+            if version == 'loglin':
+                tau[i], _ = fit_tau(row, delta=tr)
+            elif version == 'howell':
+                tau[i] = fit_acf_exp(
+                    row, tr=tr,
+                    start_lag=True, exclude_negative=False, exclude_inf=False,
+                    n_over_10_cap=False, max_fit_lag=None,
+                    a_const=True, b_const=True, maxfev=20000,
+                )['tau']
+            else:
+                raise ValueError(f"unknown tau version {version!r}; expected 'loglin' or 'howell'")
+        except ValueError:
+            raise
+        except Exception:
+            tau[i] = np.nan
+
     return tau
 
-def _ts_method_B_murray_par(acf, tr, inst, **kw):
-    _, B = inst._compute_tau_murray_parallel(acf, tr=tr, n_jobs=-1)
-    return B
 
-def _ts_method_B_murray_par_lag3mins(acf, tr, inst, **kw):
-    n_tp = int(3 * 60 / tr)
-    _, B = inst._compute_tau_murray_parallel(acf[:, :n_tp], tr=tr, n_jobs=int(os.cpu_count() / 2))
-    return B
+def tau_murray_parallel(acf, tr, n_jobs=-1):
+    """Fit the Murray (2014) three-parameter ACF model to every region in parallel.
 
-def _ts_method_B_murray_par_lag4mins(acf, tr, inst, **kw):
-    n_tp = int(4 * 60 / tr)
-    _, B = inst._compute_tau_murray_parallel(acf[:, :n_tp], tr=tr, n_jobs=int(os.cpu_count() / 2))
-    return B
+    Parameters
+    ----------
+    acf : (n_regions, n_lags) ndarray
+        Autocorrelation functions.
+    tr : float
+        Repetition time in seconds.
+    n_jobs : int
+        joblib worker count; -1 uses every CPU.
 
-def _ts_method_B_murray_par_lag5mins(acf, tr, inst, **kw):
-    n_tp = int(5 * 60 / tr)
-    _, B = inst._compute_tau_murray_parallel(acf[:, :n_tp], tr=tr, n_jobs=int(os.cpu_count() / 2))
-    return B
+    Returns
+    -------
+    tau, B : (n_regions,) ndarray
+        Timescale and offset scaling; NaN for regions whose fit failed.
+    """
+    def fit_single_region(acf_single):
+        try:
+            tau, _, B = fit_tau_murray(acf_single, delta=tr)
+            return tau, B
+        except Exception:
+            return np.nan, np.nan
 
+    results = Parallel(n_jobs=n_jobs)(
+        delayed(fit_single_region)(row) for row in np.atleast_2d(acf)
+    )
+    return np.array([r[0] for r in results]), np.array([r[1] for r in results])
+
+
+def _murray_B_over(minutes):
+    """Registry entry returning Murray B fit over the first `minutes` of the ACF."""
+    def method(acf, tr):
+        n_lags = int(minutes * 60 / tr)
+        _, B = tau_murray_parallel(acf[:, :n_lags], tr=tr, n_jobs=max(1, os.cpu_count() // 2))
+        return B
+    return method
+
+
+#: Named INT estimators, each callable as ``fn(acf, tr)``. The library's generic estimators
+#: (zero_crossing, auc_*, decay_time*, lag_one) come straight from snaplab_tools; the rest are
+#: defined above. Keys are stable and used in output filenames, so renaming one orphans its cache.
 TIMESCALE_METHODS = {
-    'zero_crossing':              _ts_method_zero_crossing,
-    'zero_crossing_robust_nc2':   _ts_method_zero_crossing_robust_nc2,
-    'zero_crossing_robust_nc3':   _ts_method_zero_crossing_robust_nc3,
-    'auc_zero_crossing':          _ts_method_auc_zero_crossing,
-    'auc_half_crossing':          _ts_method_auc_half_crossing,
-    'decay_time_half':            _ts_method_decay_time_half,
-    'lag_one':                    _ts_method_lag_one,
-    'tau':                        _ts_method_tau,
-    'tau_howell':                 _ts_method_tau_howell,
-    'tau_murray_par':             _ts_method_tau_murray_par,
-    'B_murray_par':               _ts_method_B_murray_par,
-    'B_murray_par_lag3mins':      _ts_method_B_murray_par_lag3mins,
-    'B_murray_par_lag4mins':      _ts_method_B_murray_par_lag4mins,
-    'B_murray_par_lag5mins':      _ts_method_B_murray_par_lag5mins,
+    **_LIBRARY_TIMESCALE_METHODS,
+    'zero_crossing_robust_nc2': lambda acf, tr: zero_crossing_robust(acf, tr, n_crossings=2),
+    'zero_crossing_robust_nc3': lambda acf, tr: zero_crossing_robust(acf, tr, n_crossings=3),
+    'tau':                      lambda acf, tr: tau_from_acf(acf, tr, version='loglin'),
+    'tau_howell':               lambda acf, tr: tau_from_acf(acf, tr, version='howell'),
+    'tau_murray_par':           lambda acf, tr: tau_murray_parallel(acf, tr, n_jobs=-1)[0],
+    'B_murray_par':             lambda acf, tr: tau_murray_parallel(acf, tr, n_jobs=-1)[1],
+    'B_murray_par_lag3mins':    _murray_B_over(3),
+    'B_murray_par_lag4mins':    _murray_B_over(4),
+    'B_murray_par_lag5mins':    _murray_B_over(5),
 }
 
 
@@ -491,7 +579,9 @@ class Timescales(DataLoader):
 
         # lowpass/highpass are used for output naming only; filtering is applied at load time via load_batch
         def _compute(timeseries_scan, kv_dict):
-            return compute_acf(timeseries_scan, use_fft=use_fft)
+            # atleast_2d because compute_acf mirrors its input's dimensionality, and the cache
+            # format (and every downstream estimator) assumes (n_regions, n_lags).
+            return np.atleast_2d(compute_acf(timeseries_scan, use_fft=use_fft))
 
         self.autocorr_dict = self._run_for_all_scans(
             compute_fn=_compute,
@@ -581,8 +671,11 @@ class Timescales(DataLoader):
                 continue
 
             try:
-                tr_float = float(tr) if tr else 1.0
-                result = method_fn(acf, tr_float, inst=self)
+                # No tr fallback: every estimator multiplies a lag count by tr, so a missing
+                # tr would silently return lags labelled as seconds. Fail the scan instead.
+                if not tr:
+                    raise ValueError(f"scan key carries no usable tr: {scan_key!r}")
+                result = method_fn(acf, float(tr))
                 results[scan_key] = result
                 n_computed += 1
 
@@ -670,193 +763,6 @@ class Timescales(DataLoader):
             verbose=verbose,
         )
 
-    # ============== Timescale Computation Methods ==============
-    def _compute_zero_crossing(self, acf: np.ndarray) -> np.ndarray:
-        """Find first zero crossing for each parcel."""
-        n_parcels = acf.shape[0]
-        zero_crossings = np.zeros(n_parcels)
-        
-        for i in range(n_parcels):
-            negative_indices = np.where(acf[i] < 0)[0]
-            if len(negative_indices) > 0:
-                zero_crossings[i] = negative_indices[0]
-            else:
-                zero_crossings[i] = np.nan
-        
-        return zero_crossings
-
-    def _compute_zero_crossing_robust(self, acf: np.ndarray,
-                                      n_crossings: int = 3,
-                                      max_gap: int = 20,
-                                      aggregation: str = 'mean') -> np.ndarray:
-        """Find first N zero crossings for each parcel and aggregate.
-        
-        Only includes crossings that are close together (quick oscillations).
-        Stops including crossings once a gap larger than max_gap is encountered.
-        
-        Parameters
-        ----------
-        acf : np.ndarray
-            Autocorrelation function, shape (n_parcels, n_lags)
-        n_crossings : int, default=3
-            Maximum number of early zero crossings to sample
-        max_gap : int, default=20
-            Maximum allowed gap (in lags) between consecutive crossings.
-            Stops including crossings once gap exceeds this threshold.
-        aggregation : str, default='mean'
-            Aggregation method: 'mean' or 'median'
-
-        Returns
-        -------
-        np.ndarray
-            Aggregated zero crossing lag for each parcel, shape (n_parcels,)
-        """
-        n_parcels = acf.shape[0]
-        zero_crossings_agg = np.zeros(n_parcels)
-        
-        for i in range(n_parcels):
-            # Find all negative indices
-            negative_indices = np.where(acf[i] < 0)[0]
-            
-            if len(negative_indices) == 0:
-                zero_crossings_agg[i] = np.nan
-            else:
-                # Select crossings that are close together
-                selected_crossings = [negative_indices[0]]  # Always include first crossing
-                
-                for j in range(1, min(len(negative_indices), n_crossings)):
-                    gap = negative_indices[j] - negative_indices[j-1]
-                    if gap <= max_gap:
-                        selected_crossings.append(negative_indices[j])
-                    else:
-                        # Gap too large, stop collecting
-                        break
-                
-                # Aggregate
-                if aggregation == 'mean':
-                    zero_crossings_agg[i] = np.mean(selected_crossings)
-                elif aggregation == 'median':
-                    zero_crossings_agg[i] = np.median(selected_crossings)
-                else:
-                    raise ValueError(f"aggregation must be 'mean' or 'median', got '{aggregation}'")
-        
-        return zero_crossings_agg
-    
-    def _compute_auc(self, acf: np.ndarray, max_lag: int = None, threshold: float = 0) -> np.ndarray:
-        """Compute area under curve up to some max lag (or zero crossing).
-
-        Integrates via the trapezoidal rule (np.trapezoid). dx is left at its
-        default of 1: the callers in TIMESCALE_METHODS scale the result by tr, so
-        the returned value times tr equals the trapezoidal area with dx=tr. This
-        replaces the earlier left Riemann sum (np.sum), which overestimated the
-        area by ~tr/2 and injected a TR-dependent bias into the timescale.
-        """
-        n_parcels = acf.shape[0]
-        auc = np.zeros(n_parcels)
-
-        for i in range(n_parcels):
-            try:
-                if max_lag is not None:
-                    max_lag_i = max_lag
-                else:
-                    max_lag_i = np.where(acf[i] < threshold)[0][0]
-
-                auc[i] = np.trapezoid(acf[i, :max_lag_i])
-            except Exception:
-                auc[i] = np.nan
-
-        return auc
-    
-    def _compute_decay_time(self, acf: np.ndarray, tr: float, threshold: float = 1.0 / np.e) -> np.ndarray:
-        """Find time when ACF decays to 1/e."""
-        n_parcels = acf.shape[0]
-        decay_times = np.zeros(n_parcels)
-        
-        for i in range(n_parcels):
-            # Find where ACF drops below threshold
-            below_threshold = np.where(acf[i] < threshold)[0]
-            if len(below_threshold) > 0:
-                decay_times[i] = below_threshold[0] * tr
-            else:
-                decay_times[i] = np.nan
-        
-        return decay_times
-
-    def _compute_tau_from_acf(self, acf: np.ndarray, tr: float, version: str):
-        """Compute tau for each parcel using Murray et al. 2014."""
-        n_parcels = acf.shape[0]
-        n_lags = acf.shape[1]
-        tau = np.zeros(n_parcels)
-        B = np.zeros(n_parcels)
-        
-        for i in range(n_parcels):
-            try:
-                if version == 'loglin':
-                    tau[i], A = fit_tau(acf[i], delta=tr)
-                elif version == 'howell':
-                    results = fit_acf_exp(acf[i], tr=tr,
-                                          start_lag=True, exclude_negative=False, exclude_inf=False,
-                                          n_over_10_cap=False, max_fit_lag=None,
-                                          a_const=True, b_const=True, maxfev=20000)
-                    tau[i] = results['tau']
-                elif version == 'murray':
-                    # tau[i], B[i], A = fit_tau_murray(acf[i], delta=tr)
-                    if n_lags > 10000:
-                        negative_indices = np.where(acf[i] < 0)[0]
-                        if len(negative_indices) > 0:
-                            time_window = negative_indices[0] + (negative_indices[0] * 0.5)
-                            max_lag = get_acf_time_index(time_window=time_window, tr=tr)
-                            tau[i], A, B[i] = fit_tau_murray(acf[i, :max_lag], delta=tr)
-                        else:
-                            tau[i], A, B[i] = fit_tau_murray(acf[i], delta=tr)
-                    else:
-                        tau[i], A, B[i] = fit_tau_murray(acf[i], delta=tr)
-            except Exception:
-                tau[i] = np.nan
-                B[i] = np.nan
-
-        if version == 'murray':
-            return tau, B
-        else:
-            return tau
-
-    def _compute_tau_murray_parallel(self, acf: np.ndarray, tr: float, n_jobs=-1):
-        """
-        Parallel CPU version using scipy.
-        
-        Parameters
-        ----------
-        acf : np.ndarray
-            Shape (n_regions, n_lags)
-        tr : float
-            Repetition time
-        n_jobs : int
-            Number of parallel jobs (-1 = all CPUs)
-        
-        Returns
-        -------
-        tau : np.ndarray
-            Shape (n_regions,)
-        B : np.ndarray
-            Shape (n_regions,)
-        """
-        
-        def fit_single_region(acf_single):
-            try:
-                tau, A, B = fit_tau_murray(acf_single, delta=tr)
-                return tau, B
-            except Exception as e:
-                return np.nan, np.nan
-        
-        results = Parallel(n_jobs=n_jobs)(
-            delayed(fit_single_region)(acf[i]) for i in range(len(acf))
-        )
-        
-        tau = np.array([r[0] for r in results])
-        B = np.array([r[1] for r in results])
-        
-        return tau, B
-
     # ==================== Deconfounding Functions ====================
     def regress_task_structure(self):
         """Regress task-evoked structure out of every task scan's timeseries.
@@ -934,7 +840,10 @@ class Timescales(DataLoader):
                     design_matrix_flat = create_design_matrix_nilearn(tsk_evnts_flat, n_timepoints, tr,
                                                                       hrf_model=hrf_model, drift_model=drift_model
                                                                       )
-                    task_events_acf[scan_key] = compute_acf(design_matrix_flat['trial'].values)
+                    # atleast_2d keeps this a (1, n_lags) array, as it was before compute_acf
+                    # moved to snaplab_tools (which returns 1-D for a 1-D input).
+                    task_events_acf[scan_key] = np.atleast_2d(
+                        compute_acf(design_matrix_flat['trial'].values))
                 except Exception:
                     timeseries_residuals[scan_key] = None
                     task_events[scan_key] = None
@@ -1090,65 +999,6 @@ class Timescales(DataLoader):
         self.min_scan_lengths.name = 'min_n_frames'
 
 # ==================== Standalone Functions ====================
-def compute_acf(
-        data,
-        use_fft: bool = False,
-    ):
-    """Compute the autocorrelation function for timeseries data.
-
-    Each series is mean/std standardized before the ACF is computed, then
-    normalized by its lag-0 value. Series with zero variance return all-NaN.
-
-    Parameters
-    ----------
-    data : ndarray
-        2D array (n_parcels, n_timepoints), or 1D array (single series).
-    use_fft : bool
-        Use an FFT-based computation instead of np.correlate.
-
-    Returns
-    -------
-    ndarray
-        Autocorrelation functions, shape (n_parcels, n_lags).
-    """
-    
-    if data.ndim == 1:
-        data = data.reshape(1, -1)
-    n = data.shape[1]
-    
-    autocorr_list = []
-    
-    for timeseries in data:
-        if np.std(timeseries) > 0:  # Avoid division by zero
-            # Standardize the (potentially filtered) time series
-            standardized = (timeseries - np.mean(timeseries)) / np.std(timeseries)
-            
-            if use_fft:
-                # Pad to next power of 2 for optimal FFT performance
-                fft_size = 2 ** (int(np.log2(2 * n - 1)) + 1)
-                padded = np.zeros(fft_size)
-                padded[:n] = standardized
-                
-                # Real FFT for autocorrelation
-                fft_data = pyfftw.interfaces.numpy_fft.rfft(padded)
-                acf_full = pyfftw.interfaces.numpy_fft.irfft(fft_data * np.conj(fft_data))
-                
-                # Take positive lags and normalize
-                acf = acf_full[:n]
-            else:
-                # Compute full autocorrelation
-                acf = np.correlate(standardized, standardized, mode='full')
-                acf = acf[len(acf)//2:]  # Take only non-negative lags
-    
-            acf = acf / acf[0]  # Normalize by lag-0 value
-            autocorr_list.append(acf)
-        else:
-            acf = np.zeros(n)
-            acf[:] = np.nan
-            autocorr_list.append(acf)
-            
-    return np.array(autocorr_list)
-
 def fit_tau(acf, delta):
     """
     Fast tau estimation without offset (log-linear fit).
