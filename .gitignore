@@ -152,13 +152,14 @@ dmypy.json
 # Cython debug symbols
 cython_debug/
 
-# PyCharm
-#  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
-#  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore
-#  and can be added to the global gitignore or merged into this file.  For a more nuclear
-#  option (not recommended) you can uncomment the following to ignore the entire idea folder.
+# Project stuff
 .idea/
 data/
 results/
 packages/
 scripts/scratch/
+backup/
+
+# Generated scan registries (written by DataLoader.export_scan_registry in
+# timescales_process.ipynb; regenerated from the raw data, never edited by hand)
+scan_registry_*.csv
