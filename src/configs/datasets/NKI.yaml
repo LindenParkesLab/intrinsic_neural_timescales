@@ -1,12 +1,12 @@
 name: NKI
 paths:
-  base: /mnt/lindenmp_bignas/lindenmp/research_data/RBC/NKI
+  base: /mnt/storage_ssd_raid/research_data/RBC/NKI
   rawdata_subdir: bids
   derivatives_subdir: derivatives
 modalities:
   MRI3T:
     tr: 1.4
-    data_subdir: rbc_cpac/cpac_RBCv0
+    data_subdir: xcp-d
     dir_template: "sub-{subject_id}/ses-{session}/func"
     # Glob pattern required: acquisition label varies (e.g. acq-1400, acq-645).
     filename_template: "sub-{subject_id}_ses-{session}_task-{task}_acq-1400*_atlas-{seg}_space-{space}_reg-36Parameter_desc-Mean_timeseries{ext}"
