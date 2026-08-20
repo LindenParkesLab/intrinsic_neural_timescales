@@ -3,19 +3,159 @@
 Generic GAM fitting, change-point detection, and the bootstrap engine live in
 ``snaplab_tools.gams``; this module keeps only the project-specific pieces (S-A axis correlations,
 two-stage net-change maps, and the figure builders) and wires the generic bootstrap engine to the
-S-A / stage reductions that fig4 and fig5 need.
+S-A / stage reductions that fig3 and fig4 need.
 """
 import functools
+import os
 
 import numpy as np
 import scipy as sp
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 
+from src.plotting import style_ax
 from snaplab_tools.gams import (
     fit_series, detect_change_point, integrate_derivative, segment_windows_at,
     bootstrap_gam_fits, SIGNALS, _DEFAULT_LAM_GRID,
 )
+
+
+# =============================================================================
+# Run identity: the signal vocabulary, the variant tags, and the cache path
+#
+# fig3 writes the GAM cache and fig4 reads it, so every component of that filename and every name
+# in the shared option vocabulary has to agree between the two notebooks. These functions are that
+# agreement -- the contract is executable here rather than restated by hand in both notebooks.
+# NOTE ``SIGNAL_TYPES`` (rest / task / deflection, the INT signal being modelled) is a different
+# vocabulary from ``SIGNALS`` imported above (pred / deriv1 / deriv2, the curve a change point is
+# detected on). Both are needed; do not conflate them.
+# =============================================================================
+
+SIGNAL_TYPES = ('rest', 'task', 'deflection')
+
+GAM_RECIPES = {
+    # 'historical' -> the original fixed-penalty recipe (writes the untagged cache file).
+    # 'gcv'        -> lam chosen per series by GCV on the full sample, then frozen for bootstraps.
+    'historical': dict(n_splines=4, lam=0.1),
+    'gcv':        dict(n_splines=5, lam='gcv'),
+}
+
+
+def signal_labels(absolute=True):
+    """Axis / title label per signal type. ``absolute`` names the deflection definition."""
+    return {'rest': 'Rest INTs', 'task': 'Task INTs',
+            'deflection': f'INT Deflections ({"abs." if absolute else "signed"})'}
+
+
+def signal_units(absolute=True):
+    """Short unit per signal type, for '\u0394<unit> / yr' style axis labels."""
+    return {'rest': 'INT', 'task': 'INT',
+            'deflection': '|\u0394INT|' if absolute else '\u0394INT'}
+
+
+def gam_variant_tags(fit_recipe, absolute, demean):
+    """Resolve a run's identity: fitting recipe plus the two data-definition flags.
+
+    Parameters
+    ----------
+    fit_recipe : {'historical', 'gcv'}
+        Key into :data:`GAM_RECIPES`; fixes ``n_splines`` and ``lam``.
+    absolute : bool
+        Deflection definition: True -> |task - rest|, False -> signed (task - rest).
+    demean : bool
+        Centre each series on its own mean before fitting.
+
+    Returns
+    -------
+    dict
+        ``fit_recipe``, ``n_splines``, ``lam``, ``recipe_tag``, ``absolute_tag``, ``demean_tag``
+        and ``variant_tag`` (= absolute_tag + demean_tag, the component both notebooks put in
+        panel filenames).
+    """
+    if fit_recipe not in GAM_RECIPES:
+        raise ValueError(f"fit_recipe must be one of {sorted(GAM_RECIPES)}; got {fit_recipe!r}")
+    n_splines = GAM_RECIPES[fit_recipe]['n_splines']
+    lam       = GAM_RECIPES[fit_recipe]['lam']
+    recipe_tag   = '' if fit_recipe == 'historical' else f'_ns{n_splines}-gcv'
+    absolute_tag = '_abs' if absolute else '_signed'
+    demean_tag   = '_demean' if demean else '_nodemean'
+    return dict(fit_recipe=fit_recipe, n_splines=n_splines, lam=lam,
+                recipe_tag=recipe_tag, absolute_tag=absolute_tag, demean_tag=demean_tag,
+                variant_tag=f'{absolute_tag}{demean_tag}')
+
+
+def gam_cache_path(gam_out_dir, dataset, n_regions, task_scan, tags):
+    """Path of the fig3 GAM export for one variant (``tags`` from :func:`gam_variant_tags`)."""
+    return os.path.join(
+        gam_out_dir,
+        f'{dataset}_{n_regions}_{task_scan}{tags["recipe_tag"]}{tags["absolute_tag"]}'
+        f'{tags["demean_tag"]}_regional_gam_results.npy')
+
+
+# Head-motion column(s) per dataset; None means this dataset gets no nuisance covariates.
+# A value may be a single column name or a list of them.
+#
+# HCP-YA reports mean *relative RMS displacement* (mm), not Power's framewise displacement -- see
+# src.data.load_hcpya_movement. Naming it meanRelRMS_* keeps that distinction visible; do not
+# report it as FD. fig3/fig4 only ever run HCP-D or PNC, so this entry does not reach them.
+FD_COLUMN = {'HCP-D': 'meanFD', 'PNC': 'meanFD_rest', 'HCP-YA': 'meanRelRMS_rest'}
+
+
+def build_nuisance(df_behavior, rest, dataset, include_age=False, fd_columns=None):
+    """Nuisance covariates: [(age,) sex, head motion..., subject mean resting INT].
+
+    fig3 fits with these and fig4 re-fits with them inside its bootstrap; if the two ever disagree
+    fig4 stops reproducing fig3's fit while still looking correct, so both call this. fig2 calls it
+    too, with ``include_age=True`` and an explicit ``fd_columns`` pair.
+
+    Parameters
+    ----------
+    df_behavior : pd.DataFrame
+        Must carry 'sex', 'age' when ``include_age``, and every requested motion column.
+    rest : (n_subjects, n_regions) ndarray
+        Resting INTs; the row mean becomes the last covariate. fig3/fig4 must pass the
+        FULL-parcellation matrix: under a region mask the subject mean would be taken over a
+        different set of regions in the two notebooks, which is one more reason fig4 refuses a
+        masked export. That is a constraint of the shared-cache contract, not of this function --
+        fig2 deliberately passes its masked matrix, since it shares no export with anything.
+    dataset : str
+        Key into :data:`FD_COLUMN`, used only when ``fd_columns`` is None.
+    include_age : bool
+        Prepend 'age'. False for fig3/fig4, where age is the smooth term and so cannot also be a
+        nuisance; True for fig2, where age is an ordinary confound.
+    fd_columns : str, sequence of str, or None
+        Motion column(s), overriding the :data:`FD_COLUMN` default. fig2 passes rest and its task
+        condition separately (e.g. ``['meanRelRMS_rest', 'meanRelRMS_WM']``): the two correlate at
+        r ~ 0.82 but the INT deflection is a task-minus-rest difference, so a single averaged
+        motion term would average over the very contrast the deflection is built on.
+
+    Returns
+    -------
+    (n_subjects, k) ndarray, or None when the dataset has no motion column and none was given.
+
+    Raises
+    ------
+    KeyError
+        If any requested column is absent from ``df_behavior`` -- a silent drop here would
+        quietly change the model.
+    """
+    cols = FD_COLUMN.get(dataset) if fd_columns is None else fd_columns
+    if cols is None:
+        return None
+    if isinstance(cols, str):
+        cols = [cols]
+
+    names = (['age'] if include_age else []) + ['sex'] + list(cols)
+    missing = [c for c in names if c not in df_behavior.columns]
+    if missing:
+        raise KeyError(
+            f"build_nuisance: {missing} not in df_behavior for dataset {dataset!r}. "
+            f"HCP-YA motion columns come from src.data.load_hcpya_movement; delete "
+            f"data/hcpya_movement_relativerms.csv to rebuild the cache."
+        )
+
+    return np.concatenate([df_behavior[names].values.astype(float),
+                           np.nanmean(rest, axis=1)[:, np.newaxis]], axis=1)
 
 
 # =============================================================================
@@ -180,234 +320,6 @@ def add_colorbar(fig, ax, cmap, mode, n_series, fontsize=7):
     cb.ax.tick_params(labelsize=fontsize)
 
 
-def style_ax(ax, xlabel, ylabel, title, demean, fontsize=8):
-    """Apply shared axis styling (labels, title, ticks, spines).
-
-    Parameters
-    ----------
-    ax : matplotlib Axes
-    xlabel, ylabel, title : str or None
-        Axis labels and title.
-    demean : bool
-        If True, draw a dashed zero reference line.
-    fontsize : int
-        Base font size for labels, title, and ticks.
-    """
-    if demean:
-        ax.axhline(0, color='k', lw=0.5, ls='--', alpha=0.4)
-    ax.set_xlabel(xlabel, fontsize=fontsize, labelpad=1)
-    ax.set_ylabel(ylabel, fontsize=fontsize, labelpad=1)
-    ax.set_title(title, fontsize=fontsize)
-    ax.tick_params(labelsize=fontsize, pad=0.25)
-    ax.spines[['top', 'right']].set_visible(False)
-
-
-def draw_gam_figure(results, series_colors, draw_order, key_cfg, data_key,
-                    age_grid, mode, n_series, cmap, demean, show_ci):
-    """Draw a GAM figure with 1–3 panels (rest / task / deflection).
-
-    Parameters
-    ----------
-    results : dict
-        Output of fit_all_panels.
-    series_colors : list
-        RGBA colors, one per series.
-    draw_order : ndarray
-        Index order controlling which series render on top.
-    key_cfg : list of tuple
-        (condition_key, title, ylabel) per panel; its length sets the number of
-        panels (1, 2, or 3).
-    data_key : {'pred', 'deriv'}
-        Which curve to draw.
-    age_grid : (n_grid,) ndarray
-        Evaluation points (x-axis).
-    mode : {'decile', 'region'}
-        Colorbar style.
-    n_series : int
-        Number of series.
-    cmap : matplotlib colormap
-    demean : bool
-        If True, draw a dashed zero reference line.
-    show_ci : bool
-        If True and data_key='pred', shade the CI band.
-
-    Returns
-    -------
-    fig : matplotlib Figure
-    """
-    n_panels = len(key_cfg)
-    fig, axes = plt.subplots(1, n_panels, figsize=(2.5 * n_panels, 2.5), sharey=False, dpi=300)
-    if n_panels == 1:
-        axes = [axes]
-    lw    = 0.4 if n_series > 20 else 1.8
-    alpha = 0.7 if n_series > 20 else 1.0
-
-    for ax, (key, title, ylabel) in zip(axes, key_cfg):
-        for i in draw_order:
-            ax.plot(age_grid, results[key][data_key][i],
-                    color=series_colors[i], lw=lw, alpha=alpha)
-            if show_ci and results[key]['ci_lo'] is not None and data_key == 'pred':
-                ax.fill_between(age_grid,
-                                results[key]['ci_lo'][i],
-                                results[key]['ci_hi'][i],
-                                color=series_colors[i], alpha=0.10)
-        ylab = ylabel if data_key == 'pred' else f'd/dt {ylabel}'
-        style_ax(ax, 'Age (years)', ylab, None, demean, fontsize=8)
-        add_colorbar(fig, ax, cmap, mode, n_series, fontsize=8)
-
-    fig.tight_layout()
-    return fig
-
-
-def plot_wholebrain_gam(results, panels_cfg, data_key, age, demean, show_ci=False,
-                        condition_data=None, scatter_color='#3B3B3B', scatter_alpha=0.6,
-                        scatter_size=10, smooth_color='#2c7bb6', fontsize=9,
-                        grid=True, grid_alpha=0.3):
-    """3-panel figure for wholebrain (mean across regions) GAM results.
-
-    When data_key='pred', subject-level scatter is overlaid on the smooth if
-    condition_data is provided. When data_key='deriv', only the derivative curve
-    is plotted (no scatter).
-
-    Parameters
-    ----------
-    results : dict
-        Output of fit_all_panels with n_series=1.
-    panels_cfg : list of tuple
-        (condition_key, title, ylabel) per panel.
-    data_key : {'pred', 'deriv'}
-        Which curve to draw.
-    age : (n_subjects,) ndarray
-        Subject ages (scatter x-axis).
-    demean : bool
-        If True, scatter values are demeaned to match the smooth.
-    show_ci : bool
-        If True and data_key='pred', shade the CI band.
-    condition_data : dict or None
-        {key: (n_subjects, 1)} of raw (un-demeaned) data; required for scatter
-        when data_key='pred'.
-    scatter_color : str
-        Colour for scatter points.
-    scatter_alpha : float
-        Scatter opacity.
-    scatter_size : float
-        Scatter marker size.
-    smooth_color : str
-        Colour for the GAM smooth and CI band.
-    fontsize : int
-        Base font size for labels and ticks.
-    grid : bool
-        Whether to show the background grid.
-    grid_alpha : float
-        Grid transparency.
-
-    Returns
-    -------
-    fig : matplotlib Figure
-    """
-    age_grid  = results['age_grid']
-    fig, axes = plt.subplots(1, len(panels_cfg), figsize=(4 * len(panels_cfg), 4))
-    if len(panels_cfg) == 1:
-        axes = [axes]
-
-    for ax, (key, title, ylabel) in zip(axes, panels_cfg):
-        curve = results[key][data_key][0]   # (n_grid,) — single series
-
-        # subject scatter (pred only)
-        if data_key == 'pred' and condition_data is not None:
-            y_raw = condition_data[key][:, 0].copy()
-            if demean:
-                y_raw -= np.nanmean(y_raw)
-            ax.scatter(age, y_raw, s=scatter_size, color=scatter_color,
-                       alpha=scatter_alpha, edgecolors='white', linewidths=0.5,
-                       zorder=2)
-
-        # GAM smooth
-        ax.plot(age_grid, curve, color=smooth_color, lw=2.5, alpha=0.8, zorder=3)
-
-        # CI band
-        if show_ci and results[key]['ci_lo'] is not None and data_key == 'pred':
-            ax.fill_between(age_grid,
-                            results[key]['ci_lo'][0],
-                            results[key]['ci_hi'][0],
-                            color=smooth_color, alpha=0.15, zorder=1)
-
-        # zero reference line (when demeaned)
-        if demean:
-            ax.axhline(0, color='k', lw=0.5, ls='--', alpha=0.4, zorder=1)
-
-        # grid
-        if grid:
-            ax.grid(True, alpha=grid_alpha, linestyle='-', linewidth=0.5)
-            ax.set_axisbelow(True)
-
-        # labels
-        ylab = ylabel if data_key == 'pred' else f'd/dt {ylabel}'
-        ttl  = title if data_key == 'pred' else f'{title}\n(temporal derivative)'
-        ax.set_xlabel('Age (years)', fontsize=fontsize)
-        ax.set_ylabel(ylab, fontsize=fontsize)
-        ax.set_title(ttl, fontsize=fontsize, fontweight='bold', pad=10)
-
-        # spine styling — matches style_correlation_axis
-        ax.spines['top'].set_visible(False)
-        ax.spines['right'].set_visible(False)
-        ax.spines['left'].set_linewidth(1.2)
-        ax.spines['bottom'].set_linewidth(1.2)
-
-        # tick styling
-        ax.tick_params(axis='both', which='major', labelsize=fontsize,
-                       length=6, width=1.2, colors='black')
-
-    fig.tight_layout()
-    return fig
-
-
-def plot_deriv_sa_correlation(results, sa_axis, method='spearman', deflections_only=True):
-    """Correlate GAM temporal derivatives with the SA axis at each age point.
-
-    For each age point in age_grid, correlates the per-region derivative with
-    sa_axis and plots that correlation as a function of age, one line per
-    condition. Only meaningful in region mode.
-
-    Parameters
-    ----------
-    results : dict
-        Output of fit_all_panels.
-    sa_axis : (n_regions,) ndarray
-        SA rank values in parcellation order.
-    method : {'spearman', 'pearson'}
-        Correlation type.
-    deflections_only : bool
-        If True, plot only the deflection condition; otherwise rest/task/deflection.
-
-    Returns
-    -------
-    fig : matplotlib Figure
-    """
-    age_grid   = results['age_grid']
-    if deflections_only:
-        conditions = ['deflection',]
-        labels     = ['Deflection INT',]
-    else:
-        conditions = ['rest',     'task',     'deflection']
-        labels     = ['Rest INT', 'Task INT', 'Deflection INT']
-    colors     = ['#4C72B0',  '#DD8452',  '#55A868']
-    corr_label = 'Spearman ρ' if method == 'spearman' else 'Pearson r'
-
-    fig, ax = plt.subplots(figsize=(2, 1.75), dpi=300)
-    for cond, label, color in zip(conditions, labels, colors):
-        r_vals = compute_deriv_sa_corr(results[cond]['deriv'], sa_axis, method=method)
-        ax.plot(age_grid, r_vals, color=color, lw=1.8, label=label)
-
-    ax.axhline(0, color='k', lw=0.5, ls='--', alpha=0.4)
-    ax.set_xlabel('Age (years)', fontsize=8, labelpad=1)
-    ax.set_ylabel(f'{corr_label}\n(derivative × SA axis)', fontsize=8, labelpad=1)
-    ax.legend(fontsize=8, frameon=False)
-    ax.tick_params(labelsize=8, pad=0.25)
-    ax.spines[['top', 'right']].set_visible(False)
-    return fig
-
-
 # =============================================================================
 # Bootstrap: S-A correlation curve + two-stage net-change maps (over the generic engine)
 # =============================================================================
@@ -445,13 +357,13 @@ def bootstrap_gam_maps(deflection, age, age_grid, *, sa_axis_vals=None, inflecti
                        annualized=True, method='pearson', random_state=None,
                        report_boundary_signals=(), boundary_kw=None,
                        n_jobs=-1, verbose=True):
-    """Subject bootstrap of the deflection GAMs, reduced to the S-A / stage summaries fig4/fig5 need.
+    """Subject bootstrap of the deflection GAMs, reduced to the S-A / stage summaries fig3/fig4 need.
 
     Thin project wrapper over ``snaplab_tools.gams.bootstrap_gam_fits``: it resamples subjects and
     refits every region's deflection GAM once (the generic engine), then reduces each refit to the
     derivative x S-A axis correlation curve, the stage-1/stage-2 net-change maps, and data-driven
     change-point location(s) (via ``_reduce_sa_stage``). Computing all of these from the same refit
-    removes the duplicated fitting fig4 (SA-corr CI) and fig5 (enrichment stage maps) once did
+    removes the duplicated fitting fig3 (SA-corr CI) and fig4 (enrichment stage maps) once did
     separately.
 
     Parameters
@@ -522,23 +434,6 @@ def bootstrap_gam_maps(deflection, age, age_grid, *, sa_axis_vals=None, inflecti
     return out
 
 
-def bootstrap_deriv_sa_corr(deflection, age, sa_axis_vals, age_grid,
-                             n_splines=4, lam=0.1, demean=True, nuisance=None,
-                             n_boot=200, method='pearson', random_state=None,
-                             verbose=True, n_jobs=-1):
-    """Bootstrap CI for the derivative-SA correlation curve.
-
-    Thin backward-compatible wrapper over :func:`bootstrap_gam_maps` (parallel). For a given
-    ``random_state`` it returns the same ``(n_boot, n_grid)`` curves as the previous serial
-    implementation.
-    """
-    return bootstrap_gam_maps(
-        deflection, age, age_grid, sa_axis_vals=sa_axis_vals, inflection_age=None,
-        n_splines=n_splines, lam=lam, demean=demean, nuisance=nuisance, n_boot=n_boot,
-        annualized=True, method=method, random_state=random_state,
-        n_jobs=n_jobs, verbose=verbose)['sa_curves']
-
-
 def add_sa_decile_colorbar(fig, ax_ref, cmap, n_deciles,
                             cbar_thickness=0.012, pad=0.010, fontsize=7,
                             orientation='horizontal'):
@@ -555,7 +450,7 @@ def add_sa_decile_colorbar(fig, ax_ref, cmap, n_deciles,
         The Axes whose extent the colorbar is aligned to (width if horizontal,
         height if vertical).
     cmap : matplotlib colormap
-        Colormap to display (e.g. from create_sydnor_sa_colormap()).
+        Colormap to display (e.g. register_custom_colormaps()['snap_sydnor_sa']).
     n_deciles : int
         Number of decile ticks to display.
     cbar_thickness : float
@@ -593,13 +488,14 @@ def add_sa_decile_colorbar(fig, ax_ref, cmap, n_deciles,
     return ax_cb
 
 
-def plot_deriv_sa_corr_with_ci(ax, age_grid, r_vals, r_ci_lo, r_ci_hi,
-                                lw=1.8, color='#4C72B0', fontsize=8):
-    """Plot pre-computed r(derivative × SA-axis) with bootstrap CI and annotations.
+def plot_r_age(ax, age_grid, r_vals, *, ci=None, sig=None, style='band',
+               lw=1.8, color='#4C72B0', fontsize=8, annotate=True, label=None):
+    """Draw an r(age) curve and mark where it is significant, in either of the two house idioms.
 
-    Shades the CI band darker where it lies entirely above or below zero
-    (significant), lighter where it straddles zero. Labels the ages where the CI
-    band's significance begins/ends with text annotations.
+    fig3's panel E and fig4's coupling traces are the same object -- a correlation against age with
+    a significance verdict per age point -- drawn two ways. This is that one drawing routine, so the
+    two figures cannot drift apart, and so a curve can carry a band from one test and a significance
+    verdict from another (fig3's SIG_METHOD='both': bootstrap band, spatial-null marks).
 
     Parameters
     ----------
@@ -607,41 +503,71 @@ def plot_deriv_sa_corr_with_ci(ax, age_grid, r_vals, r_ci_lo, r_ci_hi,
     age_grid : (n_grid,) ndarray
         Evaluation points (x-axis).
     r_vals : (n_grid,) ndarray
-        Observed r curve.
-    r_ci_lo : (n_grid,) ndarray
-        2.5th bootstrap percentile.
-    r_ci_hi : (n_grid,) ndarray
-        97.5th bootstrap percentile.
-    lw : float
-        Line width.
-    color : str
-        Line and fill colour.
-    fontsize : int
-        Base font size (annotations use fontsize - 1).
+        Observed correlation per age.
+    ci : (lo, hi) tuple of (n_grid,) ndarrays, or None
+        Confidence band. Required for ``style='band'``; optional otherwise (when given it also
+        sharpens the annotated ages, see below).
+    sig : (n_grid,) bool ndarray, or None
+        Significance per age. Defaults to "the band excludes zero" when ``ci`` is given, which
+        reproduces the original bootstrap-only behaviour. Pass it explicitly to mark significance
+        from a different test than the one drawing the band.
+    style : {'band', 'trace'}
+        'band'  -- shade the CI, darker where significant, with the curve solid on top (fig3 E).
+        'trace' -- no shading: the curve is faded across the full range and bold where significant
+                   (fig4's coupling traces).
+    annotate : bool
+        Label the ages at which significance starts and stops. With ``ci`` the age is refined by
+        interpolating the relevant bound's zero crossing (what fig3 has always reported); without
+        it the midpoint of the straddling grid points is used, since nothing finer is defined.
+    label : str or None
+        Legend label for the curve.
+
+    Returns
+    -------
+    (n_grid,) bool ndarray
+        The significance mask actually used, so callers can report from the same verdict they drew.
     """
-    _sig = (r_ci_lo > 0) | (r_ci_hi < 0)
-    ax.fill_between(age_grid, r_ci_lo, r_ci_hi,
-                    where=_sig,  color=color, alpha=0.35, interpolate=True)
-    ax.fill_between(age_grid, r_ci_lo, r_ci_hi,
-                    where=~_sig, color=color, alpha=0.12, interpolate=True)
-    ax.plot(age_grid, r_vals, color=color, lw=lw)
+    if style not in ('band', 'trace'):
+        raise ValueError(f"style must be 'band' or 'trace'; got {style!r}")
+    r_vals = np.asarray(r_vals, dtype=float)
+    lo, hi = (None, None) if ci is None else (np.asarray(ci[0], float), np.asarray(ci[1], float))
+    if style == 'band' and ci is None:
+        raise ValueError("style='band' needs ci=(lo, hi); pass style='trace' for a bare curve.")
+    if sig is None:
+        if ci is None:
+            raise ValueError('Pass sig=..., or ci=... to derive it from the band excluding zero.')
+        sig = (lo > 0) | (hi < 0)
+    sig = np.asarray(sig, dtype=bool)
+
+    if style == 'band':
+        ax.fill_between(age_grid, lo, hi, where=sig,  color=color, alpha=0.35, interpolate=True)
+        ax.fill_between(age_grid, lo, hi, where=~sig, color=color, alpha=0.12, interpolate=True)
+        ax.plot(age_grid, r_vals, color=color, lw=lw, label=label)
+    else:
+        ax.plot(age_grid, r_vals, color=color, lw=lw * 0.5, alpha=0.22)          # full, faded
+        ax.plot(age_grid, np.where(sig, r_vals, np.nan), color=color, lw=lw, label=label)
     ax.axhline(0, color='k', lw=0.5, ls='--', alpha=0.4)
 
-    for bound_arr, sig_mask, y_pos, y_va in [
-        (r_ci_lo, r_ci_lo > 0, 0.99, 'top'),
-        (r_ci_hi, r_ci_hi < 0, 0.03, 'bottom'),
-    ]:
-        _diffs = np.diff(sig_mask.astype(int))
-        for idx in np.where(_diffs)[0]:
-            a0, a1    = bound_arr[idx], bound_arr[idx + 1]
-            cross_age = age_grid[idx] + (-a0 / (a1 - a0)) * (age_grid[idx + 1] - age_grid[idx])
-            if _diffs[idx] > 0:
-                ha, xpos = 'right', cross_age - 0.15
+    if annotate:
+        for idx in np.where(np.diff(sig.astype(int)))[0]:
+            entering = sig[idx + 1]                       # True = significance starts here
+            positive = r_vals[idx + (1 if entering else 0)] > 0
+            if ci is None:
+                cross_age = 0.5 * (age_grid[idx] + age_grid[idx + 1])
             else:
-                ha, xpos = 'left',  cross_age + 0.15
-            ax.text(xpos, y_pos, f'{cross_age:.1f} yr',
-                    ha=ha, va=y_va, fontsize=fontsize - 1, color='k',
-                    transform=ax.get_xaxis_transform())
+                # The bound that is crossing zero: the lower one for a positive coupling, the
+                # upper one for a negative coupling.
+                bound  = lo if positive else hi
+                a0, a1 = bound[idx], bound[idx + 1]
+                frac   = 0.0 if a1 == a0 else -a0 / (a1 - a0)
+                frac   = min(max(frac, 0.0), 1.0)         # a foreign sig mask can transition where
+                                                          # the bound does not actually cross zero
+                cross_age = age_grid[idx] + frac * (age_grid[idx + 1] - age_grid[idx])
+            ha, xpos = ('right', cross_age - 0.15) if entering else ('left', cross_age + 0.15)
+            y_pos, y_va = (0.99, 'top') if positive else (0.03, 'bottom')
+            ax.text(xpos, y_pos, f'{cross_age:.1f} yr', ha=ha, va=y_va,
+                    fontsize=fontsize - 1, color='k', transform=ax.get_xaxis_transform())
+    return sig
 
 
 def compute_deriv_sa_corr(deriv, sa_axis_vals, method='pearson'):
@@ -672,76 +598,419 @@ def compute_deriv_sa_corr(deriv, sa_axis_vals, method='pearson'):
     return r_vals
 
 
-def compute_stage_maps(gam_smooths, age_grid, inflection_age=17, flat_ratio_thresh=0.5,
-                       annualized=False):
-    """Net change (or annualized rate of change) in fitted (absolute) INT deflection over two developmental stages.
+# =============================================================================
+# Neurobiological map x developmental-rate coupling (Fig-4E generalised)
+# =============================================================================
 
-    Reuses the per-parcel GAM smooths already fit for Figure 4 (no refitting). For each
-    parcel, stage 1 = age_grid[0] -> inflection_age and stage 2 = inflection_age -> age_grid[-1].
-    Net change is the integral of the fitted first derivative over each window (equivalently,
-    the difference of the fitted value at the window endpoints). The deflection metric is
-    identical to Figure 4 (absolute deflection; absolute=True in compute_deflections).
+def grid_derivatives(pred, x_grid, order):
+    """kth temporal derivative of per-region GAM predictions via repeated central differences.
 
-    The first grid column of the GAM derivative is non-finite by construction (a finite-
-    difference edge effect), so each window's integral is taken over the finite derivative
-    samples only; this is numerically identical (r > 0.999) to the endpoint difference, which
-    is reported as a cross-check.
+    Numerical differentiation (``np.gradient``, edge_order=2) applied ``order`` times along the age
+    grid -- the same convention fig3 uses for its 2nd derivative, generalised to arbitrary order. The
+    pyGAM object is never queried for analytic derivatives, so higher orders come purely from the
+    grid; a 3rd derivative of a low-knot penalised spline is the least stable (small and edge-sensitive).
 
     Parameters
     ----------
-    gam_smooths : dict with 'pred' and 'deriv', each (n_regions, n_grid) on age_grid
-        e.g. results_reg['deflection'].
-    age_grid : (n_grid,) ages at which the smooths/derivatives were evaluated.
-    inflection_age : float, default 17. Stage boundary in years.
-    flat_ratio_thresh : float, default 0.5. Warn if SD(stage1) < thresh * SD(stage2).
-    annualized : bool, default False. If True, return the annualized rate of change
-        (net change divided by the stage duration in years) instead of the total net change.
+    pred : (n_regions, n_grid) ndarray
+        Per-region GAM smooths evaluated on ``x_grid``.
+    x_grid : (n_grid,) ndarray
+        Evaluation points (ages).
+    order : int
+        Derivative order (>= 0). ``order=0`` returns ``pred`` unchanged.
 
     Returns
     -------
-    stage1, stage2 : (n_regions,) signed net-change vectors (or annualized rates if annualized=True).
+    (n_regions, n_grid) ndarray
+        The ``order``-th derivative at each grid point.
     """
-    pred  = np.asarray(gam_smooths['pred'])
-    deriv = np.asarray(gam_smooths['deriv'])
+    out = np.asarray(pred, dtype=float)
+    for _ in range(int(order)):
+        out = np.gradient(out, x_grid, axis=1, edge_order=2)
+    return out
+
+
+def compute_deriv_map_corr(deriv, map_vals, method='pearson'):
+    """Pearson/Spearman r between a per-region brain map and the regional derivative at each age.
+
+    Generalises :func:`compute_deriv_sa_corr` (which is S-A-axis specific) to any brain map. For
+    ``method='pearson'`` the correlation is vectorised across grid columns (cheap enough for the
+    bootstrap inner loop); ``method='spearman'`` falls back to a per-column loop. A region is used
+    only if it is finite in ``map_vals`` and across the whole derivative curve.
+
+    Parameters
+    ----------
+    deriv : (n_regions, n_grid) ndarray
+        Per-region temporal derivative (any order).
+    map_vals : (n_regions,) ndarray
+        Brain map in parcellation order; NaN regions are dropped.
+    method : {'pearson', 'spearman'}
+        Correlation type.
+
+    Returns
+    -------
+    r_vals : (n_grid,) ndarray
+        Correlation at each age point; NaN where fewer than 3 regions are valid.
+    """
+    deriv  = np.asarray(deriv, dtype=float)
+    m      = np.asarray(map_vals, dtype=float)
     n_grid = deriv.shape[1]
-    idx    = int(np.argmin(np.abs(age_grid - inflection_age)))
+    r      = np.full(n_grid, np.nan)
 
-    def _integrate(cols):
-        x = age_grid[cols]
-        d = deriv[:, cols]
-        finite = np.isfinite(x) & np.isfinite(d).any(axis=0)  # keep cols finite for >=1 region (drops the edge-NaN col); all-NaN regions stay NaN
-        return np.trapezoid(d[:, finite], x[finite], axis=1)
+    fin = np.isfinite(m) & np.isfinite(deriv).all(axis=1)
+    if fin.sum() < 3:
+        return r
 
-    # Integral of the fitted first derivative over each window (signed net change)
-    stage1 = _integrate(np.arange(0, idx + 1))
-    stage2 = _integrate(np.arange(idx, n_grid))
+    if method == 'pearson':
+        D   = deriv[fin]                              # (n_valid, n_grid)
+        x   = m[fin] - m[fin].mean()
+        Dc  = D - D.mean(axis=0, keepdims=True)
+        den = np.sqrt((Dc ** 2).sum(axis=0)) * np.sqrt((x ** 2).sum())
+        with np.errstate(invalid='ignore', divide='ignore'):
+            r = (Dc.T @ x) / den
+        r[~np.isfinite(r)] = np.nan
+        return r
 
-    # Cross-check: equals fitted-value difference at window endpoints
-    endpoint1 = pred[:, idx] - pred[:, 0]
-    endpoint2 = pred[:, -1]  - pred[:, idx]
-    max_dev = max(np.nanmax(np.abs(stage1 - endpoint1)),
-                  np.nanmax(np.abs(stage2 - endpoint2)))
+    xm = m[fin]
+    for t in range(n_grid):
+        col = deriv[fin, t]
+        r[t] = sp.stats.spearmanr(xm, col).statistic
+    return r
 
-    sd1, sd2 = np.nanstd(stage1), np.nanstd(stage2)
-    var1, var2 = np.nanvar(stage1), np.nanvar(stage2)
-    print(f'Stage boundary: age_grid[{idx}] = {age_grid[idx]:.2f} yr (target {inflection_age})')
-    print(f'Stage 1 ({age_grid[0]:.1f}->{age_grid[idx]:.1f} yr): spatial SD = {sd1:.4f}, spatial VAR = {var1:.4f}')
-    print(f'Stage 2 ({age_grid[idx]:.1f}->{age_grid[-1]:.1f} yr): spatial SD = {sd2:.4f}, spatial VAR = {var2:.4f}')
-    print(f'Integral vs endpoint max abs deviation = {max_dev:.2e} '
-          f'(small edge-truncation expected; should be << SD)')
 
-    if sd2 > 0 and sd1 < flat_ratio_thresh * sd2:
-        print(f'WARNING: stage-1 map is near-flat relative to stage-2 '
-              f'(SD ratio = {sd1 / sd2:.2f} < {flat_ratio_thresh}). A spatially flat stage-1 '
-              f'map cannot be expected to correlate with any spatially structured receptor map.')
+def _reduce_deriv_maps(preds, derivs, x_grid, *, orders, maps, keys, method='pearson'):
+    """Per-resample reduction for :func:`bootstrap_deriv_map_corr`.
 
+    Ignores the passed 1st-derivative ``derivs``; recomputes every requested derivative order from
+    ``preds`` via :func:`grid_derivatives` (uniform convention across orders), then correlates each
+    map against each order's regional derivative at every age. Module-level so joblib can pickle it
+    (wrap in ``functools.partial`` to bind orders/maps/keys). Returns ``{f'd{order}|{key}': curve}``.
+    """
+    out = {}
+    for order in orders:
+        d = grid_derivatives(preds, x_grid, order)
+        for i, key in enumerate(keys):
+            out[f'd{order}|{key}'] = compute_deriv_map_corr(d, maps[i], method=method)
+    return out
+
+
+def bootstrap_deriv_map_corr(deflection, age, age_grid, maps, keys, *, orders=(1, 2, 3),
+                             method='pearson', n_splines=4, lam=0.1, demean=True, nuisance=None,
+                             n_boot=200, random_state=None, n_jobs=-1, verbose=True):
+    """Subject-bootstrap CI for corr(brain map x kth GAM derivative)(age), for many maps and orders.
+
+    A single bootstrap of the deflection GAMs (via ``snaplab_tools.gams.bootstrap_gam_fits``) serves
+    every (order, map) pair: each resample refits the regional GAMs once, then :func:`_reduce_deriv_maps`
+    computes all correlation curves from the shared refit. Freeze ``lam``/``n_splines``/``random_state``
+    to the full-sample fit to match a reference bootstrap exactly.
+
+    Parameters
+    ----------
+    deflection : (n_subjects, n_regions) ndarray
+    age : (n_subjects,) ndarray
+    age_grid : (n_grid,) ndarray
+    maps : (n_maps, n_regions) array-like
+        Brain maps, one row per curve.
+    keys : sequence of str
+        Labels for ``maps`` (same length/order); form the returned dict keys.
+    orders : sequence of int
+        Derivative orders to compute (default 1, 2, 3).
+    method : {'pearson', 'spearman'}
+
+    Returns
+    -------
+    dict
+        ``{f'd{order}|{key}': (n_boot, n_grid) ndarray}`` for every order x key.
+    """
+    reduce = functools.partial(_reduce_deriv_maps, orders=tuple(orders),
+                               maps=np.asarray(maps, dtype=float), keys=list(keys), method=method)
+    return bootstrap_gam_fits(deflection, age, age_grid, reduce=reduce, n_boot=n_boot,
+                              n_splines=n_splines, lam=lam, nuisance=nuisance, demean=demean,
+                              random_state=random_state, n_jobs=n_jobs, verbose=verbose)
+
+
+def deriv_map_spatial_null_p(deriv, map_vals, map_surrogates, method='pearson'):
+    """Observed corr(map x derivative)(age) and a pointwise SA-preserving-null two-sided p per age.
+
+    At each age column the observed statistic is the correlation across regions between
+    ``map_vals`` and the regional derivative; the null at that age is the same correlation against
+    every spatial-autocorrelation-preserving surrogate in ``map_surrogates``. The two-sided p is
+    ``(1 + #{|r_null| >= |r_obs|}) / (n_perms + 1)`` per age -- POINTWISE and uncorrected across the
+    (autocorrelated) ages, so it is descriptive "where along age is the coupling spatially specific",
+    not a family-wise claim. One matmul builds the whole null.
+
+    Regions are restricted to those finite in the map, across the whole derivative curve, and across
+    all surrogates, so the returned ``r_obs`` uses exactly the regions the p-values are built on.
+
+    Parameters
+    ----------
+    deriv : (n_regions, n_grid) ndarray
+        Per-region temporal derivative (a single order).
+    map_vals : (n_regions,) ndarray
+    map_surrogates : (n_perms, n_regions) ndarray
+        SA-preserving surrogates of ``map_vals`` (e.g. BrainSMASH).
+    method : {'pearson', 'spearman'}
+        Correlation across regions. 'spearman' rank-transforms the map, every surrogate and every
+        age column ACROSS REGIONS first, then runs the same Pearson machinery -- which is what
+        Spearman is, and keeps the whole null a single matmul. Ranking is done after the finite-
+        region restriction, so ranks run over exactly the regions entering the statistic.
+
+    Returns
+    -------
+    r_obs : (n_grid,) ndarray
+        Observed correlation per age (NaN where < 3 valid regions or a flat derivative column).
+    p_two : (n_grid,) ndarray
+        Pointwise two-sided spatial-null p per age (NaN where r_obs is NaN).
+    """
+    if method not in ('pearson', 'spearman'):
+        raise ValueError(f"method must be 'pearson' or 'spearman'; got {method!r}")
+    deriv = np.asarray(deriv, dtype=float)
+    m     = np.asarray(map_vals, dtype=float)
+    S     = np.asarray(map_surrogates, dtype=float)
+    n_grid  = deriv.shape[1]
+    n_perms = S.shape[0]
+    r_obs = np.full(n_grid, np.nan)
+    p_two = np.full(n_grid, np.nan)
+
+    fin = np.isfinite(m) & np.isfinite(deriv).all(axis=1) & np.isfinite(S).all(axis=0)
+    nv  = int(fin.sum())
+    if nv < 3:
+        return r_obs, p_two
+
+    D  = deriv[fin]                                          # (nv, n_grid)
+    Sv = S[:, fin]                                           # (n_perms, nv)
+    x  = m[fin]
+    if method == 'spearman':
+        # Rank across regions: down the columns of D, along the rows of Sv (and the map itself).
+        # Average ranks for ties, so this equals scipy's spearmanr on every pair.
+        D  = sp.stats.rankdata(D, axis=0)
+        Sv = sp.stats.rankdata(Sv, axis=1)
+        x  = sp.stats.rankdata(x)
+    xz = (x - x.mean()) / x.std()
+    with np.errstate(invalid='ignore', divide='ignore'):
+        Dz = (D - D.mean(axis=0, keepdims=True)) / D.std(axis=0, keepdims=True)
+        Sz = (Sv - Sv.mean(axis=1, keepdims=True)) / Sv.std(axis=1, keepdims=True)
+
+    r_obs  = (xz @ Dz) / nv                                  # (n_grid,)
+    null_r = (Sz @ Dz) / nv                                  # (n_perms, n_grid)
+
+    good = np.isfinite(r_obs)
+    ge   = np.sum(np.abs(null_r[:, good]) >= np.abs(r_obs[good])[None, :], axis=0)
+    p_two[good] = (1 + ge) / (n_perms + 1)
+    r_obs[~good] = np.nan
+    return r_obs, p_two
+
+
+# =============================================================================
+# Regional developmental timing vs the S-A axis (stage-free, bin-free)
+# =============================================================================
+
+def regional_change_timing(pred, x_grid, min_total=1e-8):
+    """Per-region developmental timing: the magnitude-weighted mean age of the GAM rate of change.
+
+    For each region, ``tau = sum(age * |rate|) / sum(|rate|)`` over the age grid, where the rate is
+    the 1st temporal derivative of the region's GAM smooth (via :func:`grid_derivatives`). This is a
+    continuous, stage-free, bin-free summary of *when* a region does its changing (weighted by how
+    fast it changes): larger ``tau`` = later developer. It replaces the discrete stage-2 net-change
+    map / S-A decile enrichment as the regional quantity to correlate against the S-A axis.
+
+    Parameters
+    ----------
+    pred : (n_regions, n_grid) ndarray
+        Per-region GAM smooths evaluated on ``x_grid``.
+    x_grid : (n_grid,) ndarray
+        Evaluation points (ages).
+    min_total : float
+        Flatness guard: regions whose total |rate| falls below this (near-flat, or unfit/all-NaN)
+        return NaN, since their weighted-mean age is not meaningfully defined.
+
+    Returns
+    -------
+    tau : (n_regions,) ndarray
+        Weighted-mean age of change per region (in the units of ``x_grid``); NaN where undefined.
+    """
+    d1  = grid_derivatives(pred, x_grid, 1)          # (n_regions, n_grid)
+    w   = np.abs(d1)
+    tot = np.nansum(w, axis=1)
+    with np.errstate(invalid='ignore', divide='ignore'):
+        tau = np.nansum(w * np.asarray(x_grid, dtype=float)[None, :], axis=1) / tot
+    tau[~np.isfinite(tau) | (tot < min_total)] = np.nan
+    return tau
+
+
+def _corr_stat(a, b, method):
+    fn = sp.stats.spearmanr if method == 'spearman' else sp.stats.pearsonr
+    return fn(a, b).statistic
+
+
+def regional_stage_net_change(pred, x_grid, inflection, stage=2, annualized=False):
+    """Signed net change in the fitted smooth within one developmental stage, per region.
+
+    ``int_stage rate d(age)``, i.e. the fitted value at the end of the stage minus its value at the
+    start. Stage 1 is ``age <= inflection`` and stage 2 is ``age >= inflection`` (the boundary grid
+    point belongs to both, so the two stages tile the grid and their net changes sum to the total).
+
+    With ``annualized=True`` the net change is divided by that stage's duration in years, giving the
+    mean rate of change per year. The divisor is the same constant for every region, so annualisation
+    rescales the map's units without changing its correlation with any other map -- but it does make
+    the two stages comparable to each other, since they span different numbers of years.
+
+    Parameters
+    ----------
+    pred : (n_regions, n_grid) ndarray
+    x_grid : (n_grid,) ndarray
+    inflection : float
+        Stage boundary age (end of stage 1 / start of stage 2).
+    stage : {1, 2}
+        Which side of ``inflection`` to integrate over.
+    annualized : bool
+        If True, divide by the stage duration -> change per year.
+
+    Returns
+    -------
+    (n_regions,) ndarray
+    """
+    if stage not in (1, 2):
+        raise ValueError(f'stage must be 1 or 2, got {stage!r}')
+    d1  = grid_derivatives(pred, x_grid, 1)
+    x   = np.asarray(x_grid, dtype=float)
+    sel = x <= inflection if stage == 1 else x >= inflection
+    if sel.sum() < 2:
+        return np.full(np.asarray(pred).shape[0], np.nan)
+    net = np.trapezoid(d1[:, sel], x[sel], axis=1)
     if annualized:
-        # Convert total net change to an annualized rate (change per year) over each window
-        dur1 = age_grid[idx] - age_grid[0]
-        dur2 = age_grid[-1]  - age_grid[idx]
-        stage1 = stage1 / dur1
-        stage2 = stage2 / dur2
-        print(f'Returning annualized rate of change (net change / stage duration): '
-              f'stage 1 over {dur1:.1f} yr, stage 2 over {dur2:.1f} yr.')
+        dur = x[sel][-1] - x[sel][0]
+        net = net / dur if dur > 0 else np.full_like(net, np.nan)
+    return net
 
-    return stage1, stage2
+
+# Named stage net-change metrics -> (stage, annualized), consumed by :func:`sa_metric_map`.
+STAGE_NET_METRICS = {
+    'early_net':        (1, False),
+    'early_net_annual': (1, True),
+    'late_net':         (2, False),
+    'late_net_annual':  (2, True),
+}
+
+
+def sa_metric_map(name, pred, x_grid, inflection=None):
+    """Dispatch a named regional developmental metric -> (n_regions,) map.
+
+    ``name`` is one of the stage net-change metrics in :data:`STAGE_NET_METRICS` --
+    'early_net_annual' / 'late_net_annual' (:func:`regional_stage_net_change` with
+    ``annualized=True``; the annualised stage-1 / stage-2 net-change maps, the Figure-5 metrics) and
+    their un-annualised 'early_net' / 'late_net' variants -- or 'timing'
+    (:func:`regional_change_timing`). All except 'timing' require ``inflection``. Kept module-level
+    (not a lambda table) so the bootstrap reduce that calls it stays joblib-picklable.
+    """
+    if name in STAGE_NET_METRICS:
+        if inflection is None:
+            raise ValueError(f"inflection is required for the {name!r} metric")
+        stage, annualized = STAGE_NET_METRICS[name]
+        return regional_stage_net_change(pred, x_grid, inflection,
+                                         stage=stage, annualized=annualized)
+    if name == 'timing':
+        return regional_change_timing(pred, x_grid)
+    raise ValueError(f"unknown S-A metric {name!r}")
+
+
+def _reduce_metric_sa(preds, derivs, x_grid, *, metrics, sa_axis_vals, method, inflection):
+    """Per-resample reduction for :func:`bootstrap_metric_sa_corr`: each named metric map and its
+    correlation with the S-A axis. Module-level so joblib can pickle it (bind args via partial)."""
+    out = {}
+    for name in metrics:
+        vec = sa_metric_map(name, preds, x_grid, inflection)
+        fin = np.isfinite(vec) & np.isfinite(sa_axis_vals)
+        r = _corr_stat(vec[fin], sa_axis_vals[fin], method) if fin.sum() >= 3 else np.nan
+        out[f'r|{name}']   = float(r)
+        out[f'map|{name}'] = vec
+    return out
+
+
+def bootstrap_metric_sa_corr(deflection, age, age_grid, sa_axis_vals, *,
+                             metrics=('late_net_annual',), method='spearman', inflection=None,
+                             n_splines=4, lam=0.1, demean=True, nuisance=None, n_boot=200,
+                             random_state=None, n_jobs=-1, verbose=True):
+    """Subject-bootstrap CI for corr(regional developmental metric, S-A axis), for one or more metrics.
+
+    One bootstrap of the regional deflection GAMs serves every metric: each resample refits, then
+    recomputes each metric map and correlates it with the S-A axis. Freeze ``lam``/``n_splines``/
+    ``random_state`` to the full-sample fit to match the reference bootstrap.
+
+    Returns
+    -------
+    dict
+        Per metric ``name``: ``'r|name'`` (n_boot,) correlation distribution and ``'map|name'``
+        (n_boot, n_regions) map distribution. ``inflection`` is required if any stage net-change
+        metric (see :data:`STAGE_NET_METRICS`) is requested.
+    """
+    if any(m in STAGE_NET_METRICS for m in metrics) and inflection is None:
+        raise ValueError('inflection is required when a stage net-change metric '
+                         f'({sorted(STAGE_NET_METRICS)}) is requested')
+    reduce = functools.partial(_reduce_metric_sa, metrics=tuple(metrics),
+                               sa_axis_vals=np.asarray(sa_axis_vals, dtype=float),
+                               method=method, inflection=inflection)
+    return bootstrap_gam_fits(deflection, age, age_grid, reduce=reduce, n_boot=n_boot,
+                              n_splines=n_splines, lam=lam, nuisance=nuisance, demean=demean,
+                              random_state=random_state, n_jobs=n_jobs, verbose=verbose)
+
+
+def sa_decile_change(values, values_boot, sa_axis_vals, n_deciles=10, ci=(2.5, 97.5)):
+    """Mean regional value within each S-A decile, with a subject-bootstrap CI and a p vs 0 per decile.
+
+    Regions are ranked by ``sa_axis_vals`` and split into ``n_deciles`` equal-count bins (decile 1 =
+    lowest S-A / sensorimotor, decile ``n_deciles`` = highest / association). For each decile the
+    point estimate is the mean of ``values`` over its regions; the uncertainty comes from the same
+    per-region bootstrap distribution ``values_boot`` (e.g. the annualised stage-2 net-change map
+    bootstrap), reduced to a decile-mean distribution across resamples. This is a subject-bootstrap
+    test of "is the mean change in this decile above/below 0", not a spatial-enrichment null.
+
+    Parameters
+    ----------
+    values : (n_regions,) ndarray
+        Point-estimate regional map (e.g. annualised stage-2 net change).
+    values_boot : (n_boot, n_regions) ndarray
+        Bootstrap distribution of the same map (subject-resampled GAM refits).
+    sa_axis_vals : (n_regions,) ndarray
+        S-A axis values used to rank/split regions into deciles.
+    n_deciles : int
+    ci : (float, float)
+        Lower/upper percentiles for the bootstrap CI.
+
+    Returns
+    -------
+    dict of (n_deciles,) arrays plus a per-region label vector:
+        'decile' (1..n_deciles), 'mean', 'ci_lo', 'ci_hi', 'p_boot' (two-sided vs 0), 'sig'
+        (CI excludes 0), 'n' (regions per decile), and 'labels' (n_regions,) with each region's
+        decile (0 = excluded: NaN S-A axis).
+    """
+    values = np.asarray(values, dtype=float)
+    vb     = np.asarray(values_boot, dtype=float)
+    sa     = np.asarray(sa_axis_vals, dtype=float)
+
+    valid   = np.isfinite(sa)
+    n_valid = int(valid.sum())
+    order   = np.argsort(np.where(valid, sa, np.inf))       # push NaN-S-A regions to the end
+    labels  = np.zeros(sa.shape[0], dtype=int)
+    edges   = np.linspace(0, n_valid, n_deciles + 1).astype(int)
+    for d in range(n_deciles):
+        labels[order[edges[d]:edges[d + 1]]] = d + 1
+
+    mean = np.full(n_deciles, np.nan); lo = np.full(n_deciles, np.nan)
+    hi   = np.full(n_deciles, np.nan); p  = np.full(n_deciles, np.nan)
+    ns   = np.zeros(n_deciles, dtype=int)
+    for d in range(n_deciles):
+        reg = np.where(labels == d + 1)[0]
+        reg = reg[np.isfinite(values[reg])]
+        ns[d] = reg.size
+        if reg.size == 0:
+            continue
+        mean[d]      = np.nanmean(values[reg])
+        boot_means   = np.nanmean(vb[:, reg], axis=1)        # (n_boot,) decile-mean per resample
+        lo[d], hi[d] = np.nanpercentile(boot_means, ci)
+        frac = min(np.mean(boot_means <= 0), np.mean(boot_means >= 0))
+        p[d] = min(2.0 * frac, 1.0)                          # two-sided bootstrap p vs 0
+
+    sig = (lo > 0) | (hi < 0)
+    return dict(decile=np.arange(1, n_deciles + 1), mean=mean, ci_lo=lo, ci_hi=hi,
+                p_boot=p, sig=sig, n=ns, labels=labels)

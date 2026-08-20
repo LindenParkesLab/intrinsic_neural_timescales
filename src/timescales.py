@@ -1,122 +1,65 @@
 import numpy as np
-import scipy as sp
 import pandas as pd
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, Optional, Any
 from tqdm import tqdm
 from nilearn.glm.first_level import make_first_level_design_matrix
-from scipy.optimize import curve_fit, OptimizeWarning
 from collections import defaultdict
-from joblib import Parallel, delayed
-import statsmodels.api as sm
 
 from src.data import DataLoader, ScanInfo, parse_scan_string, build_scan_string
-from snaplab_tools.signal import apply_frequency_filter
 from snaplab_tools.stats import partial_pearsonr
-# ACF construction and the four generic INT estimators live in snaplab_tools; this module keeps
-# only the estimators the library does not have (robust zero crossing, the exponential tau fits)
-# and the per-scan caching layer around them. compute_acf is re-exported so
-# `from src.timescales import compute_acf` keeps working.
-from snaplab_tools.timescales import (
-    TIMESCALE_METHODS as _LIBRARY_TIMESCALE_METHODS,
-    compute_acf,
-)
+# INT estimation lives entirely in snaplab_tools -- this project defines no estimator of its own.
+# What this module owns is the per-scan caching layer around them
+# (compute_autocorrelation_function / compute_timescale_measures). Import these two from
+# snaplab_tools.timescales directly rather than through here; they are not re-exported.
+from snaplab_tools.timescales import TIMESCALE_METHODS, compute_acf
 import logging
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Project-specific INT estimators
-#
-# Same contract as snaplab_tools.timescales: fn(acf, tr) -> (n_regions,) in seconds,
-# where acf is (n_regions, n_lags). What lives here are the exponential-fit
-# estimators the library does not implement.
-# ---------------------------------------------------------------------------
-
-def tau_from_acf(acf, tr, version='loglin'):
-    """Per-region exponential-decay timescale, fit region by region.
-
-    Parameters
-    ----------
-    acf : (n_regions, n_lags) ndarray
-        Autocorrelation functions.
-    tr : float
-        Repetition time in seconds.
-    version : {'loglin', 'howell'}
-        'loglin' is the log-linear fit in :func:`fit_tau`; 'howell' is the constrained
-        Murray-form curve fit in :func:`fit_acf_exp`.
-
-    Returns
-    -------
-    (n_regions,) ndarray
-        Estimated tau in seconds; NaN for regions whose fit failed.
-    """
-    acf = np.atleast_2d(np.asarray(acf, dtype=float))
-    tau = np.full(acf.shape[0], np.nan)
-
-    for i, row in enumerate(acf):
-        try:
-            if version == 'loglin':
-                tau[i], _ = fit_tau(row, delta=tr)
-            elif version == 'howell':
-                tau[i] = fit_acf_exp(
-                    row, tr=tr,
-                    start_lag=True, exclude_negative=False, exclude_inf=False,
-                    n_over_10_cap=False, max_fit_lag=None,
-                    a_const=True, b_const=True, maxfev=20000,
-                )['tau']
-            else:
-                raise ValueError(f"unknown tau version {version!r}; expected 'loglin' or 'howell'")
-        except ValueError:
-            raise
-        except Exception:
-            tau[i] = np.nan
-
-    return tau
-
-
-def tau_murray_parallel(acf, tr, n_jobs=-1):
-    """Fit the Murray (2014) three-parameter ACF model to every region in parallel.
-
-    Parameters
-    ----------
-    acf : (n_regions, n_lags) ndarray
-        Autocorrelation functions.
-    tr : float
-        Repetition time in seconds.
-    n_jobs : int
-        joblib worker count; -1 uses every CPU.
-
-    Returns
-    -------
-    tau, B : (n_regions,) ndarray
-        Timescale and offset scaling; NaN for regions whose fit failed.
-    """
-    def fit_single_region(acf_single):
-        try:
-            tau, _, B = fit_tau_murray(acf_single, delta=tr)
-            return tau, B
-        except Exception:
-            return np.nan, np.nan
-
-    results = Parallel(n_jobs=n_jobs)(
-        delayed(fit_single_region)(row) for row in np.atleast_2d(acf)
-    )
-    return np.array([r[0] for r in results]), np.array([r[1] for r in results])
-
-
-#: Named INT estimators, each callable as ``fn(acf, tr)``. The library's generic estimators
-#: (zero_crossing, auc_*, decay_time*, lag_one) come straight from snaplab_tools; the rest are
-#: defined above. Keys are stable and used in output filenames, so renaming one orphans its cache.
-TIMESCALE_METHODS = {
-    **_LIBRARY_TIMESCALE_METHODS,
-    'tau':            lambda acf, tr: tau_from_acf(acf, tr, version='loglin'),
-    'tau_howell':     lambda acf, tr: tau_from_acf(acf, tr, version='howell'),
-    'tau_murray_par': lambda acf, tr: tau_murray_parallel(acf, tr, n_jobs=-1)[0],
-    'B_murray_par':   lambda acf, tr: tau_murray_parallel(acf, tr, n_jobs=-1)[1],
-}
-
 
 class Timescales(DataLoader):
+    """Per-scan INT estimation with a disk cache, on top of :class:`~src.data.DataLoader`.
+
+    This class owns the *caching and bookkeeping* around INT estimation, not the estimation
+    itself — every estimator comes from :mod:`snaplab_tools.timescales` (see the module header).
+    What it adds is: a filename convention that encodes every field identifying a scan, so
+    sessions/spaces/runs never collide; load-or-compute-then-save for each scan; and the task-GLM
+    step that produces the residual timeseries the paper's INTs are estimated from.
+
+    A typical run, in order::
+
+        proc = Timescales(dataset='HCP-YA', timeseries_data=ts)
+        proc.regress_task_structure()                       # task scans -> residuals
+        proc.compute_autocorrelation_function(use_residuals=True)
+        proc.compute_timescale_measures(method='auc_zero_crossing')
+
+    Each ``compute_*`` call fills the correspondingly named attribute *and* writes one file per
+    scan, so re-running is cheap and a partially completed run resumes rather than restarts.
+    Pass ``force_recompute=True`` to ignore the cache.
+
+    Attributes
+    ----------
+    timeseries_data : dict or None
+        ``scan_key -> (n_parcels, n_timepoints)``, as passed in.
+    scans : list of str
+        The scan keys, in insertion order.
+    timeseries_residuals, task_events, design_matrices, task_events_acf, task_contrasts : dict
+        Set by :meth:`regress_task_structure`; ``None`` per scan for rest scans and failures.
+    autocorr_dict : dict
+        Set by :meth:`compute_autocorrelation_function`; ``scan_key -> (n_regions, n_lags)``.
+    timescales_dict : dict
+        Set by :meth:`compute_timescale_measures`; ``scan_key -> (n_regions,)`` in seconds.
+    data_dict : dict
+        Set by :meth:`get_precomputed_outputs` when loading results computed in an earlier session.
+
+    Notes
+    -----
+    Output filenames are built by :meth:`_get_output_filepath` from the scan's identifying fields
+    plus an ``output_type`` tag. The tag encodes the processing that produced the file
+    (``_resids``, ``_resampled``, a frequency-filter token), so variants coexist on disk rather
+    than overwriting one another. Renaming a tag orphans its cache.
+    """
+
     def __init__(
         self,
         dataset: str,
@@ -307,35 +250,6 @@ class Timescales(DataLoader):
         except Exception as e:
             logger.warning("Could not load %s: %s", filepath, e)
             return None
-
-    def _check_output_exists(
-        self,
-        subject_id: str,
-        output_type: str,
-        task: str,
-        modality: str,
-        seg: str = None,
-        space: str = None,
-        session: str = None,
-        run: str = None,
-    ) -> bool:
-        """Check if a subject output file already exists."""
-        for suffix in ['.npy', '.npz', '.pkl']:
-            filepath = self._get_output_filepath(
-                subject_id=subject_id,
-                output_type=output_type,
-                task=task,
-                modality=modality,
-                seg=seg,
-                space=space,
-                session=session,
-                run=run,
-                suffix=suffix,
-                mode='load',
-            )
-            if filepath.exists():
-                return True
-        return False
 
     def _parse_scan_string(self, scan_key: str) -> Dict[str, str]:
         """Parse a scan key using key-value format.
@@ -544,7 +458,7 @@ class Timescales(DataLoader):
         Parameters
         ----------
         method : str
-            Key into TIMESCALE_METHODS (e.g. 'zero_crossing', 'tau').
+            Key into TIMESCALE_METHODS (e.g. 'zero_crossing', 'auc_zero_crossing').
         force_recompute : bool
             Ignore cached files and recompute.
         save_outputs : bool
@@ -860,209 +774,7 @@ class Timescales(DataLoader):
             
         self.data_dict = data_dict
 
-    # ==================== Utility Functions ====================
-    def get_min_scan_length_per_subject(self):
-        """Find the shortest scan length (in frames) for each subject.
-
-        Examines all scans in timeseries_data, extracts each scan's number of
-        timepoints, and takes the per-subject minimum. Useful for choosing a
-        truncation length for analyses requiring equal-length timeseries. Results
-        are stored on the instance:
-
-        - self.scan_lengths_df : per-scan DataFrame with columns
-          ['scan_key', 'subject_id', 'task', 'modality', 'condition', 'n_frames'].
-        - self.min_scan_lengths : Series indexed by subject_id, minimum n_frames.
-
-        Raises
-        ------
-        ValueError
-            If timeseries_data is empty or no scan has a determinable length.
-        """
-        if len(self.timeseries_data) == 0:
-            raise ValueError("timeseries_data is empty.")
-        
-        # Collect scan length information
-        scan_info = []
-        
-        for scan_key, timeseries in self.timeseries_data.items():
-            # Parse scan key to extract metadata
-            kv_dict = self._parse_scan_string(scan_key)
-            
-            subject_id = kv_dict.get('sub', '')
-            task = kv_dict.get('task', '')
-            modality = kv_dict.get('modality', '')
-            condition = kv_dict.get('condition', '')
-            
-            # Determine number of frames
-            if timeseries is None:
-                n_frames = None
-            else:
-                try:
-                    if timeseries.ndim == 2:
-                        # Standard format: (n_regions, n_timepoints)
-                        n_frames = timeseries.shape[1]
-                    elif timeseries.ndim == 1:
-                        # Single timeseries: (n_timepoints,)
-                        n_frames = timeseries.shape[0]
-                    else:
-                        # Unexpected dimensionality
-                        n_frames = None
-                except Exception:
-                    n_frames = None
-            
-            scan_info.append({
-                'scan_key': scan_key,
-                'subject_id': subject_id,
-                'task': task,
-                'modality': modality,
-                'condition': condition,
-                'n_frames': n_frames
-            })
-        
-        # Create DataFrame
-        self.scan_lengths_df = pd.DataFrame(scan_info)
-        
-        # Remove scans with None n_frames for aggregation
-        valid_scans = self.scan_lengths_df[self.scan_lengths_df['n_frames'].notna()].copy()
-        
-        if len(valid_scans) == 0:
-            raise ValueError("No valid scans found with determinable lengths.")
-        
-        # Find minimum scan length per subject
-        self.min_scan_lengths = valid_scans.groupby('subject_id')['n_frames'].min()
-        self.min_scan_lengths.name = 'min_n_frames'
-
 # ==================== Standalone Functions ====================
-def fit_tau(acf, delta):
-    """
-    Fast tau estimation without offset (log-linear fit).
-    """
-    k = np.arange(1, len(acf))  # Skip k=0 to avoid log(acf[0])=log(1)=0
-    
-    # Only use positive ACF values
-    mask = acf[k] > 0
-    k_valid = k[mask]
-    acf_valid = acf[k][mask]
-    
-    # Linear fit: log(ACF) = log(A) - k*delta/tau
-    log_acf = np.log(acf_valid)
-    slope, intercept = np.polyfit(k_valid, log_acf, 1)
-    
-    tau = -delta / slope
-    A = np.exp(intercept)
-    
-    return tau, A
-
-def fit_tau_murray(acf, delta):
-    """
-    Fit intrinsic timescale (tau) using Murray et al. 2014 approach.
-    
-    Fits: R(kΔ) = A[exp(-kΔ/τ) + B]
-    which expands to: R(kΔ) = A·exp(-kΔ/τ) + A·B
-    
-    Following Murray et al. 2014, fitting starts at the time lag with maximum 
-    decrease to avoid refractoriness/negative adaptation at short lags.
-    
-    Parameters
-    ----------
-    acf : np.ndarray
-        Normalized autocorrelation function (ACF[0] should be ~1)
-    delta : float
-        Time bin width (e.g., 0.05 for 50ms bins, or TR for fMRI)
-    
-    Returns
-    -------
-    tau : float
-        Intrinsic timescale
-    A : float
-        Amplitude parameter
-    B : float
-        Offset scaling factor (additive offset in model is A·B)
-    
-    Raises
-    ------
-    RuntimeError
-        If curve fitting fails to converge
-    ValueError
-        If ACF is too short or invalid
-    """
-    if len(acf) < 2:
-        raise ValueError("ACF must have at least 2 points")
-    
-    def murray_model(k, A, tau, B):
-        return A * (np.exp(-k * delta / tau) + B)
-    
-    # Find time lag with maximum decrease (Murray et al. 2014)
-    # Maximum decrease = most negative gradient
-    acf_diff = np.diff(acf)
-    start_idx = np.argmin(acf_diff)  # Index with steepest negative slope
-    
-    # Subset ACF from start_idx onward
-    acf_subset = acf[start_idx:]
-    k = np.arange(start_idx, start_idx + len(acf_subset))
-    
-    # Initialize parameters
-    # Tau: find where ACF drops to ~0.4 in the subset
-    tau_init_idx = np.where(acf_subset < 0.4)[0]
-    if len(tau_init_idx) > 0:
-        tau_init = tau_init_idx[0] * delta
-    else:
-        tau_init = len(acf_subset) * delta / 4
-    
-    # Ensure tau_init is reasonable
-    tau_init = max(tau_init, delta)  # At least one time bin
-    
-    # A: approximate from ACF at start (assuming small B)
-    A_init = acf_subset[0] / (1 + 0.1)
-    A_init = max(A_init, 0.1)  # Ensure positive
-    
-    # B: small positive value
-    B_init = 0.1
-    
-    p0 = [A_init, tau_init, B_init]
-    bounds = ([0, delta/10, -0.5], [2, np.inf, 0.5])
-    
-    try:
-        popt, _ = curve_fit(
-            murray_model, k, acf_subset, 
-            p0=p0, bounds=bounds, maxfev=5000
-        )
-        A, tau, B = popt
-        return tau, A, B
-        
-    except (RuntimeError, ValueError) as e:
-        raise RuntimeError(
-            f"Failed to fit Murray model: {str(e)}. "
-            f"ACF range: [{acf.min():.3f}, {acf.max():.3f}], "
-            f"Start index: {start_idx}/{len(acf)}, "
-            f"Initial params: A={A_init:.3f}, tau={tau_init:.3f}, B={B_init:.3f}"
-        )
-
-def get_acf_time_index(time_window=25, tr=None):
-    """
-    Returns the slice endpoint for an ACF array to cover a specified time window.
-    
-    Parameters
-    ----------
-    time_window : float, optional
-        Length of time to return in seconds (default: 25)
-    tr : float
-        Repetition time in seconds
-        
-    Returns
-    -------
-    int
-        Slice endpoint (use as acf[:endpoint] to get lags 0 to n)
-    """
-    if tr is None:
-        raise ValueError("TR must be provided")
-    
-    max_lag = int(time_window / tr)
-    return max_lag + 1
-
-
-
-
 def create_design_matrix_nilearn(
     events,
     n_timepoints,
@@ -1170,88 +882,6 @@ def fit_glm(data, design_matrix):
     
     return residuals, predicted, betas
 
-def fit_exponential_decay(lags, acf):
-    """Fit an exponential decay ACF(t) = exp(-t / tau) by log-linear regression.
-
-    Fits log(ACF) = -t / tau + const over positive ACF values up to the first
-    zero crossing (lag 0 excluded), following Gao et al. 2020.
-
-    Parameters
-    ----------
-    lags : ndarray
-        Lag times (seconds), same length as acf.
-    acf : ndarray
-        Autocorrelation values (acf[0] ~ 1).
-
-    Returns
-    -------
-    tau : float
-        Estimated timescale, or NaN if the fit failed or the slope was non-negative.
-    fit_info : dict
-        Fit diagnostics (slope, intercept, r_squared, n_points, error, ...).
-    """
-    
-    # Find first zero crossing to limit fit range (positive ACF only)
-    negative_idx = np.where(acf <= 0)[0]
-    if len(negative_idx) > 0:
-        end_idx = negative_idx[0]
-    else:
-        end_idx = len(acf)
-    
-    # Exclude lag 0 and fit only positive values
-    start_idx = 1  # Skip lag 0 (ACF=1)
-    lags_fit = lags[start_idx:end_idx]
-    acf_fit = acf[start_idx:end_idx]
-    
-    # Remove any remaining non-positive values
-    valid_idx = acf_fit > 0
-    lags_fit = lags_fit[valid_idx]
-    acf_fit = acf_fit[valid_idx]
-    
-    # lags_fit = lags[1:]
-    # acf_fit = acf[1:]
-    
-    try:
-        # Linear fit in log space: log(ACF) = -t/tau + const
-        # So slope = -1/tau, therefore tau = -1/slope
-        slope, intercept, r_value, p_value, std_err = sp.stats.linregress(lags_fit, np.log(acf_fit))
-        
-        if slope >= 0:
-            # Non-decaying or increasing ACF - invalid
-            tau = np.nan
-            error = 'positive_slope'
-        else:
-            tau = -1 / slope
-            error = None
-        
-        fit_info = {
-            'tau': tau,
-            'slope': slope,
-            'intercept': intercept,
-            'r_squared': r_value**2,
-            'p_value': p_value,
-            'std_err': std_err,
-            'n_points': len(lags_fit),
-            'fit_range': [lags_fit[0], lags_fit[-1]],
-            'lags_fit': lags_fit,
-            'acf_fit': acf_fit,
-            'log_acf_fit': np.log(acf_fit),
-            'error': error
-        }
-    except (ValueError, RuntimeWarning) as e:
-        # Fitting failed (e.g., log of negative numbers)
-        tau = np.nan
-        fit_info = {
-            'tau': np.nan,
-            'r_squared': np.nan,
-            'n_points': len(lags_fit),
-            'fit_range': [lags_fit[0] if len(lags_fit) > 0 else np.nan, 
-                         lags_fit[-1] if len(lags_fit) > 0 else np.nan],
-            'error': f'fitting_failed: {str(e)}'
-        }
-    
-    return tau, fit_info
-
 def calculate_tsnr(timeseries_matrix):
     """
     Calculate temporal signal-to-noise ratio (tSNR) for ROI timeseries data.
@@ -1283,231 +913,6 @@ def calculate_tsnr(timeseries_matrix):
         tsnr = mean_signal / std_signal
     
     return tsnr
-
-def fit_acf_exp(acf_vals, tr,
-                a_const=False, b_const=False,
-                exclude_negative=True, exclude_inf=True,
-                max_fit_lag=None, n_over_10_cap=False, start_lag=False,
-                p0=(2.0, 1.0, 0.0),
-                bounds=None, maxfev=20000):
-    """
-    Murray-style intrinsic timescale fit.
-
-    Model (Murray form):
-        R(kΔ) = A * (exp(-kΔ / tau) + B)
-
-    where:
-        - Δ is TR in seconds
-        - k is the absolute lag index: k = start_idx, start_idx+1, ...
-        - B is Murray's B (inside parentheses); additive offset is A*B
-
-    Parameters
-    ----------
-    acf_vals : array-like
-        1D array of ACF values, where acf_vals[0] should be ~1 (normalized).
-    tr : float
-        Repetition time in seconds (Δ in the model equation).
-    a_const : bool, default=False
-        If True, fix A = 1 and do not fit it.
-    b_const : bool, default=False
-        If True, fix B = 0 and do not fit it.
-    exclude_negative : bool, default=True
-        If True, truncate at first lag with acf <= 0.
-    exclude_inf : bool, default=True
-        If True, exclude non-finite acf values (nan/inf).
-    max_fit_lag : int, optional
-        If provided, fit only up to this absolute lag index (inclusive).
-        E.g., max_fit_lag=20 means fit through lag 20 regardless of start_lag.
-    n_over_10_cap : bool, default=True
-        If True, additionally cap fit to N//10 lags (stability heuristic),
-        where N = len(acf_vals) - 1.
-    start_lag : bool or int, default=False
-        Starting lag index for fit:
-        - False or None: start at lag 1
-        - True: start_idx = argmin(diff(acf)) (Murray heuristic)
-        - int: explicit start lag index
-    p0 : tuple, default=(2.0, 1.0, 0.0)
-        Initial guesses in order (tau, A, B). Ignored for fixed parameters.
-    bounds : tuple, optional
-        Bounds for parameters passed to curve_fit. If None, reasonable defaults used.
-    maxfev : int, default=20000
-        Max function evaluations for curve_fit.
-
-    Returns
-    -------
-    result : dict
-        {
-          "tau": float,
-          "A": float,
-          "B": float,
-          "success": bool,
-          "start_idx": int,
-          "n_points": int,
-          "lags_used": np.ndarray,
-          "acf_used": np.ndarray
-        }
-    """
-    # Input validation
-    acf = np.asarray(acf_vals, dtype=float)
-    if acf.ndim != 1 or acf.size < 2:
-        return {
-            "tau": np.nan, "A": np.nan, "B": np.nan, "success": False,
-            "start_idx": None, "n_points": 0, 
-            "lags_used": np.array([]), "acf_used": np.array([])
-        }
-    
-    tr = float(tr)
-    if tr <= 0:
-        raise ValueError(f"tr must be positive, got {tr}")
-
-    # Determine start index
-    if start_lag is True:
-        start_idx = int(np.argmin(np.diff(acf)))
-    elif start_lag is False or start_lag is None:
-        start_idx = 1
-    else:
-        start_idx = max(0, int(start_lag))
-
-    if start_idx >= acf.size:
-        return {
-            "tau": np.nan, "A": np.nan, "B": np.nan, "success": False,
-            "start_idx": start_idx, "n_points": 0,
-            "lags_used": np.array([]), "acf_used": np.array([])
-        }
-
-    # Extract subset starting from start_idx with absolute lag indices
-    acf_subset = acf[start_idx:].copy()
-    k = np.arange(start_idx, start_idx + acf_subset.size, dtype=float)
-
-    # Clean: exclude negative values
-    if exclude_negative:
-        bad = np.where(acf_subset <= 0)[0]
-        if bad.size > 0:
-            cut = int(bad[0])
-            if cut == 0:
-                return {
-                    "tau": np.nan, "A": np.nan, "B": np.nan, "success": False,
-                    "start_idx": start_idx, "n_points": 0,
-                    "lags_used": np.array([]), "acf_used": np.array([])
-                }
-            acf_subset = acf_subset[:cut]
-            k = k[:cut]
-
-    # Clean: exclude non-finite values
-    if exclude_inf:
-        m = np.isfinite(acf_subset)
-        acf_subset = acf_subset[m]
-        k = k[m]
-
-    if acf_subset.size < 3:
-        return {
-            "tau": np.nan, "A": np.nan, "B": np.nan, "success": False,
-            "start_idx": start_idx, "n_points": int(acf_subset.size),
-            "lags_used": k, "acf_used": acf_subset
-        }
-
-    # Apply fitting caps
-    cap_points = None
-
-    # Cap based on absolute max_fit_lag
-    if max_fit_lag is not None:
-        max_fit_lag = int(max_fit_lag)
-        if max_fit_lag < start_idx:
-            # max_fit_lag is before our start point - no data to fit
-            return {
-                "tau": np.nan, "A": np.nan, "B": np.nan, "success": False,
-                "start_idx": start_idx, "n_points": 0,
-                "lags_used": np.array([]), "acf_used": np.array([])
-            }
-        # Convert absolute lag to number of points from start_idx
-        cap_points = max(2, max_fit_lag - start_idx + 1)
-
-    # Cap based on N//10 heuristic (total ACF length)
-    if n_over_10_cap:
-        N = acf.size - 1
-        cap_n10 = max(2, (N // 10) + 1)
-        cap_points = cap_n10 if cap_points is None else min(cap_points, cap_n10)
-
-    # Apply the cap
-    if cap_points is not None and acf_subset.size > cap_points:
-        acf_subset = acf_subset[:cap_points]
-        k = k[:cap_points]
-
-    # Prepare bounds
-    if bounds is None:
-        tau_lo = tr / 10.0
-        if (not a_const) and (not b_const):
-            bounds_use = ([0.0, tau_lo, -0.5], [2.0, np.inf, 0.5])  # (A, tau, B)
-        elif a_const and (not b_const):
-            bounds_use = ([tau_lo, -0.5], [np.inf, 0.5])            # (tau, B)
-        elif (not a_const) and b_const:
-            bounds_use = ([0.0, tau_lo], [2.0, np.inf])             # (A, tau)
-        else:
-            bounds_use = ([tau_lo], [np.inf])                       # (tau)
-    else:
-        bounds_use = bounds
-
-    # Fit the model
-    tau0, A0, B0 = p0
-
-    try:
-        if (not a_const) and (not b_const):
-            def model(k, A, tau, B):
-                return A * (np.exp(-k * tr / tau) + B)
-            p0_use = [A0, tau0, B0]
-            popt, _ = curve_fit(model, k, acf_subset, p0=p0_use, 
-                               bounds=bounds_use, maxfev=maxfev)
-            A_hat, tau_hat, B_hat = popt
-
-        elif a_const and (not b_const):
-            def model(k, tau, B):
-                return (np.exp(-k * tr / tau) + B)
-            p0_use = [tau0, B0]
-            popt, _ = curve_fit(model, k, acf_subset, p0=p0_use, 
-                               bounds=bounds_use, maxfev=maxfev)
-            tau_hat, B_hat = popt
-            A_hat = 1.0
-
-        elif (not a_const) and b_const:
-            def model(k, A, tau):
-                return A * np.exp(-k * tr / tau)
-            p0_use = [A0, tau0]
-            popt, _ = curve_fit(model, k, acf_subset, p0=p0_use, 
-                               bounds=bounds_use, maxfev=maxfev)
-            A_hat, tau_hat = popt
-            B_hat = 0.0
-
-        else:  # Both A and B constant
-            def model(k, tau):
-                return np.exp(-k * tr / tau)
-            p0_use = [tau0]
-            popt, _ = curve_fit(model, k, acf_subset, p0=p0_use, 
-                               bounds=bounds_use, maxfev=maxfev)
-            tau_hat = popt[0]
-            A_hat, B_hat = 1.0, 0.0
-
-        return {
-            "tau": float(tau_hat),
-            "A": float(A_hat),
-            "B": float(B_hat),
-            "success": True,
-            "start_idx": start_idx,
-            "n_points": int(acf_subset.size),
-            "lags_used": k,
-            "acf_used": acf_subset
-        }
-
-    except (RuntimeError, ValueError, OptimizeWarning):
-        return {
-            "tau": np.nan,
-            "A": (1.0 if a_const else np.nan),
-            "B": (0.0 if b_const else np.nan),
-            "success": False,
-            "start_idx": start_idx,
-            "n_points": int(acf_subset.size),
-            "lags_used": k,
-            "acf_used": acf_subset
-        }
 
 # ==================== Standalone Utility Functions (for use in notebooks) ====================
 def compute_deflections(rest_timescales, task_timescales, absolute=False):
@@ -1557,94 +962,6 @@ def compute_deflections(rest_timescales, task_timescales, absolute=False):
     return np.abs(int_deflections) if absolute else int_deflections
 
 
-def compute_deflections_glm(rest_timescales, task_timescales, features, standardize=False):
-    """Regress task timescales on each feature plus rest timescales (per feature).
-
-    For each column of features, fits OLS task ~ const + feature + rest and reports
-    the feature coefficient and stats. Also returns partial residuals of task and
-    feature after removing rest (for residual scatter plots).
-
-    Parameters
-    ----------
-    rest_timescales, task_timescales : array-like
-        Per-region timescale vectors (n_regions,). Series are converted to arrays.
-    features : pd.Series, pd.DataFrame, or ndarray
-        One or more region-wise predictors; each column is modelled separately.
-    standardize : bool
-        Z-score rest, task, and each feature before fitting.
-
-    Returns
-    -------
-    dict
-        feature_name -> dict of model, coef, pvalue, tstat, conf_int, r_squared,
-        r_squared_adj, task_partial_resid, feature_partial_resid, valid_mask.
-    """
-    if isinstance(rest_timescales, pd.Series):
-        rest_timescales = rest_timescales.to_numpy()
-    if isinstance(task_timescales, pd.Series):
-        task_timescales = task_timescales.to_numpy()
-
-    rest_timescales = np.asarray(rest_timescales, dtype=float)
-    task_timescales = np.asarray(task_timescales, dtype=float)
-
-    if standardize:
-        rest_timescales = (rest_timescales - np.nanmean(rest_timescales)) / np.nanstd(rest_timescales)
-        task_timescales = (task_timescales - np.nanmean(task_timescales)) / np.nanstd(task_timescales)
-
-    n_regions = len(rest_timescales)
-
-    if isinstance(features, pd.Series):
-        features = features.to_frame()
-    elif isinstance(features, np.ndarray):
-        if features.ndim == 1:
-            features = pd.DataFrame(features, columns=['feature_0'])
-        else:
-            features = pd.DataFrame(features, columns=[f'feature_{i}' for i in range(features.shape[1])])
-
-    results = {}
-
-    for feature_name in features.columns:
-        feature_vals = features[feature_name].to_numpy().astype(float)
-
-        if standardize:
-            feature_vals = (feature_vals - np.nanmean(feature_vals)) / np.nanstd(feature_vals)
-
-        valid_mask = ~(np.isnan(rest_timescales) | np.isnan(task_timescales) | np.isnan(feature_vals))
-
-        rest_valid = rest_timescales[valid_mask]
-        task_valid = task_timescales[valid_mask]
-        feature_valid = feature_vals[valid_mask]
-
-        X = sm.add_constant(np.column_stack((feature_valid, rest_valid)))
-        y = task_valid
-
-        model = sm.OLS(y, X).fit()
-
-        X_rest = sm.add_constant(rest_valid)
-        task_resid_valid = sm.OLS(task_valid, X_rest).fit().resid
-        feature_resid_valid = sm.OLS(feature_valid, X_rest).fit().resid
-
-        task_resid = np.full(n_regions, np.nan)
-        feature_resid = np.full(n_regions, np.nan)
-        task_resid[valid_mask] = task_resid_valid
-        feature_resid[valid_mask] = feature_resid_valid
-
-        results[feature_name] = {
-            'model':                 model,
-            'coef':                  model.params[1],
-            'pvalue':                model.pvalues[1],
-            'tstat':                 model.tvalues[1],
-            'conf_int':              model.conf_int()[1],
-            'r_squared':             model.rsquared,
-            'r_squared_adj':         model.rsquared_adj,
-            'task_partial_resid':    task_resid,
-            'feature_partial_resid': feature_resid,
-            'valid_mask':            valid_mask,
-        }
-
-    return results
-
-
 def compute_regional_corrs(rest_data, task_data, behavior_data,
                            covariate=None, absolute=False, verbose=False, return_pval=False):
     """Correlate rest, task, and deflection timescales with a behavior, per region.
@@ -1661,18 +978,22 @@ def compute_regional_corrs(rest_data, task_data, behavior_data,
     behavior_data : ndarray
         (n_subjects,) behavioral values.
     covariate : ndarray or None
-        (n_subjects,) subject-level covariate. When given, every correlation becomes a
-        partial correlation controlling for it (df = n - 3).
+        (n_subjects,) or (n_subjects, k) subject-level covariates. When given, every
+        correlation becomes a partial correlation controlling for them (df = n - 2 - k).
+        Build the matrix with src.gams.build_nuisance so fig2 and fig3/fig4 keep one
+        definition of the nuisance set.
 
-        Intended use is each subject's MEAN rest INT, np.nanmean(rest_data, axis=1) —
-        one scalar per subject, constant across regions, so it removes global INT
-        differences without reshaping the regional map. This matches the nuisance
-        covariate used by fig4's GAMs.
+        Every column must be SUBJECT-level — one value per subject, constant across
+        regions — e.g. mean rest INT (np.nanmean(rest_data, axis=1)), age, sex, head
+        motion. Such a covariate removes a global confound without reshaping the regional
+        map the S-A test then reads.
 
         Do NOT pass a region-specific rest vector. rest_data[:, r] carries the S-A
         gradient, so regressing it out strips the S-A structure these correlations are
         used to test — empirically it collapses fig2's S-A coupling from r ~ +0.56 to
-        r ~ -0.18 (see the diagnostics cell in timescales_analysis_fig2.ipynb).
+        r ~ -0.18 (see the diagnostics cell in timescales_analysis_fig2.ipynb). That
+        mistake is shape-legal, so no check here can catch it; passing the whole
+        (n_subjects, n_regions) matrix IS caught.
     absolute : bool
         Use |task - rest| instead of the signed deflection (see compute_deflections).
     verbose : bool
@@ -1704,11 +1025,17 @@ def compute_regional_corrs(rest_data, task_data, behavior_data,
     covariate_clean = None
     if covariate is not None:
         covariate = np.asarray(covariate, dtype=float)
-        if covariate.shape != behavior_data.shape:
+        if covariate.ndim not in (1, 2) or covariate.shape[0] != behavior_data.shape[0]:
             raise ValueError(
-                f"covariate must be one value per subject, matching behavior_data "
-                f"{behavior_data.shape}; got {covariate.shape}. Pass a subject-level "
-                f"scalar such as np.nanmean(rest_data, axis=1), not a regional vector."
+                f"covariate must be (n_subjects,) or (n_subjects, k) matching behavior_data "
+                f"{behavior_data.shape}; got {covariate.shape}. Pass subject-level values "
+                f"such as np.nanmean(rest_data, axis=1), age or sex — not a regional vector."
+            )
+        if covariate.ndim == 2 and covariate.shape[1] == n_regions:
+            raise ValueError(
+                f"covariate has one column per region ({n_regions}), so it looks like a whole "
+                f"regional matrix rather than subject-level covariates. Regressing out "
+                f"region-wise rest INT strips the S-A structure these correlations test."
             )
         covariate_clean = covariate[beh_valid]
 

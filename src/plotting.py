@@ -1,3 +1,4 @@
+import os
 import warnings
 
 import numpy as np
@@ -12,7 +13,10 @@ import matplotlib.patches as mpatches
 from matplotlib.colors import Normalize
 from matplotlib.cm import ScalarMappable
 
-from snaplab_tools.plotting.utils import create_sydnor_sa_colormap, determine_significance
+from snaplab_tools.plotting.utils import (make_diverging_cmap,
+                                          make_sequential_cmap, register_custom_colormaps,
+                                          show_colormaps, cvd_min_delta_e)
+from snaplab_tools.stats import significance_stars
 
 try:
     import adjustText
@@ -20,135 +24,102 @@ except ImportError:  # optional; scatter labels fall back to no repulsion
     adjustText = None
 
 
-def plot_autocorrelation_analysis(autocorr_raw, autocorr_resid, zero_crossings_raw, zero_crossings_resid, tr,
-                                  max_lag=None, n_example_voxels=5, figsize=(12.5, 5), save_path=None, dpi=300):
-    """Plot autocorrelation analysis results (mean ACF, example voxels, INT histogram).
+def setup_notebook_style():
+    """Apply the project's matplotlib settings. Call once at the top of a figure notebook.
+
+    Six notebooks each carried an identical ``plt.rcParams.update({...})`` block; this is that
+    block, once.
+
+    Deliberately *not* built on ``snaplab_tools.plotting.utils.set_plotting_params``: that
+    function calls ``sns.set_theme()``, which rewrites rcParams wholesale including the colour
+    cycle, and would change the appearance of any panel that relies on matplotlib's default
+    colours. The submission-critical part of it -- Type-42 (editable) PDF/PS fonts, and
+    ``svg.fonttype='none'`` so SVG text stays text -- is reproduced here instead.
+    """
+    plt.rcParams.update({
+        'font.size':         8,
+        'figure.dpi':        300,
+        'svg.fonttype':      'none',    # keep SVG text editable in Illustrator
+        'pdf.fonttype':      42,        # Type 42 = editable text, not outlines
+        'ps.fonttype':       42,
+        'font.family':       'sans-serif',
+        'font.sans-serif':   ['Roboto'],
+        'axes.spines.top':   False,
+        'axes.spines.right': False,
+    })
+
+
+# ── Figure export convention ────────────────────────────────────────────────────────────────────
+# save_panel and its DPI constants now live in snaplab_tools.plotting.utils -- the convention is
+# not project-specific. Only the scratch location below is.
+#: Root of the figure scratch tree; see :func:`figure_scratch_dir`.
+FIGURE_SCRATCH_BASE = '/mnt/lindenmp_nas/lindenmp/work/figure_scratch/intrinsic_neural_timescales'
+
+
+def annotate_significance_brackets(ax, pairs, labels, y0=None, y_step=None,
+                                   tick_frac=0.02, text_pad_frac=0.0,
+                                   line_width=0.8, color='black', fontsize=7,
+                                   expand_ylim=True):
+    """Draw stacked significance brackets between pairs of categorical x-positions.
+
+    Vendored into this project from snaplab_tools (the function was removed there when
+    statistics/plotting were consolidated). Each bracket is a flat-topped line spanning two
+    x-positions with a label (e.g. ``'***'``, ``'ns'``) centered above it. Brackets are stacked
+    bottom-to-top in the order given, so pass them shortest-span-first to avoid overlap.
 
     Parameters
     ----------
-    autocorr_raw : (n_voxels, n_lags) ndarray
-        Autocorrelation before task removal.
-    autocorr_resid : (n_voxels, n_lags) ndarray
-        Autocorrelation after task removal.
-    zero_crossings_raw : (n_voxels,) ndarray
-        First zero-crossing indices before removal; may contain NaNs.
-    zero_crossings_resid : (n_voxels,) ndarray
-        First zero-crossing indices after removal; may contain NaNs.
-    tr : float
-        Repetition time in seconds.
-    max_lag : int or None
-        Maximum lag to plot (in timepoints); defaults to the largest zero-crossing.
-    n_example_voxels : int
-        Number of example voxel ACF curves to show.
-    figsize : tuple
-        Figure size.
-    save_path : str or None
-        If given, save the figure to this path.
-    dpi : int
-        Resolution for the saved figure.
+    ax : matplotlib.axes.Axes
+        Target axes with a categorical x-axis (integer positions 0..n-1, as
+        produced by seaborn violin/box plots).
+    pairs : sequence of (float, float)
+        (x1, x2) index positions to connect, one per bracket.
+    labels : sequence of str
+        Text centered above each bracket; same length and order as ``pairs``.
+    y0 : float or None
+        Data-y of the lowest bracket. Defaults to the current top ylim, which
+        already clears any data/annotations drawn so far.
+    y_step : float or None
+        Vertical gap (data units) between successive brackets. Defaults to 8% of
+        the current y-range.
+    tick_frac : float, default=0.02
+        Length of the downward end-ticks, as a fraction of the y-range.
+    text_pad_frac : float, default=0.0
+        Gap between a bracket line and its label, as a fraction of the y-range.
+    line_width, color, fontsize : styling of the brackets and labels.
+    expand_ylim : bool, default=True
+        Raise the top ylim so the tallest bracket and its label fit.
 
     Returns
     -------
-    fig : matplotlib Figure
+    ax : matplotlib.axes.Axes
     """
-    
-    # Limit the lag range for plotting
-    if max_lag is None:
-        max_lag = int(np.nanmax((np.nanmax(zero_crossings_resid), np.nanmax(zero_crossings_raw))))
-    # max_lag = min(max_lag, autocorr_raw.shape[1])
-    lag_times = np.arange(max_lag) * tr  # Convert to seconds
-    
-    # Create figure with subplots
-    fig, axes = plt.subplots(1, 3, figsize=figsize)
-    fig.suptitle('fMRI Autocorrelation Analysis Results (using nilearn)', fontsize=16, fontweight='bold')
-    
-    # Plot 1: Average ACF comparison (before vs after)
-    ax1 = axes[0]
-    mean_acf_raw = np.nanmean(autocorr_raw[:, :max_lag], axis=0)
-    mean_acf_resid = np.nanmean(autocorr_resid[:, :max_lag], axis=0)
-    std_acf_raw = np.nanstd(autocorr_raw[:, :max_lag], axis=0)
-    std_acf_resid = np.nanstd(autocorr_resid[:, :max_lag], axis=0)
-    
-    ax1.plot(lag_times, mean_acf_raw, 'b-', linewidth=2, label='Before task removal', alpha=0.8)
-    ax1.fill_between(lag_times, mean_acf_raw - std_acf_raw, mean_acf_raw + std_acf_raw, 
-                     color='blue', alpha=0.2)
-    
-    ax1.plot(lag_times, mean_acf_resid, 'r-', linewidth=2, label='After task removal', alpha=0.8)
-    ax1.fill_between(lag_times, mean_acf_resid - std_acf_resid, mean_acf_resid + std_acf_resid, 
-                     color='red', alpha=0.2)
-    
-    ax1.axhline(y=0, color='k', linestyle='--', alpha=0.5)
-    ax1.set_xlabel('Lag (seconds)')
-    ax1.set_ylabel('Autocorrelation')
-    ax1.set_title('Mean Autocorrelation Function\n(±1 SD across voxels)')
-    ax1.legend()
-    ax1.grid(True, alpha=0.3)
-    
-    # Plot 2: Example individual voxel ACF curves
-    ax2 = axes[1]
-    n_voxels = autocorr_raw.shape[0]
-    
-    # Find valid (non-NaN) voxels for example plotting
-    valid_voxels_mask = ~(np.isnan(zero_crossings_raw) | np.isnan(zero_crossings_resid))
-    valid_indices = np.where(valid_voxels_mask)[0]
-    
-    if len(valid_indices) > 0:
-        # Select evenly spaced examples from valid voxels
-        n_examples = min(n_example_voxels, len(valid_indices))
-        example_indices = valid_indices[np.linspace(0, len(valid_indices)-1, n_examples, dtype=int)]
-        
-        colors = plt.cm.Set1(np.linspace(0, 1, n_examples))
-        for i, voxel_idx in enumerate(example_indices):
-            ax2.plot(lag_times, autocorr_raw[voxel_idx, :max_lag], '--', 
-                    color=colors[i], alpha=0.6, linewidth=1)
-            ax2.plot(lag_times, autocorr_resid[voxel_idx, :max_lag], '-', 
-                    color=colors[i], alpha=0.8, linewidth=2, 
-                    label=f'Voxel {voxel_idx}')
-        ax2.legend(fontsize=8)
-    else:
-        ax2.text(0.5, 0.5, 'No valid voxels', ha='center', va='center', transform=ax2.transAxes)
-    
-    ax2.axhline(y=0, color='k', linestyle='--', alpha=0.5)
-    ax2.set_xlabel('Lag (seconds)')
-    ax2.set_ylabel('Autocorrelation')
-    ax2.set_title(f'Example Individual Voxel ACF\n(dashed=before, solid=after)')
-    ax2.grid(True, alpha=0.3)
-        
-    # Plot 3: Zero-crossing distribution
-    ax3 = axes[2]
-    
-    # Filter out NaN values for histogram
-    valid_raw = zero_crossings_raw[~np.isnan(zero_crossings_raw)]
-    valid_resid = zero_crossings_resid[~np.isnan(zero_crossings_resid)]
-    
-    if len(valid_raw) > 0:
-        zero_crossings_seconds = valid_raw * tr
-        ax3.hist(zero_crossings_seconds, bins=20, alpha=0.7, color='b', edgecolor='black', label='Before')
-        ax3.axvline(np.nanmean(zero_crossings_seconds), color='b', linestyle='--', linewidth=2,
-                   label=f'Mean (before): {np.nanmean(zero_crossings_seconds):.1f}s')
-    
-    if len(valid_resid) > 0:
-        zero_crossings_seconds = valid_resid * tr
-        ax3.hist(zero_crossings_seconds, bins=20, alpha=0.7, color='r', edgecolor='black', label='After')
-        ax3.axvline(np.nanmean(zero_crossings_seconds), color='r', linestyle='--', linewidth=2,
-                   label=f'Mean (after): {np.nanmean(zero_crossings_seconds):.1f}s')
-    
-    if len(valid_raw) == 0 and len(valid_resid) == 0:
-        ax3.text(0.5, 0.5, 'No valid zero-crossings', ha='center', va='center', transform=ax3.transAxes)
-    
-    ax3.set_xlabel('INTs (seconds)')
-    ax3.set_ylabel('Number of Voxels')
-    ax3.set_title('Distribution of INTs')
-    ax3.legend()
-    ax3.grid(True, alpha=0.3)
-    
-    plt.tight_layout()
-    
-    # Save figure if path provided
-    if save_path:
-        plt.savefig(save_path, dpi=dpi, bbox_inches='tight', facecolor='white', edgecolor='none')
+    if len(pairs) != len(labels):
+        raise ValueError("`pairs` and `labels` must have the same length")
 
-    return fig
+    ymin, ymax = ax.get_ylim()
+    yr = ymax - ymin
+    if y0 is None:
+        y0 = ymax
+    if y_step is None:
+        y_step = 0.08 * yr
+    tick = tick_frac * yr
+
+    top = y0
+    for k, ((x1, x2), label) in enumerate(zip(pairs, labels)):
+        y = y0 + k * y_step
+        ax.plot([x1, x1, x2, x2], [y - tick, y, y, y - tick],
+                lw=line_width, color=color, clip_on=False)
+        ax.text((x1 + x2) / 2, y + text_pad_frac * yr, label,
+                ha='center', va='bottom', color=color, fontsize=fontsize,
+                clip_on=False)
+        top = y
+
+    if expand_ylim:
+        ax.set_ylim(ymin, max(ymax, top + 0.05 * yr))
+
+    return ax
+
 
 
 def plot_repeated_measures_violins(df, ax, color_vector=None, colormap='viridis',
@@ -464,7 +435,7 @@ def plot_subject_level_violins(df, ax, observation_indices,
     if n_observations == 1:
         observation_colors = ['#FFA500']  # Soft orange
     else:
-        sydnor_sa_cmap = create_sydnor_sa_colormap()
+        sydnor_sa_cmap = register_custom_colormaps()['snap_sydnor_sa']
         observation_colors = [
             sydnor_sa_cmap(i / (n_observations - 1)) 
             for i in range(n_observations)
@@ -759,566 +730,424 @@ def plot_subject_level_violins(df, ax, observation_indices,
         return ax
 
 
-def plot_subject_timeseries_heatmap(raw_data, scan_string,
-                                    residual_data=None, design_matrix=None,
-                                    figsize=None,
-                                    cmap='RdBu_r', vmin=None, vmax=None,
-                                    time_units='minutes', tr=None,
-                                    title_prefix="Neural Time Series",
-                                    save_path=None, dpi=300):
-    """Plot a subject's neural timeseries as heatmaps, optionally with task-regression rows.
+# =============================================================================
+# Task-regression worked example (supplementary)
+# =============================================================================
 
-    With residual_data and design_matrix, produces 5 rows (raw, task-regressed
-    residuals, task signal = raw - residual, its variance across regions, and the
-    design matrix); otherwise a single raw-timeseries row.
+def _task_block_spans(events, tr, n_timepoints=None):
+    """Merge a BIDS events table into contiguous (start, end) spans in timepoint units.
+
+    For shading task blocks behind a plotted time series. Overlapping or abutting trials are
+    merged, so a blocked design draws as a handful of wide bands rather than one band per trial,
+    and back-to-back trials of different conditions become a single block.
+
+    Kept in this project for now rather than in ``snaplab_tools``: general enough to move up
+    later, but it has only one caller so far.
+
+    Parameters
+    ----------
+    events : pandas.DataFrame
+        BIDS events table with ``onset`` and ``duration`` columns, in seconds.
+    tr : float
+        Repetition time in seconds; converts seconds to timepoints.
+    n_timepoints : int or None
+        Clip spans to ``[0, n_timepoints - 1]``. ``None`` leaves them unclipped.
+
+    Returns
+    -------
+    list of (float, float)
+        Merged spans in timepoint units, ascending. Empty if `events` is None, empty, or lacks
+        the required columns -- shading is decoration, so a malformed table returns nothing
+        rather than raising in the middle of drawing a figure.
+    """
+    if events is None or not len(events):
+        return []
+    try:
+        onsets = np.asarray(events['onset'], dtype=float)
+        durations = np.asarray(events['duration'], dtype=float)
+    except (KeyError, TypeError, ValueError):
+        return []
+
+    merged = []
+    for start, end in sorted(zip(onsets / tr, (onsets + durations) / tr)):
+        if merged and start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+
+    if n_timepoints is None:
+        return [(float(s), float(e)) for s, e in merged]
+    return [(float(max(0.0, s)), float(min(n_timepoints - 1, e))) for s, e in merged if e > 0]
+
+
+def style_ax(ax, xlabel, ylabel, title, demean=False, fontsize=8,
+             title_pad=None, tick_pad=0.25):
+    """Label and de-clutter a line panel: labels, title, tick size, top/right spines off.
+
+    The single implementation for the project. Defaults reproduce what ``src.gams.style_ax``
+    did, so existing callers are unaffected; pass ``title_pad`` / ``tick_pad`` for tighter
+    panels.
+
+    Parameters
+    ----------
+    ax : matplotlib Axes
+    xlabel, ylabel, title : str or None
+        Axis labels and title.
+    demean : bool
+        Draw a dashed zero reference line, for panels showing deviations from a mean.
+    fontsize : int
+        Base font size for labels, title and ticks.
+    title_pad : float or None
+        Title padding in points. None uses the rcParam default.
+    tick_pad : float
+        Tick label padding in points.
+    """
+    if demean:
+        ax.axhline(0, color='k', lw=0.5, ls='--', alpha=0.4)
+    ax.set_xlabel(xlabel, fontsize=fontsize, labelpad=1)
+    ax.set_ylabel(ylabel, fontsize=fontsize, labelpad=1)
+    ax.set_title(title, fontsize=fontsize, pad=title_pad)
+    ax.tick_params(labelsize=fontsize, pad=tick_pad)
+    ax.spines[['top', 'right']].set_visible(False)
+
+
+def plot_task_regression_example(raw_data, residual_data, design_matrix,
+                                 acf_raw, acf_resid, acf_design,
+                                 int_raw, int_resid, tr,
+                                 task_events=None, brain_map=None, brain_map_label='S-A axis rank',
+                                 example_region=None, max_lag_seconds=60.0,
+                                 heatmap_cmap='snap_blue_red', map_cmap='snap_sydnor_sa',
+                                 heatmap_pct=98, normalize_rows=True,
+                                 figsize=(7.25, 7.5), fontsize=8):
+    """Draw the single-subject worked example of what task regression does to the ACF.
+
+    Five panels sharing one argument: the task design is itself autocorrelated (D), regions
+    that track it inherit that autocorrelation (A vs B, C), and because the INT is read off
+    the ACF's decay the inherited structure inflates the INT directly (E).
+
+    Panels A, B and C share the scan's time axis with the design-matrix strip above them, so
+    a block in the design can be followed down into the data, into the residual, and into a
+    single region's timeseries.
+
+    This function only draws -- every estimate is computed by the caller, so the notebook and
+    the figure cannot disagree about what was fit.
 
     Parameters
     ----------
     raw_data : (n_regions, n_timepoints) ndarray
-        Raw timeseries.
-    scan_string : str
-        Scan identifier (e.g. 'sub-100307_modality-MRI3T_tr-0.72_...').
-    residual_data : (n_regions, n_timepoints) ndarray or None
-        Task-regressed residuals. If None, only raw data is plotted.
-    design_matrix : ndarray, pd.DataFrame, or None
-        Task regressors. If None, only raw data is plotted.
-    figsize : tuple or None
-        Figure size; auto-determined from the number of rows if None.
-    cmap : str
-        Colormap for the neural-data heatmaps.
-    vmin, vmax : float or None
-        Colour limits; 2nd/98th percentiles if None.
-    time_units : {'minutes', 'seconds', 'timepoints'}
-        Units for the time axis.
-    tr : float or None
-        Repetition time in seconds; parsed from scan_string if None.
-    title_prefix : str
-        Title prefix.
-    save_path : str or None
-        If given, save the figure to this path.
-    dpi : int
-        Resolution for the saved figure.
-
-    Returns
-    -------
-    fig : matplotlib Figure
-    axes : tuple of matplotlib Axes
-    """
-    
-    n_regions, n_timepoints = raw_data.shape
-    
-    # Extract TR from scan string if not provided
-    if tr is None:
-        tr_parts = [p for p in scan_string.split('_') if p.startswith('tr-')]
-        tr = float(tr_parts[0].split('-')[1]) if tr_parts else 1.0
-    
-    # Create time axis and labels
-    time_multiplier = {'seconds': tr, 'minutes': tr/60, 'timepoints': 1}[time_units]
-    time_axis = np.arange(n_timepoints) * time_multiplier
-    time_label = f"Time ({time_units})"
-    
-    # ============== DETERMINE PLOT MODE ==============
-    # Check if we have residual data and design matrix
-    has_task_analysis = (residual_data is not None and design_matrix is not None)
-    
-    # ============== GET TASK REGRESSION DATA (if available) ==============
-    if has_task_analysis:
-        task_signal = raw_data - residual_data
-    
-    # ============== SETUP PLOTTING ==============
-    # Determine color scaling (using nan-aware functions)
-    all_neural_data = [raw_data.flatten()]
-    if has_task_analysis:
-        all_neural_data.extend([residual_data.flatten(), task_signal.flatten()])
-    
-    combined_data = np.concatenate(all_neural_data)
-    if vmin is None:
-        vmin = np.nanpercentile(combined_data, 2)
-    if vmax is None:
-        vmax = np.nanpercentile(combined_data, 98)
-    
-    # Create coordinate system
-    x_coords = np.arange(n_timepoints)
-    
-    # Setup tick positions
-    n_time_ticks = min(8, max(3, n_timepoints//50))
-    time_tick_pos = np.linspace(0, n_timepoints-1, n_time_ticks, dtype=int)
-    time_tick_labels = [f'{time_axis[i]:.1f}' for i in time_tick_pos]
-    
-    n_region_ticks = min(10, max(3, n_regions//50))
-    region_tick_pos = np.linspace(0, n_regions-1, n_region_ticks, dtype=int)
-    region_tick_labels = [f'{i+1}' for i in region_tick_pos]
-    
-    # Extract subject info for title
-    try:
-        subject_parts = [p for p in scan_string.split('_') if p.startswith(('sub-', 'scan-'))]
-        subtitle = ', '.join(subject_parts)
-    except Exception:
-        subtitle = scan_string
-    
-    # ============== CREATE FIGURE ==============
-    n_plots = 5 if has_task_analysis else 1
-    
-    # Auto-determine figure size if not provided
-    if figsize is None:
-        figsize = (12, 18) if has_task_analysis else (12, 4)
-    
-    fig, axes = plt.subplots(nrows=n_plots, ncols=1, figsize=figsize)
-    
-    # Ensure axes is always a list
-    if n_plots == 1:
-        axes = [axes]
-    
-    # Force consistent x-limits for all plots
-    for ax in axes:
-        ax.set_xlim(0, n_timepoints - 1)
-    
-    # Helper function for adding colorbars
-    def add_colorbar(im, ax, label):
-        cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-        cbar.set_label(label, rotation=270, labelpad=20, fontsize=11)
-        return cbar
-    
-    # Helper function for setting ticks
-    def set_plot_ticks(ax, show_xlabel=False):
-        ax.set_xticks(time_tick_pos)
-        ax.set_xticklabels(time_tick_labels if show_xlabel else [])
-        if show_xlabel:
-            ax.set_xlabel(time_label, fontsize=12)
-        
-        if len(region_tick_pos) > 0:
-            ax.set_yticks(region_tick_pos)
-            ax.set_yticklabels(region_tick_labels)
-    
-    # ============== PLOT 1: RAW DATA ==============
-    im1 = axes[0].imshow(raw_data, cmap=cmap, vmin=vmin, vmax=vmax, 
-                         aspect='auto', interpolation='nearest')
-    axes[0].set_title('Raw Time Series', fontsize=14, fontweight='bold', pad=8)
-    axes[0].set_ylabel('Brain Region', fontsize=12)
-    set_plot_ticks(axes[0], show_xlabel=(n_plots == 1))
-    add_colorbar(im1, axes[0], 'Signal Amplitude')
-    
-    # ============== REMAINING PLOTS (IF TASK ANALYSIS AVAILABLE) ==============
-    if has_task_analysis:
-        # Plot 2: Residual data
-        im2 = axes[1].imshow(residual_data, cmap=cmap, vmin=vmin, vmax=vmax,
-                             aspect='auto', interpolation='nearest')
-        axes[1].set_title('Task-Regressed Residuals', fontsize=14, fontweight='bold', pad=8)
-        axes[1].set_ylabel('Brain Region', fontsize=12)
-        set_plot_ticks(axes[1])
-        add_colorbar(im2, axes[1], 'Signal Amplitude')
-        
-        # Plot 3: Task signal
-        vmax_ts = np.nanpercentile(np.abs(task_signal), 98)
-        im3 = axes[2].imshow(task_signal, cmap='berlin', vmin=-vmax_ts, vmax=vmax_ts,
-                             aspect='auto', interpolation='nearest')
-        axes[2].set_title('Effect of Task Regression (Raw - Residual)', fontsize=14, fontweight='bold', pad=8)
-        axes[2].set_ylabel('Brain Region', fontsize=12)
-        set_plot_ticks(axes[2])
-        add_colorbar(im3, axes[2], 'Signal Amplitude Delta')
-        
-        # Plot 4: Variance line plot
-        which_stat = 'var'
-        if which_stat == 'mean':
-            task_variance = np.nanmean(np.abs(task_signal), axis=0)
-            stat_label = 'Absolute Mean'
-        elif which_stat == 'var':
-            task_variance = np.nanvar(task_signal, axis=0)
-            stat_label = 'Variance'
-
-        axes[3].plot(x_coords, task_variance, 'b-', linewidth=2, alpha=0.8)
-        axes[3].fill_between(x_coords, task_variance, alpha=0.3, color='blue')
-        axes[3].set_title(f'{stat_label} of Task-Regression Effect Across Brain Regions', 
-                          fontsize=14, fontweight='bold', pad=8)
-        axes[3].set_ylabel(f'{stat_label}', fontsize=12)
-        axes[3].grid(True, alpha=0.3)
-        axes[3].set_xticks(time_tick_pos)
-        axes[3].set_xticklabels([])
-        
-        # Add colorbar for variance plot (using nan-aware min/max)
-        sm = ScalarMappable(cmap='Blues', norm=Normalize(vmin=np.nanmin(task_variance), vmax=np.nanmax(task_variance)))
-        sm.set_array([])
-        add_colorbar(sm, axes[3], 'Dummy Colorbar')
-        
-        # Plot 5: Design matrix
-        if design_matrix is not None:
-            # Convert to array and transpose
-            if hasattr(design_matrix, 'values'):
-                dm_array = design_matrix.values.T
-                regressor_names = design_matrix.columns.tolist()
-            else:
-                dm_array = design_matrix.T
-                regressor_names = [f'Regressor {i+1}' for i in range(dm_array.shape[0])]
-            
-            n_regressors = dm_array.shape[0]
-            
-            im5 = axes[4].imshow(dm_array, cmap='viridis', aspect='auto', interpolation='nearest')
-            axes[4].set_title('Design Matrix (Task Regressors)', fontsize=14, fontweight='bold', pad=8)
-            axes[4].set_ylabel('Regressors', fontsize=12)
-            
-            # Set x-axis ticks to match other plots
-            axes[4].set_xticks(time_tick_pos)
-            axes[4].set_xticklabels(time_tick_labels)
-            axes[4].set_xlabel(time_label, fontsize=12)
-            
-            # Set y-axis for regressors (not brain regions)
-            if n_regressors <= 15:
-                axes[4].set_yticks(np.arange(n_regressors))
-                truncated_names = [name[:15] + '...' if len(name) > 15 else name 
-                                   for name in regressor_names]
-                axes[4].set_yticklabels(truncated_names, fontsize=9)
-            else:
-                n_reg_ticks = min(10, n_regressors//2)
-                reg_indices = np.linspace(0, n_regressors-1, n_reg_ticks, dtype=int)
-                axes[4].set_yticks(reg_indices)
-                axes[4].set_yticklabels([f'Reg {i+1}' for i in reg_indices])
-            
-            add_colorbar(im5, axes[4], 'Regressor Weight')
-        else:
-            # No design matrix available
-            axes[4].text(0.5, 0.5, 'Design Matrix Not Available', 
-                         ha='center', va='center', transform=axes[4].transAxes, 
-                         fontsize=14, style='italic')
-            axes[4].set_title('Design Matrix (Task Regressors)', fontsize=14, fontweight='bold', pad=8)
-            axes[4].set_ylabel('Regressors', fontsize=12)
-            set_plot_ticks(axes[4], show_xlabel=True)
-    
-    # ============== FINALIZE FIGURE ==============
-    info_text = f'Regions: {n_regions}, Timepoints: {n_timepoints}, TR: {tr}s'
-    title_text = f'{title_prefix} - {subtitle}. {info_text}'
-    fig.suptitle(title_text, fontsize=16, fontweight='bold', y=0.95 if has_task_analysis else 0.98)
-    
-    plt.tight_layout()
-    if has_task_analysis:
-        plt.subplots_adjust(top=0.89, bottom=0.07)
-    else:
-        plt.subplots_adjust(top=0.88, bottom=0.15)
-    
-    if save_path:
-        plt.savefig(save_path, dpi=dpi, bbox_inches='tight', facecolor='white', edgecolor='none')
-    
-    return fig, tuple(axes)
-
-
-# =============================================================================
-# Lollipop plots (PET / feature correlation summaries)
-# =============================================================================
-
-def _draw_lollipop(ax, plot_delta, sig_either, color_map, nonsig_color,
-                   linewidth, markersize, sig_alpha, nonsig_alpha,
-                   absolute_delta, delta_label, delta_title, xlim, fontsize):
-    """Draw a single horizontal lollipop panel onto ax."""
-    order = plot_delta.sort_values(ascending=False).index.tolist()
-    y_positions = np.arange(len(order))
-
-    for y, feature in zip(y_positions, order):
-        dr  = plot_delta[feature]
-        sig = sig_either[feature]
-        color = color_map[feature] if sig else nonsig_color
-        alpha = sig_alpha if sig else nonsig_alpha
-        ax.hlines(y, 0, dr, color=color, linewidth=linewidth, alpha=alpha)
-        ax.plot(dr, y, 'o', color=color, markersize=markersize, alpha=alpha)
-
-    ax.axvline(0, color='black', linewidth=0.6, linestyle='--', alpha=0.4)
-    ax.set_xlim(xlim)
-    ax.set_ylim(-0.8, len(order) - 0.2)
-    ax.set_yticks(y_positions)
-    stripped = [f.split('_', 1)[1] if '_' in f else f for f in order]
-    ax.set_yticklabels(stripped, fontsize=fontsize - 1)
-    ax.set_xlabel(delta_label, fontsize=fontsize - 1)
-    ax.set_title(delta_title, fontsize=fontsize, fontweight='bold')
-    ax.tick_params(axis='x', labelsize=fontsize - 1)
-    ax.spines['top'].set_visible(False)
-    ax.spines['right'].set_visible(False)
-
-
-def plot_faceted_lollipops(df_r, df_p, category_colors=None, figsize=None,
-                            markersize=5, linewidth=1.2, alpha=1.0,
-                            nonsig_alpha=0.75, xlim=None,
-                            rank_reference='Rest', show_legend=True,
-                            annotate_sig=False, annotation_fontsize=5,
-                            annotation_offset=0.02, fontsize=8):
-    """Horizontal faceted lollipop plot of correlations, one panel per condition.
-
-    Each panel plots the features sorted by r, coloured by feature category (the
-    prefix before the first '_').
-
-    Parameters
-    ----------
-    df_r : pd.DataFrame
-        Correlations (features x conditions).
-    df_p : pd.DataFrame
-        P-values matching df_r.
-    category_colors : dict, list, or None
-        Per-category colours; a tab10 mapping is built if None.
-    rank_reference : str or None
-        Column used to rank the other panels by their Spearman rho against it.
-    show_legend : bool
-        Draw a category legend below the panels.
-    annotate_sig : bool
-        Annotate lollipop tips with **/*/ns.
+        Timeseries before task regression (detrended + nuisance-regressed).
+    residual_data : (n_regions, n_timepoints) ndarray
+        Residuals of the task GLM, from ``fit_glm``. May contain all-NaN rows for regions the
+        GLM excluded; those regions are dropped from every panel.
+    design_matrix : pd.DataFrame
+        The nilearn design matrix. ``drift_*`` and ``constant`` columns are dropped before
+        drawing, so the strip shows the task regressors only.
+    acf_raw, acf_resid : (n_regions, n_lags) ndarray
+        ACFs of ``raw_data`` and ``residual_data``.
+    acf_design : (n_lags,) or (1, n_lags) ndarray
+        ACF of the flattened, HRF-convolved task regressor -- the design's own autocorrelation.
+    int_raw, int_resid : (n_regions,) ndarray
+        INT per region before and after regression, in seconds.
+    tr : float
+        Repetition time in seconds.
+    task_events : pd.DataFrame or None
+        Events table (onset/duration). Used only to shade blocks behind panel C.
+    brain_map : (n_regions,) ndarray or None
+        Map used to order the heatmap rows and to colour panel E -- the S-A axis in practice.
+        Regions are left in acquisition order if None.
+    brain_map_label : str
+        Colourbar label for ``brain_map``.
+    example_region : int or None
+        Region index for panel C, in the *original* (unsorted) region order. Defaults to the
+        region whose variance is most reduced by the GLM, i.e. the one that tracks the design
+        most closely.
+    max_lag_seconds : float
+        Right-hand limit of the ACF panel.
+    heatmap_cmap : str
+        Diverging colormap for panels A and B. Registered by ``register_custom_colormaps``.
+    map_cmap : str
+        Colormap for ``brain_map`` in panel E.
+    heatmap_pct : float
+        Percentile of the displayed values setting the symmetric colour limits shared by B and C.
+    normalize_rows : bool
+        Scale every region in panels B and C by *its own raw* mean and SD, so that a few
+        high-amplitude parcels cannot set the colour limits for all 400. Both panels use the
+        raw scaling, so the variance that regression removes still shows as fading. Display
+        only -- no panel's estimates are affected.
+    figsize : tuple
     fontsize : int
-        Base font size.
 
     Returns
     -------
     fig : matplotlib Figure
-    axes : list of matplotlib Axes
+    axes : dict
+        Keys ``'A'``..``'F'`` -- matching the letters drawn on the panels: A design strip,
+        B raw heatmap, C residual heatmap, D example region, E ACFs, F INT scatter -- plus
+        the colourbar axes ``'cbar_data'`` and ``'cbar_map'``.
+    stats : dict
+        Numbers the caption needs: ``example_region``, ``example_var_explained``,
+        ``int_raw_mean``, ``int_resid_mean``, ``int_median_change``, ``frac_regions_reduced``,
+        ``zero_crossing_raw``, ``zero_crossing_resid``, ``zero_crossing_design``, ``n_valid``.
     """
-    features       = df_r.index.tolist()
-    all_conditions = df_r.columns.tolist()
+    register_custom_colormaps()
 
-    rank_ref_active = rank_reference is not None and rank_reference in all_conditions
-    if rank_reference is not None and not rank_ref_active:
-        warnings.warn(
-            f"rank_reference='{rank_reference}' not found in df_r columns. "
-            "Panel ordering skipped.", UserWarning, stacklevel=2)
+    raw_data = np.asarray(raw_data, dtype=float)
+    residual_data = np.asarray(residual_data, dtype=float)
+    acf_raw = np.atleast_2d(np.asarray(acf_raw, dtype=float))
+    acf_resid = np.atleast_2d(np.asarray(acf_resid, dtype=float))
+    acf_design = np.squeeze(np.asarray(acf_design, dtype=float))
+    int_raw = np.asarray(int_raw, dtype=float)
+    int_resid = np.asarray(int_resid, dtype=float)
 
-    if rank_ref_active:
-        other = [c for c in all_conditions if c != rank_reference]
-        rhos  = {c: sp.stats.spearmanr(df_r[rank_reference], df_r[c])[0] for c in other}
-        conditions = [rank_reference] + sorted(other, key=lambda c: rhos[c], reverse=True)
+    n_regions, n_timepoints = raw_data.shape
+
+    # fit_glm returns all-NaN rows for regions it excluded (NaN or zero-variance input).
+    # Carrying them through would poison the region means in D and open gaps in the heatmaps,
+    # so drop them everywhere and report how many survived.
+    valid = ~(np.isnan(raw_data).any(axis=1) | np.isnan(residual_data).any(axis=1))
+    if not valid.any():
+        raise ValueError('no regions survived the task GLM -- nothing to plot')
+
+    # ---- region order for the heatmaps -------------------------------------------------
+    if brain_map is not None:
+        brain_map = np.asarray(brain_map, dtype=float)
+        if brain_map.shape[0] != n_regions:
+            raise ValueError(f'brain_map has {brain_map.shape[0]} regions, data has {n_regions}')
+        order = np.argsort(np.where(valid, brain_map, np.inf), kind='stable')[:valid.sum()]
     else:
-        conditions = all_conditions
+        order = np.flatnonzero(valid)
 
-    categories        = [f.split('_')[0] for f in features]
-    unique_categories = list(dict.fromkeys(categories))
+    # ---- example region ----------------------------------------------------------------
+    # Variance explained by the design, per region. The maximum is the region that most
+    # closely tracks the task, which is the one worth showing as a timeseries. Computed on
+    # valid regions only -- an all-NaN row has no variance to take a ratio of.
+    var_explained = np.full(n_regions, np.nan)
+    var_explained[valid] = 1.0 - (residual_data[valid].var(axis=1) / raw_data[valid].var(axis=1))
+    if example_region is None:
+        example_region = int(np.nanargmax(var_explained))
+    example_region = int(example_region)
 
-    if category_colors is None:
-        cmap = mpl.colormaps['tab10']
-        category_colors = {cat: cmap(i) for i, cat in enumerate(unique_categories)}
-    elif isinstance(category_colors, (list, tuple)):
-        category_colors = {cat: category_colors[i] for i, cat in enumerate(unique_categories)}
+    # ---- shared time axis --------------------------------------------------------------
+    time_seconds = np.arange(n_timepoints) * tr
+    time_minutes = time_seconds / 60.0
 
-    color_map = {f: category_colors[cat] for f, cat in zip(features, categories)}
+    # ---- figure scaffold ---------------------------------------------------------------
+    # Row 4 is an empty spacer: rows 0-3 share the time axis and want to sit tight against
+    # each other, but the bottom row needs clearance for panel D's x-label.
+    # The design strip grows with the number of regressors so its row labels never collide --
+    # HCP-WM has eight, which does not fit in the height a two-regressor design needs.
+    dm_cols = [c for c in design_matrix.columns
+               if not str(c).startswith('drift_') and c != 'constant']
+    design_height = np.clip(0.11 * len(dm_cols), 0.35, 1.10)
 
-    if xlim is None:
-        absmax = np.nanmax(np.abs(df_r.values))
-        bound  = round(absmax + 0.15, 1)
-        xlim   = (-bound, bound)
+    fig = plt.figure(figsize=figsize)
+    outer = gridspec.GridSpec(
+        6, 2, figure=fig,
+        height_ratios=[design_height, 1.15, 1.15, 0.75, 0.32, 1.30],
+        width_ratios=[1, 0.028],
+        hspace=0.22, wspace=0.02,
+    )
 
-    n_conditions = len(conditions)
-    n_features   = len(features)
-    if figsize is None:
-        figsize = (2.8 * n_conditions, max(4, n_features * 0.18))
+    ax_design = fig.add_subplot(outer[0, 0])
+    ax_raw = fig.add_subplot(outer[1, 0], sharex=ax_design)
+    ax_resid = fig.add_subplot(outer[2, 0], sharex=ax_design)
+    ax_series = fig.add_subplot(outer[3, 0], sharex=ax_design)
+    ax_cbar_data = fig.add_subplot(outer[1:3, 1])
 
-    fig, axes = plt.subplots(1, n_conditions, figsize=figsize, sharey=False, dpi=300)
-    if n_conditions == 1:
-        axes = [axes]
+    bottom = gridspec.GridSpecFromSubplotSpec(1, 2, subplot_spec=outer[5, 0], wspace=0.34)
+    ax_acf = fig.add_subplot(bottom[0, 0])
+    ax_int = fig.add_subplot(bottom[0, 1])
+    ax_cbar_map = fig.add_subplot(outer[5, 1])
 
-    for ax, condition in zip(axes, conditions):
-        r_vals = df_r[condition]
-        p_vals = df_p[condition]
-        order  = r_vals.sort_values(ascending=False).index.tolist()
-        y_pos  = np.arange(len(order))
+    def _panel_label(ax, letter):
+        ax.text(-0.055, 1.0, letter, transform=ax.transAxes, fontsize=fontsize + 2,
+                fontweight='bold', ha='right', va='bottom')
 
-        for y, feature in zip(y_pos, order):
-            r     = r_vals[feature]
-            p     = p_vals[feature]
-            color = color_map[feature]
-            a     = alpha if p < 0.05 else nonsig_alpha
-            ax.hlines(y, 0, r, color=color, linewidth=linewidth, alpha=a)
-            ax.plot(r, y, 'o', color=color, markersize=markersize, alpha=a)
-            if annotate_sig:
-                label = determine_significance(p)
-                xoff  = annotation_offset if r >= 0 else -annotation_offset
-                ax.text(r + xoff, y, label, ha='left' if r >= 0 else 'right',
-                        va='center', fontsize=annotation_fontsize, color=color, alpha=a)
+    # ---- design matrix strip -----------------------------------------------------------
+    task_cols = dm_cols
+    dm_task = design_matrix[task_cols].values.T
 
-        ax.axvline(0, color='black', linewidth=0.6, linestyle='--', alpha=0.4)
-        ax.set_xlim(xlim)
-        ax.set_ylim(-0.8, len(order) - 0.2)
-        ax.set_yticks(y_pos)
-        ax.set_yticklabels([f.split('_', 1)[1] if '_' in f else f for f in order],
-                            fontsize=fontsize - 1)
+    # vmin=0 rather than the data minimum: the HRF undershoot dips slightly negative, which
+    # would otherwise put the inter-block baseline at mid-grey and make the whole strip muddy.
+    # Clipping it to white keeps 'no task' reading as blank.
+    ax_design.imshow(dm_task, cmap='Greys', aspect='auto', interpolation='nearest',
+                     vmin=0, vmax=np.nanmax(dm_task),
+                     extent=(-0.5, n_timepoints - 0.5, len(task_cols) - 0.5, -0.5))
+    ax_design.set_yticks(np.arange(len(task_cols)))
+    ax_design.set_yticklabels([str(c)[:14] for c in task_cols], fontsize=max(4, fontsize - 3))
+    ax_design.set_ylabel('Task\nregressors', fontsize=fontsize, labelpad=1)
+    ax_design.tick_params(axis='x', labelbottom=False, length=0)
+    ax_design.tick_params(axis='y', length=0, pad=1)
+    ax_design.spines[:].set_visible(False)
+    _panel_label(ax_design, 'A')
+    ax_design.set_title('HRF-convolved task design', fontsize=fontsize, pad=3)
 
-        if rank_ref_active and condition != rank_reference:
-            rho   = sp.stats.spearmanr(df_r[rank_reference], df_r[condition])[0]
-            title = f"{condition}\n$\\rho_{{rank}}$ = {rho:.2f} (vs. {rank_reference})"
-        else:
-            title = condition
-
-        ax.set_title(title, fontsize=fontsize, fontweight='bold')
-        ax.set_xlabel('Correlation', fontsize=fontsize - 1)
-        ax.tick_params(axis='x', labelsize=fontsize - 1)
-        ax.spines['top'].set_visible(False)
-        ax.spines['right'].set_visible(False)
-
-    legend_handles = [mpatches.Patch(color=category_colors[cat], label=cat)
-                      for cat in unique_categories]
-    if show_legend:
-        leg = fig.legend(handles=legend_handles, loc='lower center', ncol=1,
-                         fontsize=fontsize - 1, frameon=False, bbox_to_anchor=(0.5, 0))
-        fig.canvas.draw()
-        leg_height = leg.get_window_extent().height / fig.bbox.height
-        fig.tight_layout(rect=[0, leg_height + 0.02, 1, 1])
+    # ---- A / B heatmaps ----------------------------------------------------------------
+    # Parcels differ several-fold in raw signal amplitude, so on a shared absolute colour
+    # scale a handful of high-amplitude regions set the limits and everything else washes
+    # out. Scale each region by *its own raw* mean and SD and apply that same scaling to the
+    # residual: regions become comparable, while the drop in variance that regression causes
+    # is still visible as fading rather than being normalised away (which is what
+    # standardising each panel separately would do).
+    if normalize_rows:
+        mu = raw_data.mean(axis=1, keepdims=True)
+        sd = raw_data.std(axis=1, keepdims=True)
+        with np.errstate(invalid='ignore', divide='ignore'):
+            raw_disp = (raw_data - mu) / sd
+            resid_disp = (residual_data - mu) / sd
+        cbar_label = 'Signal (SD of raw)'
     else:
-        fig.tight_layout()
+        raw_disp, resid_disp = raw_data, residual_data
+        cbar_label = 'Signal (a.u.)'
 
-    return fig, axes
+    vmax = np.nanpercentile(np.abs(raw_disp[valid]), heatmap_pct)
+    heat_kw = dict(cmap=heatmap_cmap, vmin=-vmax, vmax=vmax, aspect='auto',
+                   interpolation='nearest',
+                   extent=(-0.5, n_timepoints - 0.5, len(order) - 0.5, -0.5))
+    im = ax_raw.imshow(raw_disp[order], **heat_kw)
+    ax_resid.imshow(resid_disp[order], **heat_kw)
 
+    ylabel = 'Region' if brain_map is None else f'Region\n({brain_map_label} order)'
+    for ax, title in ((ax_raw, 'Before task regression'),
+                      (ax_resid, 'After task regression')):
+        ax.set_ylabel(ylabel, fontsize=fontsize, labelpad=1)
+        ax.set_title(title, fontsize=fontsize, pad=3)
+        ax.set_yticks([0, len(order) - 1])
+        ax.set_yticklabels(['1', str(len(order))], fontsize=fontsize)
+        ax.tick_params(axis='x', labelbottom=False, length=0)
+        ax.tick_params(axis='y', labelsize=fontsize, pad=1)
+        ax.spines[:].set_visible(False)
+    _panel_label(ax_raw, 'B')
+    _panel_label(ax_resid, 'C')
 
-def plot_two_condition_supplement(df_r, df_p, reference, sig_threshold=0.05,
-                                   category_colors=None, figsize=None,
-                                   markersize=5, linewidth=1.2,
-                                   sig_alpha=1.0, nonsig_alpha=0.25,
-                                   nonsig_color='#aaaaaa',
-                                   annotate_scatter=False, annotation_fontsize=5,
-                                   absolute_delta=False, show_lollipop=True,
-                                   split_lollipop=False, show_legend=True,
-                                   fontsize=8):
-    """Scatter + optional lollipop supplement for a two-condition correlation table.
+    cbar = fig.colorbar(im, cax=ax_cbar_data)
+    cbar.set_label(cbar_label, fontsize=fontsize, labelpad=2)
+    cbar.ax.tick_params(labelsize=max(5, fontsize - 2), pad=1)
+    cbar.outline.set_visible(False)
 
-    Left panel: scatter of r(reference) vs r(task). Right panel(s): horizontal
-    lollipop of the change in correlation (task - reference), sorted descending.
+    # ---- C: single region --------------------------------------------------------------
+    for start, end in _task_block_spans(task_events, tr, n_timepoints):
+        ax_series.axvspan(start, end, color='0.85', lw=0, zorder=0)
+    ax_series.plot(np.arange(n_timepoints), raw_data[example_region], lw=0.6,
+                   color='#B2182B', label='before', zorder=2)
+    ax_series.plot(np.arange(n_timepoints), residual_data[example_region], lw=0.6,
+                   color='#2166AC', label='after', zorder=3)
+    ax_series.set_ylabel('Signal (a.u.)', fontsize=fontsize, labelpad=1)
+    ax_series.set_xlabel('Time (minutes)', fontsize=fontsize, labelpad=1)
+    # Locate the region by its position on the brain map rather than by a marker on the
+    # heatmaps: 400 rows in a couple of inches puts a single row below one pixel, so a
+    # positional arrow cannot actually point at it.
+    rank_note = ('' if brain_map is None
+                 else f' [{brain_map_label} {brain_map[example_region]:.0f}/{n_regions}]')
+    ax_series.set_title(
+        f'Region {example_region + 1}{rank_note}: most task-driven '
+        f'({100 * var_explained[example_region]:.0f}% of variance explained by the design)',
+        fontsize=fontsize, pad=3)
+    # Tick on whole (or half) minutes rather than on evenly spaced frames, which would label
+    # the axis with arbitrary decimals.
+    step = 1.0 if time_minutes[-1] >= 3 else 0.5
+    tick_minutes = np.arange(0, time_minutes[-1] + 1e-9, step)
+    ax_series.set_xticks(tick_minutes * 60.0 / tr)
+    ax_series.set_xticklabels([f'{m:g}' for m in tick_minutes], fontsize=fontsize)
+    ax_series.set_xlim(-0.5, n_timepoints - 0.5)
+    ax_series.tick_params(labelsize=fontsize, pad=1)
+    ax_series.spines[['top', 'right']].set_visible(False)
+    # Headroom plus an opaque frame: the block shading spans the full panel height, so a
+    # frameless legend would sit directly on top of the traces.
+    ax_series.margins(y=0.22)
+    leg = ax_series.legend(fontsize=max(5, fontsize - 2), loc='upper right', ncol=2,
+                           handlelength=1.2, columnspacing=0.8, borderaxespad=0.1,
+                           frameon=True, framealpha=0.9, edgecolor='none')
+    leg.get_frame().set_facecolor('white')
+    _panel_label(ax_series, 'D')
 
-    Parameters
-    ----------
-    df_r : pd.DataFrame
-        Exactly 2 columns, one of which is `reference`.
-    df_p : pd.DataFrame
-        Matching p-values.
-    reference : str
-        Column name of the reference condition.
-    show_lollipop : bool
-        Show the lollipop panel(s) alongside the scatter.
-    split_lollipop : bool
-        Split the lollipop by the sign of r(reference).
-    show_legend : bool
-        Draw a category legend.
+    # ---- D: ACFs -----------------------------------------------------------------------
+    max_lag = int(min(acf_raw.shape[1], acf_resid.shape[1], np.ceil(max_lag_seconds / tr) + 1))
+    lag_seconds = np.arange(max_lag) * tr
 
-    Returns
-    -------
-    fig : matplotlib Figure
-    axes : tuple of matplotlib Axes
-    """
-    if df_r.shape[1] != 2:
-        raise ValueError('plot_two_condition_supplement requires exactly 2 conditions.')
-    if reference not in df_r.columns:
-        raise ValueError(f"Reference '{reference}' not found in df_r columns.")
+    def _band(acf, color, label):
+        mean = np.nanmean(acf[valid, :max_lag], axis=0)
+        sd = np.nanstd(acf[valid, :max_lag], axis=0)
+        ax_acf.fill_between(lag_seconds, mean - sd, mean + sd, color=color, alpha=0.18, lw=0)
+        ax_acf.plot(lag_seconds, mean, color=color, lw=1.0, label=label, zorder=3)
+        return mean
 
-    task     = [c for c in df_r.columns if c != reference][0]
-    features = df_r.index.tolist()
+    ax_acf.axhline(0, color='k', lw=0.5, ls='--', alpha=0.4, zorder=1)
+    mean_raw = _band(acf_raw, '#B2182B', 'before')
+    mean_resid = _band(acf_resid, '#2166AC', 'after')
 
-    categories        = [f.split('_')[0] for f in features]
-    unique_categories = list(dict.fromkeys(categories))
-    if category_colors is None:
-        cmap = mpl.colormaps['tab10']
-        category_colors = {cat: cmap(i) for i, cat in enumerate(unique_categories)}
-    color_map  = {f: category_colors[cat] for f, cat in zip(features, categories)}
-    sig_either = (df_p[reference] < sig_threshold) | (df_p[task] < sig_threshold)
+    design_curve = acf_design[:max_lag]
+    ax_acf.plot(lag_seconds[:len(design_curve)], design_curve, color='0.35', lw=1.0, ls=(0, (3, 1.5)),
+                label='task design', zorder=2)
 
-    if figsize is None:
-        n_features = len(features)
-        figsize = (12, max(4, n_features * 0.18)) if show_lollipop else (5, max(4, n_features * 0.18))
+    def _first_crossing(curve):
+        below = np.flatnonzero(curve < 0)
+        return float(below[0] * tr) if below.size else np.nan
 
-    fig = plt.figure(figsize=figsize, dpi=300)
+    zc_raw, zc_resid = _first_crossing(mean_raw), _first_crossing(mean_resid)
+    zc_design = _first_crossing(design_curve)
+    for zc, color in ((zc_raw, '#B2182B'), (zc_resid, '#2166AC')):
+        if np.isfinite(zc):
+            ax_acf.plot([zc], [0], marker='v', color=color, markersize=3, clip_on=False, zorder=4)
 
-    if not show_lollipop:
-        ax_scatter   = fig.add_subplot(1, 1, 1)
-        lollipop_axes = []
-    elif not split_lollipop:
-        gs = gridspec.GridSpec(1, 2, figure=fig, width_ratios=[1, 0.33])
-        ax_scatter    = fig.add_subplot(gs[0, 0])
-        ax_lollipop   = fig.add_subplot(gs[0, 1])
-        lollipop_axes = [ax_lollipop]
+    ax_acf.set_xlim(0, lag_seconds[-1])
+    style_ax(ax_acf, 'Lag (seconds)', 'Autocorrelation',
+             'ACF across regions (mean $\\pm$ SD)', fontsize=fontsize,
+             title_pad=3, tick_pad=1)
+    ax_acf.legend(fontsize=max(5, fontsize - 2), frameon=False, loc='upper right',
+                  handlelength=1.4, borderaxespad=0.1)
+    _panel_label(ax_acf, 'E')
+
+    # ---- E: INT before vs after --------------------------------------------------------
+    both = valid & np.isfinite(int_raw) & np.isfinite(int_resid)
+    colours = brain_map[both] if brain_map is not None else None
+    sc = ax_int.scatter(int_raw[both], int_resid[both], c=colours, cmap=map_cmap,
+                        s=3, lw=0, alpha=0.85, zorder=3)
+
+    lo = float(np.nanmin([int_raw[both].min(), int_resid[both].min()]))
+    hi = float(np.nanmax([int_raw[both].max(), int_resid[both].max()]))
+    pad = 0.05 * (hi - lo)
+    ax_int.plot([lo - pad, hi + pad], [lo - pad, hi + pad], color='k', lw=0.5, ls='--',
+                alpha=0.5, zorder=2)
+    ax_int.set_xlim(lo - pad, hi + pad)
+    ax_int.set_ylim(lo - pad, hi + pad)
+    ax_int.set_aspect('equal', adjustable='box')
+
+    delta = int_resid[both] - int_raw[both]
+    frac_reduced = float(np.mean(delta < 0))
+    ax_int.text(0.04, 0.96,
+                f'median $\\Delta$ = {np.median(delta):+.2f} s\n{100 * frac_reduced:.0f}% of regions reduced',
+                transform=ax_int.transAxes, fontsize=max(5, fontsize - 2), va='top', ha='left')
+    style_ax(ax_int, 'INT before (s)', 'INT after (s)', 'INT per region',
+             fontsize=fontsize, title_pad=3, tick_pad=1)
+    _panel_label(ax_int, 'F')
+
+    if brain_map is not None:
+        cbar_map = fig.colorbar(sc, cax=ax_cbar_map)
+        cbar_map.set_label(brain_map_label, fontsize=fontsize, labelpad=2)
+        cbar_map.ax.tick_params(labelsize=max(5, fontsize - 2), pad=1)
+        cbar_map.outline.set_visible(False)
     else:
-        pos_features = df_r.index[df_r[reference] >= 0].tolist()
-        neg_features = df_r.index[df_r[reference] <  0].tolist()
-        gs = gridspec.GridSpec(1, 3, figure=fig, width_ratios=[2, 1, 1])
-        ax_scatter      = fig.add_subplot(gs[0, 0])
-        ax_loll_neg     = fig.add_subplot(gs[0, 1])
-        ax_loll_pos     = fig.add_subplot(gs[0, 2])
-        lollipop_axes   = [ax_loll_neg, ax_loll_pos]
+        ax_cbar_map.set_visible(False)
 
-    if show_lollipop:
-        delta_r    = df_r[task] - df_r[reference]
-        plot_delta = delta_r.abs() if absolute_delta else delta_r
-        delta_label = (f'|Δr|  (|{task} − {reference}|)' if absolute_delta
-                       else f'Δr  ({task} − {reference})')
-        delta_title_base = (f'Absolute change\n(|{task} − {reference}|)' if absolute_delta
-                            else f'Change in correlation\n({task} − {reference})')
-        lollipop_xlim = (
-            -0.05 if absolute_delta else min(-0.1, plot_delta.min() - 0.05),
-            max(0.1, plot_delta.max() + 0.05),
-        )
-        lollipop_subsets = (
-            [(plot_delta, delta_title_base)] if not split_lollipop
-            else [(plot_delta.loc[neg_features], f'r({reference}) < 0'),
-                  (plot_delta.loc[pos_features], f'r({reference}) ≥ 0')]
-        )
-        for ax_l, (subset_delta, title) in zip(lollipop_axes, lollipop_subsets):
-            _draw_lollipop(ax_l, subset_delta, sig_either, color_map, nonsig_color,
-                           linewidth, markersize, sig_alpha, nonsig_alpha,
-                           absolute_delta, delta_label, title, lollipop_xlim, fontsize)
-
-    absmax = max(np.abs(df_r.values).max(), 0.1)
-    bound  = round(absmax + 0.05, 1)
-    ax_scatter.set_xlim(-bound, bound)
-    ax_scatter.set_ylim(-bound, bound)
-
-    texts, x_coords, y_coords = [], [], []
-    for feature in features:
-        r_ref  = df_r.loc[feature, reference]
-        r_task = df_r.loc[feature, task]
-        sig    = sig_either[feature]
-        color  = color_map[feature] if sig else nonsig_color
-        a      = sig_alpha if sig else nonsig_alpha
-        ax_scatter.plot(r_ref, r_task, 'o', color=color, markersize=markersize, alpha=a)
-        x_coords.append(r_ref)
-        y_coords.append(r_task)
-        if annotate_scatter:
-            label = '_'.join(feature.split('_')[1:])
-            texts.append(ax_scatter.text(r_ref, r_task, label,
-                                          fontsize=annotation_fontsize, color=color, alpha=a))
-
-    if annotate_scatter and texts:
-        if adjustText is not None:
-            adjustText.adjust_text(texts, x=x_coords, y=y_coords, ax=ax_scatter,
-                                    expand=(1.5, 2.0), force_text=(0.5, 1.0),
-                                    force_points=(0.5, 1.0), ensure_inside_axes=True,
-                                    arrowprops=dict(arrowstyle='-', color='grey', lw=0.4, alpha=0.5))
-
-    ax_scatter.plot([-bound, bound], [-bound, bound], color='black', lw=0.7, ls='--', alpha=0.4)
-    ax_scatter.axhline(0, color='grey', lw=0.4, alpha=0.3)
-    ax_scatter.axvline(0, color='grey', lw=0.4, alpha=0.3)
-    ax_scatter.set_xlabel(f'r  ({reference})', fontsize=fontsize - 1)
-    ax_scatter.set_ylabel(f'r  ({task})', fontsize=fontsize - 1)
-    ax_scatter.set_title(f'{reference} vs. {task}', fontsize=fontsize, fontweight='bold')
-    ax_scatter.tick_params(labelsize=fontsize - 1)
-    ax_scatter.set_aspect('equal', adjustable='box')
-    ax_scatter.spines['top'].set_visible(False)
-    ax_scatter.spines['right'].set_visible(False)
-
-    legend_handles = [mpatches.Patch(color=category_colors[cat], label=cat)
-                      for cat in unique_categories]
-    legend_handles.append(mpatches.Patch(color=nonsig_color, alpha=nonsig_alpha,
-                                           label=f'p ≥ {sig_threshold} (both conditions)'))
-    fig.tight_layout()
-
-    if show_lollipop and split_lollipop:
-        fig.canvas.draw()
-        scatter_bbox = ax_scatter.get_position()
-        for ax_l in lollipop_axes:
-            pos = ax_l.get_position()
-            ax_l.set_position([pos.x0, scatter_bbox.y0, pos.width, scatter_bbox.height])
-
-    if show_legend:
-        fig.canvas.draw()
-        renderer    = fig.canvas.get_renderer()
-        fig_h_px    = fig.get_size_inches()[1] * fig.dpi
-        all_axes    = [ax_scatter] + list(lollipop_axes)
-        min_bot_fig = min(ax.get_tightbbox(renderer).y0 for ax in all_axes) / fig_h_px
-        fig.legend(handles=legend_handles, loc='upper center',
-                   ncol=len(legend_handles), fontsize=fontsize - 1, frameon=False,
-                   bbox_to_anchor=(0.5, min_bot_fig - 0.01))
-
-    if not show_lollipop:
-        return fig, (ax_scatter,)
-    elif not split_lollipop:
-        return fig, (ax_scatter, ax_lollipop)
-    else:
-        return fig, (ax_scatter, ax_loll_pos, ax_loll_neg)
+    # Keys match the letters drawn on the panels, so a caption edit and a code edit
+    # can refer to the same thing.
+    axes = {'A': ax_design, 'B': ax_raw, 'C': ax_resid, 'D': ax_series,
+            'E': ax_acf, 'F': ax_int,
+            'cbar_data': ax_cbar_data, 'cbar_map': ax_cbar_map}
+    stats = {
+        'example_region': example_region,
+        'example_var_explained': float(var_explained[example_region]),
+        'int_raw_mean': float(np.nanmean(int_raw[both])),
+        'int_resid_mean': float(np.nanmean(int_resid[both])),
+        'int_median_change': float(np.median(delta)),
+        'frac_regions_reduced': frac_reduced,
+        'zero_crossing_raw': zc_raw,
+        'zero_crossing_resid': zc_resid,
+        'zero_crossing_design': zc_design,
+        'n_valid': int(valid.sum()),
+    }
+    return fig, axes, stats
 
 
 # ==================== Support Utility Functions ====================
@@ -1359,3 +1188,29 @@ def _calculate_annotation_height(data_values, y_min, y_max, offset_fraction=0.05
     y_range = y_max - y_min
     data_max = np.nanmax(data_values)
     return data_max + y_range * offset_fraction
+
+
+def figure_scratch_dir(dataset=None, base=FIGURE_SCRATCH_BASE):
+    """Resolve (and create) the scratch directory a notebook writes its panels into.
+
+    One definition of where panels land, so the notebooks stop rebuilding the same path from an
+    f-string apiece. Pass ``dataset`` for a per-dataset subdirectory; omit it for figures that
+    span datasets (fig1, the schematic).
+
+    Parameters
+    ----------
+    dataset : str or None
+        Dataset subdirectory, e.g. 'HCP-YA'. None writes to ``base`` itself.
+    base : str
+        Root scratch directory.
+
+    Returns
+    -------
+    str
+        The created directory.
+    """
+    out = os.path.join(base, dataset) if dataset else base
+    os.makedirs(out, exist_ok=True)
+    return out
+
+

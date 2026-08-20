@@ -224,6 +224,93 @@ class ScanInfo:
 # Behavior handlers
 # ==============================================================================
 
+# HCP-YA head motion. The S1200 release writes one scalar per run to
+# MNINonLinear/Results/<run>/Movement_RelativeRMS_mean.txt -- the mean *relative RMS
+# displacement* in mm. That is not Power's framewise displacement, so the columns are named
+# meanRelRMS_* rather than meanFD_* and should be reported as such.
+HCPYA_MOVEMENT_FILE = 'Movement_RelativeRMS_mean.txt'
+HCPYA_MOVEMENT_CACHE = 'hcpya_movement_relativerms.csv'
+
+
+def load_hcpya_movement(loader: 'DataLoader', force: bool = False) -> pd.DataFrame:
+    """Per-run mean relative RMS displacement for every HCP-YA subject on disk.
+
+    Reading the ~15k one-line text files off the NAS takes ~30 s, which is too slow to pay on
+    every DataLoader init, so the result is cached as a CSV under the project output directory
+    and re-read from there. Delete the cache (or pass ``force``) after downloading more runs.
+
+    Returns
+    -------
+    pd.DataFrame
+        Indexed by subject_id, one column per HCP run directory (e.g. 'rfMRI_REST1_LR').
+        Empty if the raw data directory is absent.
+    """
+    cache = loader.output_dir / 'data' / HCPYA_MOVEMENT_CACHE
+    if cache.exists() and not force:
+        return pd.read_csv(cache, index_col=0, dtype={'subject_id': str})
+
+    raw = loader.base_dir / loader.config.rawdata_subdir
+    if not raw.is_dir():
+        logger.warning("No raw data directory at %s; skipping HCP-YA motion.", raw)
+        return pd.DataFrame()
+
+    rows = {}
+    for sub_dir in sorted(p for p in raw.iterdir() if p.is_dir() and p.name.isdigit()):
+        results = sub_dir / 'MNINonLinear' / 'Results'
+        if not results.is_dir():
+            continue
+        rec = {}
+        for run_dir in results.iterdir():
+            path = run_dir / HCPYA_MOVEMENT_FILE
+            if path.exists():
+                try:
+                    rec[run_dir.name] = float(np.loadtxt(path))
+                except Exception as e:      # a truncated download, not a reason to abort
+                    logger.warning("Could not parse %s: %s", path, e)
+        if rec:
+            rows[sub_dir.name] = rec
+
+    df = pd.DataFrame.from_dict(rows, orient='index').sort_index()
+    df.index.name = 'subject_id'
+    if not df.empty:
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(cache)
+        logger.info("Cached HCP-YA motion for %d subjects to %s", len(df), cache)
+    return df
+
+
+def _add_hcpya_motion(loader: 'DataLoader', df: pd.DataFrame) -> pd.DataFrame:
+    """Add rest / task mean-relative-RMS columns to the HCP-YA behavior table.
+
+    Rest and task motion are kept as separate columns rather than one grand mean. They are
+    correlated (r ~ 0.82 -- motion is largely a subject trait) but not interchangeable, and the
+    INT deflection is a task-minus-rest difference, so collapsing them would average over exactly
+    the contrast the deflection is built on.
+
+    Columns added (NaN where a subject has no runs of that kind):
+      meanRelRMS_rest  -- mean over the 3T rest runs
+      meanRelRMS_task  -- mean over all 3T task runs
+      meanRelRMS_<TASK> -- mean over that task's runs, e.g. meanRelRMS_WM
+    """
+    mv = load_hcpya_movement(loader)
+    if mv.empty:
+        logger.warning("No HCP-YA motion data found; meanRelRMS columns not added.")
+        return df
+
+    rest_cols = [c for c in mv.columns if c.startswith('rfMRI_REST') and '7T' not in c]
+    task_cols = [c for c in mv.columns if c.startswith('tfMRI_') and '7T' not in c]
+
+    out = pd.DataFrame(index=mv.index)
+    out['meanRelRMS_rest'] = mv[rest_cols].mean(axis=1) if rest_cols else np.nan
+    out['meanRelRMS_task'] = mv[task_cols].mean(axis=1) if task_cols else np.nan
+    for name in ('EMOTION', 'GAMBLING', 'LANGUAGE', 'MOTOR', 'RELATIONAL', 'SOCIAL', 'WM'):
+        cols = [c for c in task_cols if c.startswith(f'tfMRI_{name}_')]
+        if cols:
+            out[f'meanRelRMS_{name}'] = mv[cols].mean(axis=1)
+
+    return df.join(out, how='left')
+
+
 def _behavior_hcp_unrestricted_restricted(loader: 'DataLoader') -> pd.DataFrame:
     base = loader.config.base_path
     unrest_files = list(base.glob('unrestricted_*.csv'))
@@ -245,7 +332,8 @@ def _behavior_hcp_unrestricted_restricted(loader: 'DataLoader') -> pd.DataFrame:
     for word in words_to_convert:
         new_columns = new_columns.str.replace(word, word.upper(), regex=False)
     df.columns = new_columns
-    return df
+    # Added after the case fix above so the meanRelRMS_* names survive it verbatim.
+    return _add_hcpya_motion(loader, df)
 
 
 def _load_hcpd_beh_file(beh_dir: Path, fname: str, cols: list,
@@ -1145,17 +1233,48 @@ class DataLoader:
 
         timeseries = timeseries.astype(np.float32)
 
-        if detrend:
-            timeseries = sp.signal.detrend(timeseries, axis=0, type='linear')
+        # Non-finite parcels -- edge-of-mask parcels the parcellation could not fill -- are
+        # carried through untouched rather than repaired or dropped. Both steps below raise on
+        # non-finite input (scipy's detrend solves a least-squares fit; sklearn rejects NaN), and
+        # load_batch turns any raise into a silently skipped scan, so without this guard a single
+        # bad parcel would quietly remove a whole subject from the analysis. Downstream already
+        # expects NaN parcels: fit_glm masks them out and compute_acf returns all-NaN.
+        # Penn_LEAD carries 3 such parcels out of 400; HCP-YA and HCP-D sampled clean.
+        #
+        # The all-finite case keeps the original whole-array code verbatim. Operating on a
+        # boolean-masked copy instead is algebraically identical but not bitwise identical --
+        # float32 reductions depend on memory layout, which moved results by ~1e-7 relative.
+        # Data that already worked must come out unchanged, so it takes the untouched path.
+        finite_parcels = np.isfinite(timeseries).all(axis=0)
 
-        if nuisance_regression:
-            gs = np.mean(timeseries, axis=1).reshape(-1, 1)
-            # gs_diff = np.append(0, np.diff(gs, axis=0)).reshape(-1, 1)
-            # nuis = np.concatenate([gs, gs_diff, gs ** 2, gs_diff ** 2], axis=1)
-            nuis = gs
-            regr = LinearRegression()
-            regr.fit(nuis, timeseries)
-            timeseries = timeseries - regr.predict(nuis)
+        if finite_parcels.all():
+            if detrend:
+                timeseries = sp.signal.detrend(timeseries, axis=0, type='linear')
+
+            if nuisance_regression:
+                gs = np.mean(timeseries, axis=1).reshape(-1, 1)
+                # gs_diff = np.append(0, np.diff(gs, axis=0)).reshape(-1, 1)
+                # nuis = np.concatenate([gs, gs_diff, gs ** 2, gs_diff ** 2], axis=1)
+                nuis = gs
+                regr = LinearRegression()
+                regr.fit(nuis, timeseries)
+                timeseries = timeseries - regr.predict(nuis)
+        else:
+            if verbose:
+                print(f"    {int((~finite_parcels).sum())}/{finite_parcels.size} non-finite "
+                      "parcels left untouched by detrend / nuisance regression")
+            if finite_parcels.any():
+                if detrend:
+                    timeseries[:, finite_parcels] = sp.signal.detrend(
+                        timeseries[:, finite_parcels], axis=0, type='linear')
+
+                if nuisance_regression:
+                    gs = np.mean(timeseries[:, finite_parcels], axis=1).reshape(-1, 1)
+                    nuis = gs
+                    regr = LinearRegression()
+                    regr.fit(nuis, timeseries[:, finite_parcels])
+                    timeseries[:, finite_parcels] = (timeseries[:, finite_parcels]
+                                                     - regr.predict(nuis))
 
         # Optional TR resampling (HCP-YA 3T -> 7T grid only). Applied after nuisance
         # regression and before frequency filtering, so the filter uses the new
