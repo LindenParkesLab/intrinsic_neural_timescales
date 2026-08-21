@@ -618,15 +618,22 @@ class Timescales(DataLoader):
         For each task scan, builds a nilearn design matrix from its events
         (HRF-convolved for fMRI; raw for MEG), fits a per-region GLM, and keeps the
         residuals. Also stores the events, design matrices, per-condition beta
-        contrast maps, and the ACF of the flattened task regressor. Rest scans and
-        any failures are stored as None.
+        contrast maps, the flattened (all-conditions-merged) task regressor, and its
+        ACF. Rest scans and any failures are stored as None.
 
         Sets self.timeseries_residuals, self.task_events, self.design_matrices,
-        self.task_events_acf, and self.task_contrasts (all keyed by scan_key).
+        self.task_regressor_flat, self.task_events_acf, and self.task_contrasts (all
+        keyed by scan_key).
+
+        The flattened regressor is kept, not only its ACF: it is the curve the
+        supplementary task-regression figure plots as the design's own
+        autocorrelation, and rebuilding it in a notebook would let the notebook's
+        HRF/drift settings drift away from the ones actually used here.
         """
         timeseries_residuals = dict().fromkeys(self.timeseries_data)
         task_events = dict().fromkeys(self.timeseries_data)
         design_matrices = dict().fromkeys(self.timeseries_data)
+        task_regressor_flat = dict().fromkeys(self.timeseries_data)
         task_events_acf = dict().fromkeys(self.timeseries_data)
         task_contrasts = dict().fromkeys(self.timeseries_data)
 
@@ -688,6 +695,7 @@ class Timescales(DataLoader):
                     design_matrix_flat = create_design_matrix_nilearn(tsk_evnts_flat, n_timepoints, tr,
                                                                       hrf_model=hrf_model, drift_model=drift_model
                                                                       )
+                    task_regressor_flat[scan_key] = design_matrix_flat['trial'].values
                     # atleast_2d keeps this a (1, n_lags) array, as it was before compute_acf
                     # moved to snaplab_tools (which returns 1-D for a 1-D input).
                     task_events_acf[scan_key] = np.atleast_2d(
@@ -696,18 +704,21 @@ class Timescales(DataLoader):
                     timeseries_residuals[scan_key] = None
                     task_events[scan_key] = None
                     design_matrices[scan_key] = None
+                    task_regressor_flat[scan_key] = None
                     task_events_acf[scan_key] = None
                     task_contrasts[scan_key] = None
             else:
                 timeseries_residuals[scan_key] = None
                 task_events[scan_key] = None
                 design_matrices[scan_key] = None
+                task_regressor_flat[scan_key] = None
                 task_events_acf[scan_key] = None
                 task_contrasts[scan_key] = None
 
         self.timeseries_residuals = timeseries_residuals
         self.task_events = task_events
         self.design_matrices = design_matrices
+        self.task_regressor_flat = task_regressor_flat
         self.task_events_acf = task_events_acf
         self.task_contrasts = task_contrasts
     
@@ -915,6 +926,99 @@ def calculate_tsnr(timeseries_matrix):
     return tsnr
 
 # ==================== Standalone Utility Functions (for use in notebooks) ====================
+def split_design_columns(design_matrix):
+    """Split a nilearn design matrix into its task columns and its nuisance columns.
+
+    One definition of "which column is a task regressor", used by the GLM contrast extraction,
+    by the drift-only baseline the supplementary figure is built on, and by the notebook that
+    reports how many of each there are. Written once here so the baseline cannot end up
+    regressing a different column set than the figure says it did.
+
+    Parameters
+    ----------
+    design_matrix : pd.DataFrame
+        nilearn design matrix.
+
+    Returns
+    -------
+    (task_cols, nuisance_cols) : (list of str, list of str)
+        `nuisance_cols` is the ``drift_*`` basis plus ``constant``, in the matrix's own order.
+    """
+    columns = [str(c) for c in design_matrix.columns]
+    nuisance_cols = [c for c in columns if c.startswith('drift_') or c == 'constant']
+    task_cols = [c for c in columns if c not in nuisance_cols]
+    return task_cols, nuisance_cols
+
+
+def drift_only_control(raw_data, design_matrix, tr, int_method='auc_zero_crossing',
+                       use_fft=True):
+    """Refit a task GLM with its nuisance columns alone, and measure what that costs the INT.
+
+    A design built by ``create_design_matrix_nilearn`` carries a cosine drift basis and a
+    constant alongside the condition regressors, so its residual has been high-pass filtered on
+    top of whatever filtering the timeseries already received at load time. When the input was
+    only linearly detrended (``DataLoader.load_batch(detrend=True, frequency_filter=False)``)
+    that cosine basis is *new* filtering, and a raw-versus-residual INT comparison charges its
+    effect to task regression: on HCP-YA working memory it is about a third of the difference.
+
+    The residual returned here is the fix, not just the diagnostic. Using it as the "before"
+    side of the figure puts the identical drift basis on both sides, so what is left between
+    them is the task regressors and nothing else.
+
+    Parameters
+    ----------
+    raw_data : (n_regions, n_timepoints) ndarray
+        The same timeseries the full GLM is fit to.
+    design_matrix : pd.DataFrame
+        The full nilearn design matrix. Only its ``drift_*`` and ``constant`` columns are used.
+    tr : float
+        Repetition time in seconds.
+    int_method : str
+        Key of ``TIMESCALE_METHODS``; use the one the rest of the analysis uses.
+    use_fft : bool
+        Passed to ``compute_acf``.
+
+    Returns
+    -------
+    dict
+        ``residual`` (n_regions, n_timepoints) the drift-only residual -- the figure's
+        baseline; ``acf`` (n_regions, n_lags) its ACF; ``int_drift`` (n_regions,) its INT;
+        ``int_raw`` (n_regions,) the INT of the untouched input, for the comparison;
+        ``delta`` (n_regions,) ``int_drift - int_raw``; ``median``, ``q25``, ``q75`` of the
+        finite deltas; ``nuisance_cols`` the columns actually regressed; ``n_valid`` regions.
+    """
+    if int_method not in TIMESCALE_METHODS:
+        raise ValueError(f"unknown int_method {int_method!r}; "
+                         f"available: {sorted(TIMESCALE_METHODS)}")
+    _, nuisance_cols = split_design_columns(design_matrix)
+    if not nuisance_cols:
+        raise ValueError('design matrix has no drift_* or constant columns to control for')
+
+    int_fn = TIMESCALE_METHODS[int_method]
+    raw_data = np.asarray(raw_data, dtype=float)
+    acf_raw = np.atleast_2d(compute_acf(raw_data, use_fft=use_fft))
+    int_raw = np.asarray(int_fn(acf_raw, tr), dtype=float)
+
+    residual, _, _ = fit_glm(raw_data, design_matrix[nuisance_cols])
+    acf_drift = np.atleast_2d(compute_acf(residual, use_fft=use_fft))
+    int_drift = np.asarray(int_fn(acf_drift, tr), dtype=float)
+
+    delta = int_drift - int_raw
+    finite = np.isfinite(delta)
+    return {
+        'residual': residual,
+        'acf': acf_drift,
+        'int_drift': int_drift,
+        'int_raw': int_raw,
+        'delta': delta,
+        'median': float(np.median(delta[finite])) if finite.any() else np.nan,
+        'q25': float(np.percentile(delta[finite], 25)) if finite.any() else np.nan,
+        'q75': float(np.percentile(delta[finite], 75)) if finite.any() else np.nan,
+        'nuisance_cols': nuisance_cols,
+        'n_valid': int(finite.sum()),
+    }
+
+
 def compute_deflections(rest_timescales, task_timescales, absolute=False):
     """Compute task-vs-rest timescale deflections (task minus rest).
 

@@ -811,69 +811,157 @@ def style_ax(ax, xlabel, ylabel, title, demean=False, fontsize=8,
     ax.spines[['top', 'right']].set_visible(False)
 
 
-def plot_task_regression_example(raw_data, residual_data, design_matrix,
-                                 acf_raw, acf_resid, acf_design,
-                                 int_raw, int_resid, tr,
-                                 task_events=None, brain_map=None, brain_map_label='S-A axis rank',
+def _bin_rows_in_map_order(matrix, order, n_bins):
+    """Average a region x time matrix down to `n_bins` rows, in `order`.
+
+    ``imshow(interpolation='nearest')`` picks one source row per output pixel and discards the
+    rest, so a 400-row heatmap drawn in an inch or two does not average regions -- it *samples*
+    some of them and silently drops the others, and which ones survive depends on the figure
+    DPI. Binning explicitly makes the reduction a stated one: each displayed row is the mean of
+    a contiguous group of regions along the ordering map, so a band in the picture is a band of
+    the map rather than an artefact of the renderer.
+
+    Parameters
+    ----------
+    matrix : (n_regions, n_timepoints) ndarray
+        Values to display.
+    order : (n_valid,) ndarray of int
+        Row indices into `matrix`, already sorted by the ordering map.
+    n_bins : int
+        Target number of displayed rows. Capped at ``len(order)``; bins differ by at most one
+        region when the division is uneven.
+
+    Returns
+    -------
+    (binned, regions_per_bin) : ((n_bins, n_timepoints) ndarray, float)
+    """
+    n_bins = int(max(1, min(n_bins, len(order))))
+    groups = np.array_split(np.asarray(order), n_bins)
+    binned = np.vstack([np.nanmean(matrix[g], axis=0) for g in groups])
+    return binned, len(order) / float(n_bins)
+
+
+def _robust_limits(values, pct=(1.0, 99.0), pad_fraction=0.06):
+    """Percentile-based axis limits, plus how many points fall outside them.
+
+    ``nanmin``/``nanmax`` hand the axis to whichever single region is most extreme, which on a
+    square panel with ``aspect='equal'`` compresses the other 399 into a corner. Percentile
+    limits keep the bulk legible; the returned count is what lets the panel say out loud that
+    something was pushed off the edge, rather than hiding it.
+
+    Parameters
+    ----------
+    values : array-like
+        Pooled values the axis has to cover (NaNs ignored).
+    pct : (float, float)
+        Lower and upper percentiles defining the limits.
+    pad_fraction : float
+        Extra margin, as a fraction of the percentile range.
+
+    Returns
+    -------
+    (lo, hi) : (float, float)
+        Padded limits. Falls back to the finite min/max if the percentiles coincide.
+    """
+    finite = np.asarray(values, dtype=float)
+    finite = finite[np.isfinite(finite)]
+    if finite.size == 0:
+        return 0.0, 1.0
+    lo, hi = np.percentile(finite, pct)
+    if not np.isfinite(hi - lo) or hi <= lo:
+        lo, hi = float(finite.min()), float(finite.max())
+    if hi <= lo:
+        hi = lo + 1.0
+    pad = pad_fraction * (hi - lo)
+    return float(lo - pad), float(hi + pad)
+
+
+def plot_task_regression_example(baseline_data, residual_data, design_matrix,
+                                 acf_baseline, acf_resid, acf_design,
+                                 int_baseline, int_resid, tr,
+                                 task_events=None, design_flat=None,
+                                 brain_map=None, brain_map_label='S-A axis rank',
                                  example_region=None, max_lag_seconds=60.0,
                                  heatmap_cmap='snap_blue_red', map_cmap='snap_sydnor_sa',
-                                 heatmap_pct=98, normalize_rows=True,
+                                 heatmap_pct=98, normalize_rows=True, heatmap_bins=120,
+                                 int_limit_pct=(1.0, 99.0),
                                  figsize=(7.25, 7.5), fontsize=8):
     """Draw the single-subject worked example of what task regression does to the ACF.
 
-    Five panels sharing one argument: the task design is itself autocorrelated (D), regions
-    that track it inherit that autocorrelation (A vs B, C), and because the INT is read off
-    the ACF's decay the inherited structure inflates the INT directly (E).
+    Six panels sharing one argument: the task design is itself autocorrelated (E), regions that
+    track it inherit that autocorrelation (A vs B, C, D), and because the INT is read off the
+    ACF's decay the inherited structure changes the INT directly (F).
 
-    Panels A, B and C share the scan's time axis with the design-matrix strip above them, so
-    a block in the design can be followed down into the data, into the residual, and into a
-    single region's timeseries.
+    Panels A, B, C and D share the scan's time axis, so a block in the design can be followed
+    down into the data, into the residual, and into a single region's timeseries.
+
+    **Both sides of the comparison carry the design's drift basis.** ``baseline_data`` is the
+    residual of a GLM fit with the ``drift_*`` and ``constant`` columns *only*, not the
+    timeseries as loaded -- see ``src.timescales.drift_only_control``. The task GLM's design
+    adds a 0.01 Hz cosine basis that the loaded timeseries never had (it is linearly detrended
+    and nuisance-regressed, not high-pass filtered), so comparing the loaded timeseries against
+    the full residual would charge that filtering to task regression -- about a third of the
+    INT change on HCP-YA working memory. Removing the same basis from both sides leaves the
+    task regressors as the only difference between them.
 
     This function only draws -- every estimate is computed by the caller, so the notebook and
     the figure cannot disagree about what was fit.
 
     Parameters
     ----------
-    raw_data : (n_regions, n_timepoints) ndarray
-        Timeseries before task regression (detrended + nuisance-regressed).
+    baseline_data : (n_regions, n_timepoints) ndarray
+        The "before" side: residuals of a drift-and-constant-only GLM, from
+        ``src.timescales.drift_only_control(...)['residual']``. Not the raw timeseries -- see
+        the note above.
     residual_data : (n_regions, n_timepoints) ndarray
-        Residuals of the task GLM, from ``fit_glm``. May contain all-NaN rows for regions the
-        GLM excluded; those regions are dropped from every panel.
+        The "after" side: residuals of the full task GLM, from ``fit_glm``. May contain all-NaN
+        rows for regions the GLM excluded; those regions are dropped from every panel.
     design_matrix : pd.DataFrame
         The nilearn design matrix. ``drift_*`` and ``constant`` columns are dropped before
         drawing, so the strip shows the task regressors only.
-    acf_raw, acf_resid : (n_regions, n_lags) ndarray
-        ACFs of ``raw_data`` and ``residual_data``.
+    acf_baseline, acf_resid : (n_regions, n_lags) ndarray
+        ACFs of ``baseline_data`` and ``residual_data``.
     acf_design : (n_lags,) or (1, n_lags) ndarray
         ACF of the flattened, HRF-convolved task regressor -- the design's own autocorrelation.
-    int_raw, int_resid : (n_regions,) ndarray
-        INT per region before and after regression, in seconds.
+    int_baseline, int_resid : (n_regions,) ndarray
+        INT per region before and after task regression, in seconds.
     tr : float
         Repetition time in seconds.
     task_events : pd.DataFrame or None
-        Events table (onset/duration). Used only to shade blocks behind panel C.
+        Events table (onset/duration). Used only to shade blocks behind panel D.
+    design_flat : (n_timepoints,) ndarray or None
+        The flattened task regressor -- all conditions merged into one -- from
+        ``Timescales.task_regressor_flat``. Drawn as a highlighted extra row at the bottom of
+        panel A. This is the series whose ACF panel E plots as 'task design', so without it the
+        strongest curve in E has nothing in the figure it corresponds to. None omits the row.
     brain_map : (n_regions,) ndarray or None
-        Map used to order the heatmap rows and to colour panel E -- the S-A axis in practice.
+        Map used to order the heatmap rows and to colour panel F -- the S-A axis in practice.
         Regions are left in acquisition order if None.
     brain_map_label : str
         Colourbar label for ``brain_map``.
     example_region : int or None
-        Region index for panel C, in the *original* (unsorted) region order. Defaults to the
-        region whose variance is most reduced by the GLM, i.e. the one that tracks the design
-        most closely.
+        Region index for panel D, in the *original* (unsorted) region order. Defaults to the
+        region whose variance is most reduced by the task regressors, i.e. the one that tracks
+        the design most closely.
     max_lag_seconds : float
         Right-hand limit of the ACF panel.
     heatmap_cmap : str
-        Diverging colormap for panels A and B. Registered by ``register_custom_colormaps``.
+        Diverging colormap for panels B and C. Registered by ``register_custom_colormaps``.
     map_cmap : str
-        Colormap for ``brain_map`` in panel E.
+        Colormap for ``brain_map`` in panel F.
     heatmap_pct : float
         Percentile of the displayed values setting the symmetric colour limits shared by B and C.
     normalize_rows : bool
-        Scale every region in panels B and C by *its own raw* mean and SD, so that a few
+        Scale every region in panels B and C by *its own baseline* mean and SD, so that a few
         high-amplitude parcels cannot set the colour limits for all 400. Both panels use the
-        raw scaling, so the variance that regression removes still shows as fading. Display
-        only -- no panel's estimates are affected.
+        baseline scaling, so the variance that task regression removes still shows as fading.
+        Display only -- no panel's estimates are affected.
+    heatmap_bins : int
+        Number of displayed rows in panels B and C. Regions are binned in ``brain_map`` order
+        (see ``_bin_rows_in_map_order``); state the count in the caption.
+    int_limit_pct : (float, float)
+        Percentiles setting panel F's axis limits, so a single extreme region cannot compress
+        the other 399.
     figsize : tuple
     fontsize : int
 
@@ -881,30 +969,35 @@ def plot_task_regression_example(raw_data, residual_data, design_matrix,
     -------
     fig : matplotlib Figure
     axes : dict
-        Keys ``'A'``..``'F'`` -- matching the letters drawn on the panels: A design strip,
-        B raw heatmap, C residual heatmap, D example region, E ACFs, F INT scatter -- plus
-        the colourbar axes ``'cbar_data'`` and ``'cbar_map'``.
+        Keys ``'A'``..``'F'``, matching the letters drawn on the panels: A design strip,
+        B baseline heatmap, C residual heatmap, D example region, E ACFs, F INT before vs
+        after -- plus the colourbar axes ``'cbar_data'`` and ``'cbar_map'``.
     stats : dict
-        Numbers the caption needs: ``example_region``, ``example_var_explained``,
-        ``int_raw_mean``, ``int_resid_mean``, ``int_median_change``, ``frac_regions_reduced``,
-        ``zero_crossing_raw``, ``zero_crossing_resid``, ``zero_crossing_design``, ``n_valid``.
+        Numbers the caption needs, keyed to the panel that draws them:
+        B/C -- ``heatmap_n_bins``, ``heatmap_regions_per_bin``;
+        D -- ``example_region``, ``example_var_explained``;
+        E -- ``zero_crossing_baseline``, ``zero_crossing_resid``, ``zero_crossing_design``;
+        F -- ``int_baseline_mean``, ``int_resid_mean``, ``int_median_change``,
+        ``int_change_q25``, ``int_change_q75``, ``int_change_iqr``, ``frac_regions_reduced``,
+        ``int_axis_lo``, ``int_axis_hi``, ``n_outside_int_axis``;
+        plus ``n_valid``.
     """
     register_custom_colormaps()
 
-    raw_data = np.asarray(raw_data, dtype=float)
+    baseline_data = np.asarray(baseline_data, dtype=float)
     residual_data = np.asarray(residual_data, dtype=float)
-    acf_raw = np.atleast_2d(np.asarray(acf_raw, dtype=float))
+    acf_baseline = np.atleast_2d(np.asarray(acf_baseline, dtype=float))
     acf_resid = np.atleast_2d(np.asarray(acf_resid, dtype=float))
     acf_design = np.squeeze(np.asarray(acf_design, dtype=float))
-    int_raw = np.asarray(int_raw, dtype=float)
+    int_baseline = np.asarray(int_baseline, dtype=float)
     int_resid = np.asarray(int_resid, dtype=float)
 
-    n_regions, n_timepoints = raw_data.shape
+    n_regions, n_timepoints = baseline_data.shape
 
     # fit_glm returns all-NaN rows for regions it excluded (NaN or zero-variance input).
-    # Carrying them through would poison the region means in D and open gaps in the heatmaps,
+    # Carrying them through would poison the region means in E and open gaps in the heatmaps,
     # so drop them everywhere and report how many survived.
-    valid = ~(np.isnan(raw_data).any(axis=1) | np.isnan(residual_data).any(axis=1))
+    valid = ~(np.isnan(baseline_data).any(axis=1) | np.isnan(residual_data).any(axis=1))
     if not valid.any():
         raise ValueError('no regions survived the task GLM -- nothing to plot')
 
@@ -918,11 +1011,14 @@ def plot_task_regression_example(raw_data, residual_data, design_matrix,
         order = np.flatnonzero(valid)
 
     # ---- example region ----------------------------------------------------------------
-    # Variance explained by the design, per region. The maximum is the region that most
-    # closely tracks the task, which is the one worth showing as a timeseries. Computed on
-    # valid regions only -- an all-NaN row has no variance to take a ratio of.
+    # Variance explained, per region. Measured against the baseline rather than against the
+    # loaded timeseries, so it is the share the *task regressors* account for and not the
+    # share the task regressors and the drift basis account for together. The maximum is the
+    # region that most closely tracks the task, which is the one worth showing as a timeseries.
     var_explained = np.full(n_regions, np.nan)
-    var_explained[valid] = 1.0 - (residual_data[valid].var(axis=1) / raw_data[valid].var(axis=1))
+    with np.errstate(invalid='ignore', divide='ignore'):
+        var_explained[valid] = 1.0 - (residual_data[valid].var(axis=1)
+                                      / baseline_data[valid].var(axis=1))
     if example_region is None:
         example_region = int(np.nanargmax(var_explained))
     example_region = int(example_region)
@@ -935,10 +1031,12 @@ def plot_task_regression_example(raw_data, residual_data, design_matrix,
     # Row 4 is an empty spacer: rows 0-3 share the time axis and want to sit tight against
     # each other, but the bottom row needs clearance for panel D's x-label.
     # The design strip grows with the number of regressors so its row labels never collide --
-    # HCP-WM has eight, which does not fit in the height a two-regressor design needs.
+    # HCP-WM has eight, plus the flattened row and its gap, which does not fit in the height a
+    # two-regressor design needs.
     dm_cols = [c for c in design_matrix.columns
                if not str(c).startswith('drift_') and c != 'constant']
-    design_height = np.clip(0.11 * len(dm_cols), 0.35, 1.10)
+    n_strip_rows = len(dm_cols) + (2 if design_flat is not None else 0)
+    design_height = np.clip(0.11 * n_strip_rows, 0.35, 1.25)
 
     fig = plt.figure(figsize=figsize)
     outer = gridspec.GridSpec(
@@ -949,7 +1047,7 @@ def plot_task_regression_example(raw_data, residual_data, design_matrix,
     )
 
     ax_design = fig.add_subplot(outer[0, 0])
-    ax_raw = fig.add_subplot(outer[1, 0], sharex=ax_design)
+    ax_base = fig.add_subplot(outer[1, 0], sharex=ax_design)
     ax_resid = fig.add_subplot(outer[2, 0], sharex=ax_design)
     ax_series = fig.add_subplot(outer[3, 0], sharex=ax_design)
     ax_cbar_data = fig.add_subplot(outer[1:3, 1])
@@ -963,18 +1061,55 @@ def plot_task_regression_example(raw_data, residual_data, design_matrix,
         ax.text(-0.055, 1.0, letter, transform=ax.transAxes, fontsize=fontsize + 2,
                 fontweight='bold', ha='right', va='bottom')
 
-    # ---- design matrix strip -----------------------------------------------------------
+    # ---- A: design matrix strip --------------------------------------------------------
     task_cols = dm_cols
     dm_task = design_matrix[task_cols].values.T
+
+    # Conditions share one scale so their relative amplitudes stay readable. The flattened
+    # regressor is the sum of them all and would otherwise be the only bright row, so it is
+    # scaled to its own maximum: it is a different object, shown for its *shape*, and panel E
+    # plots its ACF, which is amplitude-invariant anyway.
+    task_scale = np.nanmax(np.abs(dm_task)) or 1.0
+    if design_flat is not None:
+        flat = np.asarray(design_flat, dtype=float).ravel()
+        if flat.shape[0] != n_timepoints:
+            raise ValueError(f'design_flat has {flat.shape[0]} timepoints, '
+                             f'data has {n_timepoints}')
+        flat_scale = np.nanmax(np.abs(flat)) or 1.0
+        # A NaN spacer row, masked out, separates the flattened regressor from the conditions
+        # so the reader does not read it as a ninth condition.
+        strip = np.full((len(task_cols) + 2, n_timepoints), np.nan)
+        strip[:len(task_cols)] = dm_task / task_scale
+        strip[-1] = flat / flat_scale
+        flat_row = len(task_cols) + 1
+    else:
+        strip = dm_task / task_scale
+        flat_row = None
 
     # vmin=0 rather than the data minimum: the HRF undershoot dips slightly negative, which
     # would otherwise put the inter-block baseline at mid-grey and make the whole strip muddy.
     # Clipping it to white keeps 'no task' reading as blank.
-    ax_design.imshow(dm_task, cmap='Greys', aspect='auto', interpolation='nearest',
-                     vmin=0, vmax=np.nanmax(dm_task),
-                     extent=(-0.5, n_timepoints - 0.5, len(task_cols) - 0.5, -0.5))
-    ax_design.set_yticks(np.arange(len(task_cols)))
-    ax_design.set_yticklabels([str(c)[:14] for c in task_cols], fontsize=max(4, fontsize - 3))
+    strip_cmap = plt.get_cmap('Greys').copy()
+    strip_cmap.set_bad(color='none')
+    ax_design.imshow(np.ma.masked_invalid(strip), cmap=strip_cmap, aspect='auto',
+                     interpolation='nearest', vmin=0, vmax=1,
+                     extent=(-0.5, n_timepoints - 0.5, strip.shape[0] - 0.5, -0.5))
+
+    tick_rows = list(np.arange(len(task_cols)))
+    tick_labels = [str(c)[:14] for c in task_cols]
+    if flat_row is not None:
+        tick_rows.append(flat_row)
+        tick_labels.append('flattened')
+        # Outlined in the same grey as panel E's dashed curve, which is this row's ACF. The
+        # box is the only thing tying the two panels together.
+        ax_design.add_patch(mpatches.Rectangle(
+            (-0.5, flat_row - 0.5), n_timepoints, 1.0, fill=False,
+            edgecolor='0.35', lw=0.8, zorder=5, clip_on=False))
+    ax_design.set_yticks(tick_rows)
+    ax_design.set_yticklabels(tick_labels, fontsize=max(4, fontsize - 3))
+    if flat_row is not None:
+        ax_design.get_yticklabels()[-1].set_color('0.35')
+        ax_design.get_yticklabels()[-1].set_fontweight('bold')
     ax_design.set_ylabel('Task\nregressors', fontsize=fontsize, labelpad=1)
     ax_design.tick_params(axis='x', labelbottom=False, length=0)
     ax_design.tick_params(axis='y', length=0, pad=1)
@@ -982,42 +1117,55 @@ def plot_task_regression_example(raw_data, residual_data, design_matrix,
     _panel_label(ax_design, 'A')
     ax_design.set_title('HRF-convolved task design', fontsize=fontsize, pad=3)
 
-    # ---- A / B heatmaps ----------------------------------------------------------------
-    # Parcels differ several-fold in raw signal amplitude, so on a shared absolute colour
-    # scale a handful of high-amplitude regions set the limits and everything else washes
-    # out. Scale each region by *its own raw* mean and SD and apply that same scaling to the
-    # residual: regions become comparable, while the drop in variance that regression causes
-    # is still visible as fading rather than being normalised away (which is what
-    # standardising each panel separately would do).
+    # ---- B / C heatmaps ----------------------------------------------------------------
+    # Parcels differ several-fold in signal amplitude, so on a shared absolute colour scale a
+    # handful of high-amplitude regions set the limits and everything else washes out. Scale
+    # each region by *its own baseline* mean and SD and apply the baseline SD to the residual:
+    # regions become comparable, while the drop in variance that task regression causes is
+    # still visible as fading rather than being normalised away (which is what standardising
+    # each panel separately would do).
+    #
+    # The residual is centred on its *own* mean, not the baseline's. It is mean-zero by
+    # construction whenever the design carries a constant column, so with mean-centred input
+    # the two are the same thing -- but handed data in native BOLD units, subtracting the
+    # baseline mean would shift every residual by that mean and render panel C a uniform slab.
     if normalize_rows:
-        mu = raw_data.mean(axis=1, keepdims=True)
-        sd = raw_data.std(axis=1, keepdims=True)
+        sd = baseline_data.std(axis=1, keepdims=True)
         with np.errstate(invalid='ignore', divide='ignore'):
-            raw_disp = (raw_data - mu) / sd
-            resid_disp = (residual_data - mu) / sd
-        cbar_label = 'Signal (SD of raw)'
+            base_disp = (baseline_data - baseline_data.mean(axis=1, keepdims=True)) / sd
+            resid_disp = (residual_data - residual_data.mean(axis=1, keepdims=True)) / sd
+        # Names the scaling honestly: the denominator is the baseline's SD, and the baseline
+        # is itself a residual, so 'SD of raw' would now be wrong.
+        cbar_label = 'Signal (SD of baseline)'
     else:
-        raw_disp, resid_disp = raw_data, residual_data
+        base_disp, resid_disp = baseline_data, residual_data
         cbar_label = 'Signal (a.u.)'
 
-    vmax = np.nanpercentile(np.abs(raw_disp[valid]), heatmap_pct)
+    base_binned, regions_per_bin = _bin_rows_in_map_order(base_disp, order, heatmap_bins)
+    resid_binned, _ = _bin_rows_in_map_order(resid_disp, order, heatmap_bins)
+    n_bins = base_binned.shape[0]
+
+    vmax = np.nanpercentile(np.abs(base_binned), heatmap_pct)
     heat_kw = dict(cmap=heatmap_cmap, vmin=-vmax, vmax=vmax, aspect='auto',
                    interpolation='nearest',
-                   extent=(-0.5, n_timepoints - 0.5, len(order) - 0.5, -0.5))
-    im = ax_raw.imshow(raw_disp[order], **heat_kw)
-    ax_resid.imshow(resid_disp[order], **heat_kw)
+                   extent=(-0.5, n_timepoints - 0.5, n_bins - 0.5, -0.5))
+    im = ax_base.imshow(base_binned, **heat_kw)
+    ax_resid.imshow(resid_binned, **heat_kw)
 
-    ylabel = 'Region' if brain_map is None else f'Region\n({brain_map_label} order)'
-    for ax, title in ((ax_raw, 'Before task regression'),
+    ylabel = ('Region, binned' if brain_map is None
+              else f'Region, binned\n({brain_map_label} order)')
+    for ax, title in ((ax_base, 'Before task regression'),
                       (ax_resid, 'After task regression')):
-        ax.set_ylabel(ylabel, fontsize=fontsize, labelpad=1)
+        ax.set_ylabel(ylabel, fontsize=max(5, fontsize - 1), labelpad=1)
         ax.set_title(title, fontsize=fontsize, pad=3)
-        ax.set_yticks([0, len(order) - 1])
+        # Ticks label the underlying regions, not the bins: the bins are a display device and
+        # the reader should be locating parcel 1 and parcel 400 on the map ordering.
+        ax.set_yticks([0, n_bins - 1])
         ax.set_yticklabels(['1', str(len(order))], fontsize=fontsize)
         ax.tick_params(axis='x', labelbottom=False, length=0)
         ax.tick_params(axis='y', labelsize=fontsize, pad=1)
         ax.spines[:].set_visible(False)
-    _panel_label(ax_raw, 'B')
+    _panel_label(ax_base, 'B')
     _panel_label(ax_resid, 'C')
 
     cbar = fig.colorbar(im, cax=ax_cbar_data)
@@ -1025,23 +1173,24 @@ def plot_task_regression_example(raw_data, residual_data, design_matrix,
     cbar.ax.tick_params(labelsize=max(5, fontsize - 2), pad=1)
     cbar.outline.set_visible(False)
 
-    # ---- C: single region --------------------------------------------------------------
+    # ---- D: single region --------------------------------------------------------------
     for start, end in _task_block_spans(task_events, tr, n_timepoints):
         ax_series.axvspan(start, end, color='0.85', lw=0, zorder=0)
-    ax_series.plot(np.arange(n_timepoints), raw_data[example_region], lw=0.6,
+    ax_series.plot(np.arange(n_timepoints), baseline_data[example_region], lw=0.6,
                    color='#B2182B', label='before', zorder=2)
     ax_series.plot(np.arange(n_timepoints), residual_data[example_region], lw=0.6,
                    color='#2166AC', label='after', zorder=3)
     ax_series.set_ylabel('Signal (a.u.)', fontsize=fontsize, labelpad=1)
     ax_series.set_xlabel('Time (minutes)', fontsize=fontsize, labelpad=1)
     # Locate the region by its position on the brain map rather than by a marker on the
-    # heatmaps: 400 rows in a couple of inches puts a single row below one pixel, so a
-    # positional arrow cannot actually point at it.
+    # heatmaps: even binned, one row is a fraction of an inch, so a positional arrow cannot
+    # point at a single parcel.
     rank_note = ('' if brain_map is None
                  else f' [{brain_map_label} {brain_map[example_region]:.0f}/{n_regions}]')
     ax_series.set_title(
         f'Region {example_region + 1}{rank_note}: most task-driven '
-        f'({100 * var_explained[example_region]:.0f}% of variance explained by the design)',
+        f'({100 * var_explained[example_region]:.0f}% of variance explained by the task '
+        f'regressors)',
         fontsize=fontsize, pad=3)
     # Tick on whole (or half) minutes rather than on evenly spaced frames, which would label
     # the axis with arbitrary decimals.
@@ -1061,8 +1210,9 @@ def plot_task_regression_example(raw_data, residual_data, design_matrix,
     leg.get_frame().set_facecolor('white')
     _panel_label(ax_series, 'D')
 
-    # ---- D: ACFs -----------------------------------------------------------------------
-    max_lag = int(min(acf_raw.shape[1], acf_resid.shape[1], np.ceil(max_lag_seconds / tr) + 1))
+    # ---- E: ACFs -----------------------------------------------------------------------
+    max_lag = int(min(acf_baseline.shape[1], acf_resid.shape[1],
+                      np.ceil(max_lag_seconds / tr) + 1))
     lag_seconds = np.arange(max_lag) * tr
 
     def _band(acf, color, label):
@@ -1073,22 +1223,26 @@ def plot_task_regression_example(raw_data, residual_data, design_matrix,
         return mean
 
     ax_acf.axhline(0, color='k', lw=0.5, ls='--', alpha=0.4, zorder=1)
-    mean_raw = _band(acf_raw, '#B2182B', 'before')
+    mean_baseline = _band(acf_baseline, '#B2182B', 'before')
     mean_resid = _band(acf_resid, '#2166AC', 'after')
 
     design_curve = acf_design[:max_lag]
-    ax_acf.plot(lag_seconds[:len(design_curve)], design_curve, color='0.35', lw=1.0, ls=(0, (3, 1.5)),
-                label='task design', zorder=2)
+    ax_acf.plot(lag_seconds[:len(design_curve)], design_curve, color='0.35', lw=1.0,
+                ls=(0, (3, 1.5)), label='task design', zorder=2)
 
     def _first_crossing(curve):
         below = np.flatnonzero(curve < 0)
         return float(below[0] * tr) if below.size else np.nan
 
-    zc_raw, zc_resid = _first_crossing(mean_raw), _first_crossing(mean_resid)
+    zc_baseline, zc_resid = _first_crossing(mean_baseline), _first_crossing(mean_resid)
     zc_design = _first_crossing(design_curve)
-    for zc, color in ((zc_raw, '#B2182B'), (zc_resid, '#2166AC')):
+    # The design's own crossing is marked alongside the data's. It was computed and returned
+    # before but never drawn, which left the figure's strongest coincidence -- that the
+    # 'before' ACF turns over near the lag the design does -- invisible.
+    for zc, color in ((zc_baseline, '#B2182B'), (zc_resid, '#2166AC'), (zc_design, '0.35')):
         if np.isfinite(zc):
-            ax_acf.plot([zc], [0], marker='v', color=color, markersize=3, clip_on=False, zorder=4)
+            ax_acf.plot([zc], [0], marker='v', color=color, markersize=3, clip_on=False,
+                        zorder=4)
 
     ax_acf.set_xlim(0, lag_seconds[-1])
     style_ax(ax_acf, 'Lag (seconds)', 'Autocorrelation',
@@ -1096,28 +1250,47 @@ def plot_task_regression_example(raw_data, residual_data, design_matrix,
              title_pad=3, tick_pad=1)
     ax_acf.legend(fontsize=max(5, fontsize - 2), frameon=False, loc='upper right',
                   handlelength=1.4, borderaxespad=0.1)
+    # Says out loud what the triangles are. They mark a zero crossing of the *mean* ACF,
+    # which is a different estimator from the per-region INT in F; without the note a reader
+    # is entitled to assume the triangle is where F's numbers come from.
+    ax_acf.text(0.02, 0.03,
+                '$\\blacktriangledown$ zero crossing of the mean ACF\n'
+                '(not the per-region estimator in F)',
+                transform=ax_acf.transAxes, fontsize=max(4, fontsize - 3),
+                color='0.35', va='bottom', ha='left')
     _panel_label(ax_acf, 'E')
 
-    # ---- E: INT before vs after --------------------------------------------------------
-    both = valid & np.isfinite(int_raw) & np.isfinite(int_resid)
+    # ---- F: INT before vs after --------------------------------------------------------
+    both = valid & np.isfinite(int_baseline) & np.isfinite(int_resid)
     colours = brain_map[both] if brain_map is not None else None
-    sc = ax_int.scatter(int_raw[both], int_resid[both], c=colours, cmap=map_cmap,
+    sc = ax_int.scatter(int_baseline[both], int_resid[both], c=colours, cmap=map_cmap,
                         s=3, lw=0, alpha=0.85, zorder=3)
 
-    lo = float(np.nanmin([int_raw[both].min(), int_resid[both].min()]))
-    hi = float(np.nanmax([int_raw[both].max(), int_resid[both].max()]))
-    pad = 0.05 * (hi - lo)
-    ax_int.plot([lo - pad, hi + pad], [lo - pad, hi + pad], color='k', lw=0.5, ls='--',
+    int_lo, int_hi = _robust_limits(np.concatenate([int_baseline[both], int_resid[both]]),
+                                    pct=int_limit_pct)
+    outside = int(np.sum((int_baseline[both] < int_lo) | (int_baseline[both] > int_hi)
+                         | (int_resid[both] < int_lo) | (int_resid[both] > int_hi)))
+    ax_int.plot([int_lo, int_hi], [int_lo, int_hi], color='k', lw=0.5, ls='--',
                 alpha=0.5, zorder=2)
-    ax_int.set_xlim(lo - pad, hi + pad)
-    ax_int.set_ylim(lo - pad, hi + pad)
+    ax_int.set_xlim(int_lo, int_hi)
+    ax_int.set_ylim(int_lo, int_hi)
     ax_int.set_aspect('equal', adjustable='box')
 
-    delta = int_resid[both] - int_raw[both]
+    delta = int_resid[both] - int_baseline[both]
+    q25, q75 = np.percentile(delta, [25, 75])
     frac_reduced = float(np.mean(delta < 0))
     ax_int.text(0.04, 0.96,
-                f'median $\\Delta$ = {np.median(delta):+.2f} s\n{100 * frac_reduced:.0f}% of regions reduced',
+                f'median $\\Delta$ = {np.median(delta):+.2f} s\n'
+                f'IQR [{q25:+.2f}, {q75:+.2f}]\n'
+                f'{100 * frac_reduced:.0f}% of regions reduced',
                 transform=ax_int.transAxes, fontsize=max(5, fontsize - 2), va='top', ha='left')
+    if outside:
+        # Robust limits keep the bulk legible, but a point pushed off the edge has to be
+        # declared or the panel is claiming a range it does not cover.
+        ax_int.text(0.97, 0.03, f'{outside} region(s) outside view',
+                    transform=ax_int.transAxes, fontsize=max(4, fontsize - 3),
+                    color='0.45', va='bottom', ha='right',
+                    bbox=dict(facecolor='white', edgecolor='none', alpha=0.75, pad=0.8))
     style_ax(ax_int, 'INT before (s)', 'INT after (s)', 'INT per region',
              fontsize=fontsize, title_pad=3, tick_pad=1)
     _panel_label(ax_int, 'F')
@@ -1132,19 +1305,27 @@ def plot_task_regression_example(raw_data, residual_data, design_matrix,
 
     # Keys match the letters drawn on the panels, so a caption edit and a code edit
     # can refer to the same thing.
-    axes = {'A': ax_design, 'B': ax_raw, 'C': ax_resid, 'D': ax_series,
+    axes = {'A': ax_design, 'B': ax_base, 'C': ax_resid, 'D': ax_series,
             'E': ax_acf, 'F': ax_int,
             'cbar_data': ax_cbar_data, 'cbar_map': ax_cbar_map}
     stats = {
+        'heatmap_n_bins': int(n_bins),
+        'heatmap_regions_per_bin': float(regions_per_bin),
         'example_region': example_region,
         'example_var_explained': float(var_explained[example_region]),
-        'int_raw_mean': float(np.nanmean(int_raw[both])),
-        'int_resid_mean': float(np.nanmean(int_resid[both])),
-        'int_median_change': float(np.median(delta)),
-        'frac_regions_reduced': frac_reduced,
-        'zero_crossing_raw': zc_raw,
+        'zero_crossing_baseline': zc_baseline,
         'zero_crossing_resid': zc_resid,
         'zero_crossing_design': zc_design,
+        'int_baseline_mean': float(np.nanmean(int_baseline[both])),
+        'int_resid_mean': float(np.nanmean(int_resid[both])),
+        'int_median_change': float(np.median(delta)),
+        'int_change_q25': float(q25),
+        'int_change_q75': float(q75),
+        'int_change_iqr': float(q75 - q25),
+        'frac_regions_reduced': frac_reduced,
+        'int_axis_lo': float(int_lo),
+        'int_axis_hi': float(int_hi),
+        'n_outside_int_axis': outside,
         'n_valid': int(valid.sum()),
     }
     return fig, axes, stats
