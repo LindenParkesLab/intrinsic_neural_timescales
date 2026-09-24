@@ -884,7 +884,6 @@ def plot_task_regression_example(baseline_data, residual_data, design_matrix,
                                  example_region=None, max_lag_seconds=60.0,
                                  heatmap_cmap='snap_blue_red', map_cmap='snap_sydnor_sa',
                                  heatmap_pct=98, normalize_rows=True, heatmap_bins=120,
-                                 int_limit_pct=(1.0, 99.0),
                                  figsize=(7.25, 7.5), fontsize=8):
     """Draw the single-subject worked example of what task regression does to the ACF.
 
@@ -959,9 +958,6 @@ def plot_task_regression_example(baseline_data, residual_data, design_matrix,
     heatmap_bins : int
         Number of displayed rows in panels B and C. Regions are binned in ``brain_map`` order
         (see ``_bin_rows_in_map_order``); state the count in the caption.
-    int_limit_pct : (float, float)
-        Percentiles setting panel F's axis limits, so a single extreme region cannot compress
-        the other 399.
     figsize : tuple
     fontsize : int
 
@@ -979,7 +975,8 @@ def plot_task_regression_example(baseline_data, residual_data, design_matrix,
         E -- ``zero_crossing_baseline``, ``zero_crossing_resid``, ``zero_crossing_design``;
         F -- ``int_baseline_mean``, ``int_resid_mean``, ``int_median_change``,
         ``int_change_q25``, ``int_change_q75``, ``int_change_iqr``, ``frac_regions_reduced``,
-        ``int_axis_lo``, ``int_axis_hi``, ``n_outside_int_axis``;
+        ``int_axis_lo``, ``int_axis_hi`` (the full data range -- panel F clips nothing, so
+        ``n_outside_int_axis`` is always 0 and is kept only so callers do not break);
         plus ``n_valid``.
     """
     register_custom_colormaps()
@@ -1108,8 +1105,10 @@ def plot_task_regression_example(baseline_data, residual_data, design_matrix,
     ax_design.set_yticks(tick_rows)
     ax_design.set_yticklabels(tick_labels, fontsize=max(4, fontsize - 3))
     if flat_row is not None:
+        # Colour, but NOT bold: at this size a bold weight smears the glyphs into each other
+        # and the label reads as blurry. The grey matches panel E's dashed curve, and the
+        # rectangle drawn above is what actually ties the two panels together.
         ax_design.get_yticklabels()[-1].set_color('0.35')
-        ax_design.get_yticklabels()[-1].set_fontweight('bold')
     ax_design.set_ylabel('Task\nregressors', fontsize=fontsize, labelpad=1)
     ax_design.tick_params(axis='x', labelbottom=False, length=0)
     ax_design.tick_params(axis='y', length=0, pad=1)
@@ -1182,14 +1181,11 @@ def plot_task_regression_example(baseline_data, residual_data, design_matrix,
                    color='#2166AC', label='after', zorder=3)
     ax_series.set_ylabel('Signal (a.u.)', fontsize=fontsize, labelpad=1)
     ax_series.set_xlabel('Time (minutes)', fontsize=fontsize, labelpad=1)
-    # Locate the region by its position on the brain map rather than by a marker on the
-    # heatmaps: even binned, one row is a fraction of an inch, so a positional arrow cannot
-    # point at a single parcel.
-    rank_note = ('' if brain_map is None
-                 else f' [{brain_map_label} {brain_map[example_region]:.0f}/{n_regions}]')
+    # The region's brain-map rank and the fact that it is the most task-driven parcel are both
+    # returned in `stats` for the caption; the title carries only what the panel shows.
     ax_series.set_title(
-        f'Region {example_region + 1}{rank_note}: most task-driven '
-        f'({100 * var_explained[example_region]:.0f}% of variance explained by the task '
+        f'Region {example_region + 1} '
+        f'({100 * var_explained[example_region]:.0f}% of variance explained by task '
         f'regressors)',
         fontsize=fontsize, pad=3)
     # Tick on whole (or half) minutes rather than on evenly spaced frames, which would label
@@ -1250,14 +1246,9 @@ def plot_task_regression_example(baseline_data, residual_data, design_matrix,
              title_pad=3, tick_pad=1)
     ax_acf.legend(fontsize=max(5, fontsize - 2), frameon=False, loc='upper right',
                   handlelength=1.4, borderaxespad=0.1)
-    # Says out loud what the triangles are. They mark a zero crossing of the *mean* ACF,
-    # which is a different estimator from the per-region INT in F; without the note a reader
-    # is entitled to assume the triangle is where F's numbers come from.
-    ax_acf.text(0.02, 0.03,
-                '$\\blacktriangledown$ zero crossing of the mean ACF\n'
-                '(not the per-region estimator in F)',
-                transform=ax_acf.transAxes, fontsize=max(4, fontsize - 3),
-                color='0.35', va='bottom', ha='left')
+    # The triangles mark a zero crossing of the *mean* ACF, which is a different estimator
+    # from the per-region INT in F. That distinction now lives in the caption rather than as
+    # an inline note, which read as a caveat about the panel itself.
     _panel_label(ax_acf, 'E')
 
     # ---- F: INT before vs after --------------------------------------------------------
@@ -1266,10 +1257,12 @@ def plot_task_regression_example(baseline_data, residual_data, design_matrix,
     sc = ax_int.scatter(int_baseline[both], int_resid[both], c=colours, cmap=map_cmap,
                         s=3, lw=0, alpha=0.85, zorder=3)
 
+    # Full range, so every region is on view. Percentile limits kept the bulk legible but
+    # pushed a handful of parcels off the edge, and a scatter that silently omits points is
+    # worse than one with a few outliers setting a wider axis.
     int_lo, int_hi = _robust_limits(np.concatenate([int_baseline[both], int_resid[both]]),
-                                    pct=int_limit_pct)
-    outside = int(np.sum((int_baseline[both] < int_lo) | (int_baseline[both] > int_hi)
-                         | (int_resid[both] < int_lo) | (int_resid[both] > int_hi)))
+                                    pct=(0.0, 100.0))
+    outside = 0
     ax_int.plot([int_lo, int_hi], [int_lo, int_hi], color='k', lw=0.5, ls='--',
                 alpha=0.5, zorder=2)
     ax_int.set_xlim(int_lo, int_hi)
@@ -1284,14 +1277,7 @@ def plot_task_regression_example(baseline_data, residual_data, design_matrix,
                 f'IQR [{q25:+.2f}, {q75:+.2f}]\n'
                 f'{100 * frac_reduced:.0f}% of regions reduced',
                 transform=ax_int.transAxes, fontsize=max(5, fontsize - 2), va='top', ha='left')
-    if outside:
-        # Robust limits keep the bulk legible, but a point pushed off the edge has to be
-        # declared or the panel is claiming a range it does not cover.
-        ax_int.text(0.97, 0.03, f'{outside} region(s) outside view',
-                    transform=ax_int.transAxes, fontsize=max(4, fontsize - 3),
-                    color='0.45', va='bottom', ha='right',
-                    bbox=dict(facecolor='white', edgecolor='none', alpha=0.75, pad=0.8))
-    style_ax(ax_int, 'INT before (s)', 'INT after (s)', 'INT per region',
+    style_ax(ax_int, 'Timescale before (s)', 'Timescale after (s)', 'INT per region',
              fontsize=fontsize, title_pad=3, tick_pad=1)
     _panel_label(ax_int, 'F')
 
