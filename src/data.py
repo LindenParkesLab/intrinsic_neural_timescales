@@ -4,6 +4,7 @@ import re
 import logging
 import numpy as np
 import scipy as sp
+from scipy import stats as sp_stats
 import pandas as pd
 import nibabel as nib
 import yaml
@@ -46,6 +47,11 @@ class ModalityConfig:
     task_events_use_glob: bool = False
     use_glob: bool = False
     filename_template_fallbacks: List[str] = field(default_factory=list)
+    task_params: Dict[str, dict] = field(default_factory=dict)
+
+    def template_fields(self, task: str) -> dict:
+        """Extra template fields for ``task``: its ``task_params`` entry minus ``tr``."""
+        return {k: v for k, v in self.task_params.get(task, {}).items() if k != 'tr'}
 
 
 @dataclass
@@ -88,6 +94,7 @@ def load_dataset_config(dataset_name: str) -> DatasetConfig:
             task_events_use_glob=bool(mod_raw.get('task_events_use_glob', False)),
             use_glob=bool(mod_raw.get('use_glob', False)),
             filename_template_fallbacks=mod_raw.get('filename_template_fallbacks') or [],
+            task_params={str(t): dict(p) for t, p in (mod_raw.get('task_params') or {}).items()},
         )
 
     return DatasetConfig(
@@ -335,10 +342,34 @@ def _behavior_hcp_unrestricted_restricted(loader: 'DataLoader') -> pd.DataFrame:
     # Added after the case fix above so the meanRelRMS_* names survive it verbatim.
     return _add_hcpya_motion(loader, df)
 
+#: NDA's missing-value code.
+HCPD_SENTINEL = 999
 
 def _load_hcpd_beh_file(beh_dir: Path, fname: str, cols: list,
-                         rename: dict = None, missing_vals: list = None) -> pd.DataFrame:
-    """Load one HCP-D behavioral TSV and return a tidy DataFrame indexed by subject_id."""
+                         rename: dict = None, missing_vals: list = None,
+                         row_filter: 'callable' = None,
+                         filter_cols: list = None) -> pd.DataFrame:
+    """Load one HCP-D behavioral TSV and return a tidy DataFrame indexed by subject_id.
+
+    Parameters
+    ----------
+    cols : list of str
+        Columns to extract. Missing ones are skipped silently (the release varies).
+    rename : dict, optional
+        Applied last, so ``cols`` always names the on-disk column.
+    missing_vals : list, optional
+        Extra values to mask *in addition to* :data:`HCPD_SENTINEL`, which is always masked.
+    row_filter : callable, optional
+        ``frame -> boolean Series``, applied to the raw rows **before** de-duplication.
+        Several of these files hold more than one row per subject, and the extra rows are not
+        repeat visits -- they are different instruments (self- vs caregiver-report, different
+        age-band forms, different constructs). Without a filter, ``keep='first'`` picks whichever
+        the file happens to list first, which silently mixes scales within a column. Use this to
+        pin one respondent and one form.
+    filter_cols : list of str, optional
+        Extra columns ``row_filter`` needs (e.g. ``comqother``, ``version_form``). They are read
+        but never returned.
+    """
     path = beh_dir / fname
     try:
         hdr = pd.read_csv(path, sep='\t', nrows=0)
@@ -348,18 +379,42 @@ def _load_hcpd_beh_file(beh_dir: Path, fname: str, cols: list,
     available = [c for c in cols if c in hdr.columns]
     if not available:
         return pd.DataFrame()
-    df = pd.read_csv(path, sep='\t', skiprows=[1], usecols=['src_subject_id'] + available)
+
+    extra = [c for c in (filter_cols or []) if c in hdr.columns]
+    df = pd.read_csv(path, sep='\t', skiprows=[1],
+                     usecols=['src_subject_id'] + available + extra, low_memory=False)
+
+    if row_filter is not None:
+        keep = row_filter(df)
+        n_dropped = int((~keep).sum())
+        df = df[keep]
+        logger.debug('%s: row_filter kept %d of %d rows', fname, len(df), len(df) + n_dropped)
+    df = df.drop(columns=extra, errors='ignore')
+
     df['subject_id'] = df['src_subject_id'].astype(str) + 'V1MR'
     df = (df.drop(columns='src_subject_id')
             .set_index('subject_id')
             .loc[lambda x: ~x.index.duplicated(keep='first')])
     df = df.apply(pd.to_numeric, errors='coerce')
-    if missing_vals:
-        for mv in missing_vals:
-            df = df.replace(mv, np.nan)
+
+    for mv in [HCPD_SENTINEL] + list(missing_vals or []):
+        df = df.replace(mv, np.nan)
+
+    for c in df.columns:
+        if df[c].notna().sum() == 0:
+            logger.warning("HCP-D: column '%s' from %s is empty after masking %d "
+                           "(no usable values in this release)", c, fname, HCPD_SENTINEL)
+
     if rename:
         df = df.rename(columns=rename)
     return df
+
+
+def _hcpd_self_report(df: pd.DataFrame) -> pd.Series:
+    """Rows a participant answered about themselves, excluding caregiver-report rows.
+
+    """
+    return ~df['comqother'].astype(str).str.contains('caregiver', case=False, na=False)
 
 
 def _behavior_hcp_d(loader: 'DataLoader') -> pd.DataFrame:
@@ -409,52 +464,145 @@ def _behavior_hcp_d(loader: 'DataLoader') -> pd.DataFrame:
     ]:
         df = df.join(frame, how='left')
 
-    # Pubertal development — coalesce sex-specific scores into one column
-    pds = lf('pds01.txt', ['pds_boy_rs', 'pds_girl_rs'], missing_vals=[999])
-    if not pds.empty and 'pds_boy_rs' in pds.columns:
-        pds['pds_score'] = pds['pds_boy_rs'].combine_first(pds['pds_girl_rs'])
-        pds = pds[['pds_score']]
-    df = df.join(pds, how='left')
-
-    # Personality / temperament / impulsivity
+    # Personality / temperament / impulsivity — self-report only; see _hcpd_self_report.
     for frame in [
-        lf('bisbas01.txt', ['bissc_total', 'bas_drive', 'bas_fs', 'bas_rr']),
-        lf('upps01.txt',   ['premed_score', 'senseek_score', 'persev_score']),
+        lf('bisbas01.txt', ['bissc_total', 'bas_drive', 'bas_fs', 'bas_rr'],
+           row_filter=_hcpd_self_report, filter_cols=['comqother']),
+        lf('upps01.txt',   ['premed_score', 'senseek_score', 'persev_score'],
+           row_filter=_hcpd_self_report, filter_cols=['comqother']),
     ]:
         df = df.join(frame, how='left')
 
-    # Stress / affect / wellbeing
-    for frame in [
-        lf('pss01.txt',            ['pss_totalscore']),
-        lf('tlbx_fearanx01.txt',   ['nih_tlbx_tscore'], rename={'nih_tlbx_tscore': 'fearanx_tscore'}),
-        lf('tlbx_wellbeing01.txt', ['nih_tlbx_tscore'], rename={'nih_tlbx_tscore': 'wellbeing_tscore'}),
-        lf('tlbx_sensation01.txt', ['nih_tlbx_tscore'], rename={'nih_tlbx_tscore': 'sensation_tscore'}),
-    ]:
-        df = df.join(frame, how='left')
+    # One subject has a bas_fs of 99. Prob coding error. NaN-ing it!
+    if 'bas_fs' in df.columns:
+        df.loc[df['bas_fs'] > 90, 'bas_fs'] = np.nan
 
-    # Outlier filter on fluid cognition composite (known extreme outliers in raw data)
-    if 'nih_fluidcogcomp_unadjusted' in df.columns:
-        col = df['nih_fluidcogcomp_unadjusted']
-        df['nih_fluidcogcomp_unadjusted'] = col.where(col.sub(col.mean()).abs() <= 3 * col.std())
+    # --- Stress / affect ---
+    # Perceived Stress
+    df = df.join(lf('pss01.txt', ['nih_tlbx_tscore'],
+                    rename={'nih_tlbx_tscore': 'pss_tscore'},
+                    row_filter=_hcpd_self_report, filter_cols=['comqother']), how='left')
 
-    # --- CARIT nogo accuracy (from per-subject EVs) ---
-    def _ev_count(path):
+    # Fear/anxiety
+    df = df.join(lf('tlbx_fearanx01.txt', ['nih_tlbx_tscore'],
+                    rename={'nih_tlbx_tscore': 'fearanx_tscore'},
+                    row_filter=lambda d: d['version_form'].astype(str)
+                                          .str.contains('Fear FF Ages 8-17', na=False),
+                    filter_cols=['version_form']), how='left')
+
+    # Wellbeing
+    df = df.join(lf('tlbx_wellbeing01.txt', ['nih_tlbx_tscore'],
+                    rename={'nih_tlbx_tscore': 'life_satisfaction_tscore'},
+                    row_filter=lambda d: (
+                        d['version_form'].astype(str).str.contains(
+                            'General Life Satisfaction', na=False)
+                        & ~d['version_form'].astype(str).str.contains('Parent Report', na=False)),
+                    filter_cols=['version_form']), how='left')
+
+    # --- CARIT performance (from per-subject EVs) ---
+    df = df.join(load_hcpd_carit(loader), how='left')
+
+    return df
+
+#: CARIT trial-outcome EVs
+CARIT_EVS = ('go', 'miss', 'nogoCRWin', 'nogoCRLose', 'nogoFAWin', 'nogoFALose')
+CARIT_RUN = 'PA' 
+HCPD_CARIT_CACHE = 'hcpd_carit_performance_pa.csv'
+
+def _carit_run_counts(ev_dir: Path) -> Optional[dict]:
+    """Trial counts for one CARIT run, or None when the run is absent."""
+    if not (ev_dir / 'go.txt').exists():
+        return None
+    counts = {}
+    for ev in CARIT_EVS:
+        path = ev_dir / f'{ev}.txt'
         try:
             with open(path) as f:
-                return sum(1 for line in f if line.strip())
+                counts[ev] = sum(1 for line in f if line.strip())
         except FileNotFoundError:
-            return 0
+            counts[ev] = 0        # an outcome that never occurred gets no file
+    return counts
 
-    carit = {}
-    for subj in df.index:
-        ev_dir = (proc_dir / split_hcpd_string(subj)
-                  / 'MNINonLinear' / 'Results' / 'tfMRI_CARIT_PA' / 'EVs')
-        n_fa = (_ev_count(ev_dir / 'nogoFAWin.txt') + _ev_count(ev_dir / 'nogoFALose.txt'))
-        n_cr = (_ev_count(ev_dir / 'nogoCRWin.txt') + _ev_count(ev_dir / 'nogoCRLose.txt'))
-        total = n_fa + n_cr
-        carit[subj] = n_cr / total if total > 0 else np.nan
-    df['carit_nogo_acc'] = pd.Series(carit)
 
+def _carit_metrics(counts: dict) -> Optional[dict]:
+    """Signal-detection and error measures from pooled CARIT trial counts.
+
+    CARIT is a go/no-go task: frequent go trials build a prepotent response that rare no-go
+    trials require withholding. That gives two independent error types, and they are not
+    redundant -- a false alarm is a failure to inhibit, a miss is a lapse of attention.
+
+    ``d_prime`` and ``criterion`` separate those from response bias.
+    """
+    go, miss = counts['go'], counts['miss']
+    cr = counts['nogoCRWin'] + counts['nogoCRLose']
+    fa = counts['nogoFAWin'] + counts['nogoFALose']
+    n_go, n_nogo = go + miss, cr + fa
+    if n_go == 0 or n_nogo == 0:
+        return None
+
+    hit_c = (go + 0.5) / (n_go + 1)
+    fa_c = (fa + 0.5) / (n_nogo + 1)
+    z_hit, z_fa = sp_stats.norm.ppf(hit_c), sp_stats.norm.ppf(fa_c)
+
+    win_n, lose_n = counts['nogoCRWin'] + counts['nogoFAWin'], counts['nogoCRLose'] + counts['nogoFALose']
+    return {
+        'carit_nogo_acc':       cr / n_nogo,
+        'carit_omission_rate':  miss / n_go,
+        'carit_dprime':         z_hit - z_fa,
+        'carit_criterion':      -0.5 * (z_hit + z_fa),
+        'carit_nonresponder':   go == 0,
+        'carit_fa_rate_win':    counts['nogoFAWin'] / win_n if win_n else np.nan,
+        'carit_fa_rate_lose':   counts['nogoFALose'] / lose_n if lose_n else np.nan,
+        'carit_perf_exclude':   (go / n_go < 0.50) or (cr / n_nogo < 0.25),
+        'carit_n_go_trials':    n_go,
+        'carit_n_nogo_trials':  n_nogo,
+    }
+
+
+def load_hcpd_carit(loader: 'DataLoader', force: bool = False) -> pd.DataFrame:
+    """CARIT go/no-go performance per subject, from the PA run.
+
+    PA is the run the imaging uses; see :data:`CARIT_RUN` for the measured comparison against
+    the AP run and against pooling the two.
+
+    Returns
+    -------
+    pd.DataFrame
+        Indexed by subject_id, carrying the metrics from :func:`_carit_metrics`.
+        Empty if the processed directory is absent.
+
+    Notes
+    -----
+    No reaction time is available; see :data:`CARIT_EVS`.
+    """
+    cache = loader.output_dir / 'data' / HCPD_CARIT_CACHE
+    if cache.exists() and not force:
+        return pd.read_csv(cache, index_col=0, dtype={'subject_id': str})
+
+    proc = loader.rawdata_dir
+    if not proc.is_dir():
+        logger.warning("No processed directory at %s; skipping HCP-D CARIT.", proc)
+        return pd.DataFrame()
+
+    rows = {}
+    for sub_dir in sorted(p for p in proc.iterdir() if p.is_dir() and p.name.startswith('HCD')):
+        ev_dir = (sub_dir / 'MNINonLinear' / 'Results'
+                  / f'tfMRI_CARIT_{CARIT_RUN}' / 'EVs')
+        counts = _carit_run_counts(ev_dir)
+        if counts is None:
+            continue
+        metrics = _carit_metrics(counts)
+        if metrics is None:
+            continue
+        rows[sub_dir.name.replace('_', '')] = metrics
+
+    df = pd.DataFrame.from_dict(rows, orient='index').sort_index()
+    df.index.name = 'subject_id'
+    if not df.empty:
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(cache)
+        logger.info("Wrote HCP-D CARIT %s performance for %d subjects to %s",
+                    CARIT_RUN, len(df), cache)
     return df
 
 
@@ -475,13 +623,21 @@ def _behavior_pnc_rbc(loader: 'DataLoader') -> pd.DataFrame:
 
     df_qc = df_qc[df_qc['participant_id'].isin(passing_ids)]
     df_qc = df_qc.groupby(['participant_id', 'task'])['meanFD'].mean().reset_index()
-    rest_fd = df_qc[df_qc['task'] == 'rest'].set_index('participant_id')['meanFD'].rename('meanFD_rest')
-    frac2back_fd = df_qc[df_qc['task'] == 'frac2back'].set_index('participant_id')['meanFD'].rename('meanFD_frac2back')
-    df_qc_final = pd.concat([rest_fd, frac2back_fd], axis=1)
+    rest_rms = df_qc[df_qc['task'] == 'rest'].set_index('participant_id')['meanFD'].rename('meanRelRMS_rest')
+    frac2back_rms = df_qc[df_qc['task'] == 'frac2back'].set_index('participant_id')['meanFD'].rename('meanRelRMS_frac2back')
+    df_qc_final = pd.concat([rest_rms, frac2back_rms], axis=1)
     df_qc_final.index.name = 'subject_id'
 
     df = df.loc[df_qc_final.index]
-    return pd.merge(df, df_qc_final, left_index=True, right_index=True)
+    df = pd.merge(df, df_qc_final, left_index=True, right_index=True)
+
+    # True framewise displacement, from the same per-run QC files every other XCP-D dataset uses.
+    motion = xcpd_motion_columns(loader)
+    if motion.empty:
+        logger.warning("No PNC per-run motion found; meanFD columns not added (meanRelRMS_* "
+                       "from the study QC table are still present).")
+        return df
+    return df.join(motion, how='left')
 
 
 def _behavior_penn_lead(loader: 'DataLoader') -> pd.DataFrame:
@@ -493,10 +649,6 @@ def _behavior_penn_lead(loader: 'DataLoader') -> pd.DataFrame:
     df['sex'] = (df['sex'] == 'M').astype(int)
     df.set_index('subject_id', inplace=True)
 
-    # Compute session-specific ages from BIDS sessions.tsv acquisition times.
-    # The acq_time values are anonymised (anchored to ~year 1800) but the
-    # time *differences* between sessions are preserved, so we can derive each
-    # subject's age at later sessions as:  age_sesN = age_ses1 + Δt(ses1→sesN).
     bids_dir = loader.config.base_path / 'bids'
     for subject_id in df.index:
         ses_tsv = bids_dir / f'sub-{subject_id}' / f'sub-{subject_id}_sessions.tsv'
@@ -513,7 +665,184 @@ def _behavior_penn_lead(loader: 'DataLoader') -> pd.DataFrame:
             delta_years = (row['acq_time'] - base_time).days / 365.25
             df.loc[subject_id, f'age_ses{ses_label}'] = df.loc[subject_id, 'age'] + delta_years
 
+    # Head motion, per session as well as pooled
+    motion = xcpd_motion_columns(loader)
+    if motion.empty:
+        logger.warning("No Penn_LEAD motion data found; meanFD columns not added.")
+        return df
+    return df.join(motion, how='left')
+
+
+XCPD_MOTION_CACHE = '{dataset}_motion_xcpd.csv'
+XCPD_QC_FIELDS = ('mean_fd', 'mean_relative_rms', 'max_relative_rms',
+                  'num_censored_volumes', 'num_retained_volumes')
+XCPD_MOTION_SPEC = {
+    'AOMIC_PIOP1': dict(rest_task='restingstate', task_tasks=None,           per_session=False, alias_session=None),
+    'AOMIC_PIOP2': dict(rest_task='restingstate', task_tasks=None,           per_session=False, alias_session=None),
+    'WAND':        dict(rest_task='rest',         task_tasks=None,           per_session=False, alias_session=None),
+    'PNC':         dict(rest_task='rest',         task_tasks=('frac2back',), per_session=False, alias_session=None),
+    'Penn_LEAD':   dict(rest_task='rest',         task_tasks=('nback',),     per_session=True,  alias_session='1'),
+}
+
+
+def _qc_entities(filename: str) -> dict:
+    """BIDS entities of a QC filename, as strings.
+
+    Read from the NAME, not the file's own columns: pandas turns WAND's ``sub`` into 395 and its
+    ``ses`` into 3, and Penn_LEAD's ``run`` into 1, dropping the zero padding the scan registries
+    use ('00395', '03', '01'). The filename keeps it.
+    """
+    return dict(re.findall(r'([a-zA-Z]+)-([a-zA-Z0-9]+)', filename))
+
+
+def load_xcpd_motion(loader: 'DataLoader', force: bool = False) -> pd.DataFrame:
+    """Per-run head motion for every subject of an XCP-D-processed dataset, one row per run.
+
+    Shared by AOMIC-PIOP1/PIOP2, WAND, PNC and Penn_LEAD, whose XCP-D outputs carry the same
+    ``*_desc-linc_qc.tsv`` file.
+
+    Returns
+    -------
+    pd.DataFrame
+        Long: one row per run, with ``subject_id``, ``session``, ``task``, ``run``, ``acq`` and
+        the :data:`XCPD_QC_FIELDS`. Empty if the derivatives directory is absent.
+    """
+    cache = (loader.output_dir / 'data'
+             / XCPD_MOTION_CACHE.format(dataset=loader.dataset.lower()))
+    if cache.exists() and not force:
+        return pd.read_csv(cache, dtype={'subject_id': str, 'session': str, 'run': str, 'acq': str})
+
+    xcpd = (loader.config.base_path / loader.config.derivatives_subdir
+            / loader.config.modalities['MRI3T'].data_subdir)
+    if not xcpd.is_dir():
+        logger.warning("No XCP-D directory at %s; skipping %s motion.", xcpd, loader.dataset)
+        return pd.DataFrame()
+
+    rows = []
+    for pattern in ('sub-*/func/*_desc-linc_qc.tsv', 'sub-*/ses-*/func/*_desc-linc_qc.tsv'):
+        for path in sorted(xcpd.glob(pattern)):
+            try:
+                qc = pd.read_csv(path, sep='\t', dtype=str)
+            except Exception as e:      # one unreadable QC file is not a reason to abort
+                logger.warning("Could not parse %s: %s", path, e)
+                continue
+            if qc.empty or 'mean_fd' not in qc.columns:
+                continue
+            ent = _qc_entities(path.name)
+            rec = {'subject_id': ent.get('sub'), 'session': ent.get('ses'),
+                   'task': ent.get('task'), 'run': ent.get('run'), 'acq': ent.get('acq')}
+            for field in XCPD_QC_FIELDS:
+                rec[field] = float(qc.iloc[0][field]) if field in qc.columns else np.nan
+            rows.append(rec)
+
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df = df.sort_values(['subject_id', 'session', 'task', 'run']).reset_index(drop=True)
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(cache, index=False)
+        logger.info("Cached %s motion for %d runs (%d subjects) to %s",
+                    loader.dataset, len(df), df['subject_id'].nunique(), cache)
     return df
+
+
+def xcpd_motion_columns(loader: 'DataLoader', force: bool = False) -> pd.DataFrame:
+    """Per-subject motion columns for an XCP-D dataset, ready to join onto its behaviour table.
+
+    Columns
+    -------
+    ``meanFD_<task>``            that task's FD: the mean over its runs, and over sessions for a
+                                 dataset without ``alias_session``. Where ``alias_session`` is set
+                                 (Penn_LEAD) this column carries THAT SESSION's value, not the
+                                 across-session mean -- pooling would put two timepoints of a
+                                 longitudinal sample into one number. The per-session columns below
+                                 are where the other sessions live.
+    ``meanFD_<task>_ses<N>``     per session, for datasets with ``per_session`` set
+    ``meanFD_rest``              the dataset's rest task (from ``alias_session`` when set)
+    ``meanFD_task``              mean over its analysed non-rest tasks (likewise)
+
+    ``meanFD_rest`` and ``meanFD_task`` are what :func:`src.gams.build_nuisance` reads by default.
+    They are kept separate rather than averaged into one number for the reason given in
+    :func:`_add_hcpya_motion`: the INT deflection is a task-minus-rest difference.
+    """
+    spec = XCPD_MOTION_SPEC.get(loader.dataset)
+    if spec is None:
+        raise KeyError(f"No XCPD_MOTION_SPEC entry for {loader.dataset!r}; "
+                       f"have {sorted(XCPD_MOTION_SPEC)}")
+    long = load_xcpd_motion(loader, force=force)
+    if long.empty:
+        return pd.DataFrame()
+
+    # Runs (and XCP-D's acq variants) collapse first, so a task has one value per session.
+    per_ses = (long.groupby(['subject_id', 'session', 'task'], dropna=False)['mean_fd']
+               .mean().reset_index())
+    out = (per_ses.pivot_table(index='subject_id', columns='task', values='mean_fd')
+           .rename(columns=lambda c: f'meanFD_{c}'))
+
+    if spec['per_session']:
+        wide_ses = per_ses.pivot_table(index='subject_id', columns=['task', 'session'],
+                                       values='mean_fd')
+        wide_ses.columns = [f'meanFD_{task}_ses{ses}' for task, ses in wide_ses.columns]
+        out = out.join(wide_ses)
+
+    def _column(task):
+        """The column the aliases read: this dataset's alias session, or the across-session mean."""
+        if spec['per_session'] and spec['alias_session'] is not None:
+            named = f'meanFD_{task}_ses{spec["alias_session"]}'
+            if named in out.columns:
+                return named
+        return f'meanFD_{task}'
+
+    rest_col = _column(spec['rest_task'])
+    if rest_col in out.columns:
+        out['meanFD_rest'] = out[rest_col]
+    task_names = (spec['task_tasks'] if spec['task_tasks'] is not None
+                  else sorted({t for t in per_ses['task'].unique() if t != spec['rest_task']}))
+    task_cols = [c for c in (_column(t) for t in task_names) if c in out.columns]
+    if task_cols:
+        out['meanFD_task'] = out[task_cols].mean(axis=1)
+
+    out.index.name = 'subject_id'
+    return out
+
+
+def _behavior_aomic(loader: 'DataLoader') -> pd.DataFrame:
+    """AOMIC (PIOP1 / PIOP2) demographics, questionnaires and per-run head motion.
+
+    """
+    df = pd.read_csv(loader.config.base_path / 'participants.tsv', delimiter='\t')
+    df.rename(columns={'participant_id': 'subject_id'}, inplace=True)
+    df['subject_id'] = [s.split('-')[1] if str(s).startswith('sub-') else str(s)
+                        for s in df['subject_id']]
+    # Match the coding every other handler uses (M -> 1). Missing sex stays NaN rather than
+    # becoming 0, which an == comparison would silently produce.
+    df['sex'] = df['sex'].map({'M': 1, 'F': 0})
+    df.set_index('subject_id', inplace=True)
+
+    motion = xcpd_motion_columns(loader)
+    if motion.empty:
+        logger.warning("No %s motion data found; meanFD columns not added.", loader.dataset)
+        return df
+    return df.join(motion, how='left')
+
+
+def _behavior_wand(loader: 'DataLoader') -> pd.DataFrame:
+    """WAND demographics and per-run head motion.
+
+    """
+    df = pd.read_csv(loader.config.base_path / 'participants.tsv', delimiter='\t')
+    df.rename(columns={'participant_id': 'subject_id'}, inplace=True)
+    df['subject_id'] = [s.split('-')[1] if str(s).startswith('sub-') else str(s)
+                        for s in df['subject_id']]
+    # Match the coding every other handler uses (male -> 1). Missing sex stays NaN rather than
+    # becoming 0, which an == comparison would silently produce.
+    df['sex'] = df['sex'].map({'Male': 1, 'Female': 0})
+    df.set_index('subject_id', inplace=True)
+
+    motion = xcpd_motion_columns(loader)
+    if motion.empty:
+        logger.warning("No WAND motion data found; meanFD columns not added.")
+        return df
+    return df.join(motion, how='left')
 
 
 def _behavior_hbn_rbc(loader: 'DataLoader') -> pd.DataFrame:
@@ -532,6 +861,9 @@ BEHAVIOR_HANDLERS = {
     'hcp_d': _behavior_hcp_d,
     'pnc_rbc': _behavior_pnc_rbc,
     'penn_lead': _behavior_penn_lead,
+    'aomic_piop1': _behavior_aomic,
+    'aomic_piop2': _behavior_aomic,
+    'wand': _behavior_wand,
     'hbn_rbc': _behavior_hbn_rbc,
 }
 
@@ -611,11 +943,12 @@ def _events_bids_tsv(loader: 'DataLoader', scan: ScanInfo) -> pd.DataFrame:
         func_dir = func_dir / f'ses-{scan.session}'
     func_dir = func_dir / 'func'
 
-    filename = mod_config.task_events_file_template.format(
-        subject_id=scan.subject_id,
-        session=scan.session,
-        task=scan.task,
-    )
+    filename = mod_config.task_events_file_template.format(**{
+        **mod_config.template_fields(scan.task),
+        'subject_id': scan.subject_id,
+        'session': scan.session,
+        'task': scan.task,
+    })
 
     if mod_config.task_events_use_glob:
         matches = glob.glob(str(func_dir / filename))
@@ -775,14 +1108,19 @@ class DataLoader:
     # Config helpers
     # --------------------------------------------------------------------------
 
-    def get_tr(self, modality: str) -> float:
-        """Return the TR (seconds) for a given modality."""
+    def get_tr(self, modality: str, task: Optional[str] = None) -> float:
+        """Return the TR (seconds) for a modality, or for one task within it.
+
+        """
         if modality not in self.config.modalities:
             raise ValueError(
                 f"Unknown modality '{modality}' for dataset '{self.dataset}'. "
                 f"Available: {list(self.config.modalities)}"
             )
-        return self.config.modalities[modality].tr
+        mod_config = self.config.modalities[modality]
+        if task is not None and 'tr' in mod_config.task_params.get(task, {}):
+            return float(mod_config.task_params[task]['tr'])
+        return mod_config.tr
 
     def enable_hcpya_3t_resampling(self, target_modality: str = 'MRI7T') -> float:
         """Resample HCP-YA 3T timeseries onto the target modality's TR grid at load time.
@@ -842,7 +1180,8 @@ class DataLoader:
         list of ScanInfo
             The newly registered scans.
         """
-        tr = self.get_tr(modality)
+        # Per task, not per modality: a dataset may mix acquisitions within one modality.
+        tr_of = {task: self.get_tr(modality, task) for task in tasks}
         registered = []
         for subject_id in subject_ids:
             for session in sessions:
@@ -854,7 +1193,7 @@ class DataLoader:
                         space=space,
                         seg=seg,
                         modality=modality,
-                        tr=tr,
+                        tr=tr_of[task],
                         rbc=self.config.rbc,
                     )
                     if scan not in self.scan_registry:
@@ -1048,6 +1387,7 @@ class DataLoader:
             / mod_config.data_subdir
         )
         template_kwargs = {
+            **mod_config.template_fields(scan.task),
             'subject_id': scan.subject_id,
             'session': scan.session,
             'task': scan.task,
@@ -1284,7 +1624,7 @@ class DataLoader:
         effective_tr = scan.tr
         if (self.resample_to_tr is not None and self.dataset == 'HCP-YA'
                 and scan.modality == 'MRI3T'):
-            native_tr = self.get_tr(scan.modality)
+            native_tr = self.get_tr(scan.modality, scan.task)
             if not np.isclose(native_tr, self.resample_to_tr):
                 ratio = Fraction(native_tr / self.resample_to_tr).limit_denominator(1000)
                 up, down = ratio.numerator, ratio.denominator
