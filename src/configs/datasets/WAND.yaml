@@ -14,6 +14,6 @@ modalities:
     # Validation checks file existence only.
     task_events_handler: null
 behavior:
-  handler: null
+  handler: wand
 rbc: false
 subject_id_rawdata_transform: null
