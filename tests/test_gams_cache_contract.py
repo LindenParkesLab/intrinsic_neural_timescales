@@ -5,8 +5,6 @@ resolving the identical path from the identical inputs. Nothing checks that agre
 beyond the file being found, so a silent change to a tag -- a renamed flag, a reordered component,
 a lost separator -- would make fig4 either miss the file or, worse, read the wrong variant. These
 tests pin the mapping.
-
-See CLAUDE.md, "fig3 and fig4 are one pipeline".
 """
 import itertools
 import os
@@ -80,3 +78,43 @@ class TestCachePath:
         b = gam_cache_path('/out', 'PNC', 400, 'tfMRICARITPA', tags)
         c = gam_cache_path('/out', 'HCP-D', 200, 'tfMRICARITPA', tags)
         assert len({a, b, c}) == 3
+
+
+class TestRestLength:
+    """Length-matched rest changes the rest side of every deflection, so it is part of the run's
+    identity -- and so is which task the rest is matched to. 'full' must leave every existing cache
+    and panel name untouched."""
+
+    def test_full_is_the_default_and_changes_nothing(self):
+        tags = gam_variant_tags('gcv', True, True)
+        assert tags['rest_length'] == 'full' and tags['rest_match'] is None
+        assert tags['rest_tag'] == '' and tags['variant_tag'] == '_abs_demean'
+        assert (gam_cache_path('/out', 'HCP-D', 400, 'tfMRICARITPA', tags)
+                == '/out/HCP-D_400_tfMRICARITPA_ns5-gcv_abs_demean_regional_gam_results.npy')
+
+    def test_matched_tags_the_path_and_the_panel_names_with_its_task(self):
+        tags = gam_variant_tags('gcv', True, True, rest_length='matched', rest_match='CARIT')
+        assert tags['rest_tag'] == '_restlen-CARIT'
+        assert tags['variant_tag'] == '_abs_demean_restlen-CARIT'
+        assert gam_cache_path('/out', 'HCP-D', 400, 'tfMRICARITPA', tags).endswith(
+            '_abs_demean_restlen-CARIT_regional_gam_results.npy')
+
+    @pytest.mark.parametrize('recipe,absolute,demean', FLAGS)
+    def test_full_and_each_match_never_share_a_file(self, recipe, absolute, demean):
+        modes = [('full', None)] + [('matched', m) for m in ('CARIT', 'EMOTION', 'GUESSING')]
+        paths = {gam_cache_path('/out', 'HCP-D', 400, 'tfMRICARITPA',
+                                gam_variant_tags(r, a, d, rest_length=rl, rest_match=rm))
+                 for r, a, d in FLAGS for rl, rm in modes}
+        assert len(paths) == len(modes) * len(FLAGS)
+
+    def test_rejects_unknown_rest_length(self):
+        with pytest.raises(ValueError, match='rest_length'):
+            gam_variant_tags('gcv', True, True, rest_length='half')
+
+    def test_matched_needs_its_task(self):
+        with pytest.raises(ValueError, match='rest_match'):
+            gam_variant_tags('gcv', True, True, rest_length='matched')
+
+    def test_full_refuses_a_task(self):
+        with pytest.raises(ValueError, match='rest_match'):
+            gam_variant_tags('gcv', True, True, rest_match='CARIT')

@@ -10,7 +10,9 @@ import os
 import numpy as np
 import pandas as pd
 
-from src.timescales import Timescales, filter_data_dict
+from src.timescales import (Timescales, filter_data_dict, parse_scan_string,
+                            rest_window_covered, rest_window_matches, rest_window_output_type,
+                            rest_window_token)
 from src.supporting_data import load_supporting_data
 from src.subject_data import (_load_hcpya_connectivity, _load_hcpd_connectivity,
                               _load_hcpya_myelin, _load_hcpd_myelin, _sync_subject_level_data)
@@ -41,7 +43,60 @@ def _setup_processor(dataset):
     return timescales_processor, results_dir
 
 
-def _load_timescale_outputs(processor, which_modality, use_7t, output_type, use_resids, filter_str):
+def _resolve_rest_match(dataset, rest_match):
+    """Which matched task's windows to load. ``None`` picks the dataset's only match (HCP-YA: WM)
+    and raises when it has several (HCP-D), so a notebook cannot load CARIT-length rest for an
+    EMOTION analysis by default."""
+    matches = rest_window_matches(dataset)
+    if not matches:
+        raise ValueError(
+            f"rest_length='matched', but {dataset} has no length-matched rest (see "
+            f"src.timescales.REST_WINDOW_MATCH). Keeping full-length rest silently would mix the "
+            f"two, so this raises instead.")
+    if rest_match is None:
+        if len(matches) > 1:
+            raise ValueError(
+                f"{dataset}'s rest is length-matched to several tasks {list(matches)}; pass rest_match "
+                "(src.timescales.rest_window_match_for(dataset, task) gives it for the task analysed).")
+        return matches[0]
+    if rest_match not in matches:
+        raise ValueError(f'{dataset} has no rest windows matched to {rest_match!r}; it has {list(matches)}')
+    return rest_match
+
+
+def _substitute_rest_windows(processor, data_dict, output_type, rest_match):
+    """Swap each covered rest scan's full-length INT for its window matched to ``rest_match``.
+
+    Done before ``filter_data_dict``: a covered rest scan whose window is missing becomes None and
+    is dropped by that function's existing check, exactly as a missing residual drops a subject.
+    Uncovered rest scans (e.g. HCP-YA 7T) keep their full-length INT, and the count says so.
+    """
+    dataset = processor.dataset
+    rest_keys = [k for k in data_dict if parse_scan_string(k).get('condition') == 'rest']
+    covered = [k for k in rest_keys
+               if rest_window_covered(dataset, parse_scan_string(k).get('modality', ''), rest_match)]
+    if not covered:
+        raise ValueError(
+            f"rest_length='matched', but no {dataset} rest scan has windows matched to "
+            f"{rest_match!r} (see src.timescales.REST_WINDOW_MATCH). Keeping full-length rest "
+            f"silently would mix the two, so this raises instead.")
+    processor.get_precomputed_outputs(output_type=rest_window_output_type(output_type, rest_match))
+    windows = processor.data_dict
+    missing = [k for k in covered if windows.get(k) is None]
+    for k in covered:
+        data_dict[k] = windows.get(k)
+    msg = (f"  rest_length='matched' ({rest_window_token(rest_match)}): "
+           f"{len(covered) - len(missing)} rest scans use length-matched windows")
+    if missing:
+        msg += f"; {len(missing)} have no window (their subjects are dropped)"
+    if len(rest_keys) > len(covered):
+        msg += f"; {len(rest_keys) - len(covered)} uncovered rest scans keep full length"
+    print(msg)
+    return data_dict
+
+
+def _load_timescale_outputs(processor, which_modality, use_7t, output_type, use_resids, filter_str,
+                            rest_length='full', rest_match=None):
     """Load precomputed timescale (and tSNR) outputs for a dataset into dicts.
 
     Loads the appropriate scan registry (multi/MEG variants for HCP-YA), then the
@@ -62,6 +117,10 @@ def _load_timescale_outputs(processor, which_modality, use_7t, output_type, use_
         Also load residual timescales and merge them in.
     filter_str : str or None
         If given, overrides output_type to a filtered zero-crossing variant.
+    rest_length : {'full', 'matched'}
+        See :func:`load_notebook_data`.
+    rest_match : str or None
+        See :func:`load_notebook_data`.
 
     Returns
     -------
@@ -91,6 +150,14 @@ def _load_timescale_outputs(processor, which_modality, use_7t, output_type, use_
     processor.get_precomputed_outputs(output_type=output_type)
     data_dict = processor.data_dict.copy()
 
+    if rest_length == 'matched':
+        data_dict = _substitute_rest_windows(processor, data_dict, output_type,
+                                             _resolve_rest_match(dataset, rest_match))
+    elif rest_length != 'full':
+        raise ValueError(f"rest_length must be 'full' or 'matched'; got {rest_length!r}")
+    elif rest_match is not None:
+        raise ValueError(f"rest_match={rest_match!r} is only meaningful with rest_length='matched'")
+
     if use_resids:
         processor.get_precomputed_outputs(output_type=output_type_resid)
         data_dict_residuals = processor.data_dict.copy()
@@ -105,7 +172,8 @@ def _load_timescale_outputs(processor, which_modality, use_7t, output_type, use_
 def load_notebook_data(dataset='HCP-YA', which_modality='FMRI',
                        use_resids=True, use_7t=False,
                        output_type='timescale_zero_crossing_robust_nc3', filter_str=None, # '_lp-0.5hz'
-                       load_subject_data=True, n_regions=400, gene_panel='gao'):
+                       load_subject_data=True, n_regions=400, gene_panel='gao',
+                       rest_length='full', rest_match=None):
     """Load all data a notebook needs for a dataset into a single dict.
 
     Sets up the Timescales processor, loads supporting region maps (axes, gene /
@@ -135,6 +203,14 @@ def load_notebook_data(dataset='HCP-YA', which_modality='FMRI',
     gene_panel : str
         Brain-gene list the gene PCA is fit on ('gao', 'dear', ...). Surfaces as
         supporting_data['gene_panel']; tag anything derived from the gene PCA with it.
+    rest_length : {'full', 'matched'}
+        Rest INTs from full-length runs, or from length-matched windows (``_restlen-<task>``) for
+        the dataset x modality pairs in ``src.timescales.REST_WINDOW_MATCH``. Raises for a dataset
+        with no coverage rather than silently keeping full-length rest.
+    rest_match : str or None
+        Which matched task's windows to load under ``'matched'`` (e.g. ``'CARIT'``; get it with
+        ``src.timescales.rest_window_match_for(dataset, task)``). ``None`` is resolved only for a
+        dataset with a single match (HCP-YA: WM) and raises for one with several (HCP-D).
 
     Returns
     -------
@@ -156,7 +232,8 @@ def load_notebook_data(dataset='HCP-YA', which_modality='FMRI',
         n_regions=n_regions, gene_panel=gene_panel)
 
     data_dict, data_dict_tsnr, _ = _load_timescale_outputs(
-        timescales_processor, which_modality, use_7t, output_type, use_resids, filter_str)
+        timescales_processor, which_modality, use_7t, output_type, use_resids, filter_str,
+        rest_length=rest_length, rest_match=rest_match)
 
     subject_ids = list(dict.fromkeys(scan.subject_id for scan in timescales_processor.scan_registry))
     n_subs = len(subject_ids)

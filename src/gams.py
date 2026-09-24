@@ -14,6 +14,7 @@ import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 
 from src.plotting import style_ax
+from src.timescales import rest_window_token
 from snaplab_tools.gams import (
     fit_series, detect_change_point, integrate_derivative, segment_windows_at,
     bootstrap_gam_fits, SIGNALS, _DEFAULT_LAM_GRID,
@@ -53,7 +54,7 @@ def signal_units(absolute=True):
             'deflection': '|\u0394INT|' if absolute else '\u0394INT'}
 
 
-def gam_variant_tags(fit_recipe, absolute, demean):
+def gam_variant_tags(fit_recipe, absolute, demean, rest_length='full', rest_match=None):
     """Resolve a run's identity: fitting recipe plus the two data-definition flags.
 
     Parameters
@@ -64,13 +65,22 @@ def gam_variant_tags(fit_recipe, absolute, demean):
         Deflection definition: True -> |task - rest|, False -> signed (task - rest).
     demean : bool
         Centre each series on its own mean before fitting.
+    rest_length : {'full', 'matched'}
+        Rest INTs from full-length runs, or from length-matched windows (``_restlen-<task>``; see
+        ``src.timescales.REST_WINDOW_MATCH``). It changes the rest side of every deflection, so it
+        is part of the run's identity. ``'full'`` adds no tag, so every existing cache and panel
+        name is unchanged.
+    rest_match : str or None
+        The matched task under ``'matched'`` (e.g. ``'CARIT'``, from
+        ``src.timescales.rest_window_match_for``); it names the tag, ``_restlen-CARIT``. Required
+        with ``'matched'``, refused with ``'full'``.
 
     Returns
     -------
     dict
-        ``fit_recipe``, ``n_splines``, ``lam``, ``recipe_tag``, ``absolute_tag``, ``demean_tag``
-        and ``variant_tag`` (= absolute_tag + demean_tag, the component both notebooks put in
-        panel filenames).
+        ``fit_recipe``, ``n_splines``, ``lam``, ``recipe_tag``, ``absolute_tag``, ``demean_tag``,
+        ``rest_length``, ``rest_match``, ``rest_tag`` and ``variant_tag`` (= absolute_tag + demean_tag + rest_tag,
+        the component both notebooks put in panel filenames).
     """
     if fit_recipe not in GAM_RECIPES:
         raise ValueError(f"fit_recipe must be one of {sorted(GAM_RECIPES)}; got {fit_recipe!r}")
@@ -79,9 +89,18 @@ def gam_variant_tags(fit_recipe, absolute, demean):
     recipe_tag   = '' if fit_recipe == 'historical' else f'_ns{n_splines}-gcv'
     absolute_tag = '_abs' if absolute else '_signed'
     demean_tag   = '_demean' if demean else '_nodemean'
+    if rest_length not in ('full', 'matched'):
+        raise ValueError(f"rest_length must be 'full' or 'matched'; got {rest_length!r}")
+    if rest_length == 'matched' and not rest_match:
+        raise ValueError("rest_length='matched' needs rest_match, the matched task's name (e.g. "
+                         "'CARIT'; src.timescales.rest_window_match_for)")
+    if rest_length == 'full' and rest_match is not None:
+        raise ValueError(f"rest_match={rest_match!r} is only meaningful with rest_length='matched'")
+    rest_tag     = '' if rest_length == 'full' else f'_{rest_window_token(rest_match)}'
     return dict(fit_recipe=fit_recipe, n_splines=n_splines, lam=lam,
                 recipe_tag=recipe_tag, absolute_tag=absolute_tag, demean_tag=demean_tag,
-                variant_tag=f'{absolute_tag}{demean_tag}')
+                rest_length=rest_length, rest_match=rest_match, rest_tag=rest_tag,
+                variant_tag=f'{absolute_tag}{demean_tag}{rest_tag}')
 
 
 def gam_cache_path(gam_out_dir, dataset, n_regions, task_scan, tags):
@@ -89,16 +108,13 @@ def gam_cache_path(gam_out_dir, dataset, n_regions, task_scan, tags):
     return os.path.join(
         gam_out_dir,
         f'{dataset}_{n_regions}_{task_scan}{tags["recipe_tag"]}{tags["absolute_tag"]}'
-        f'{tags["demean_tag"]}_regional_gam_results.npy')
+        f'{tags["demean_tag"]}{tags.get("rest_tag", "")}_regional_gam_results.npy')
 
 
 # Head-motion column(s) per dataset; None means this dataset gets no nuisance covariates.
-# A value may be a single column name or a list of them.
-#
-# HCP-YA reports mean *relative RMS displacement* (mm), not Power's framewise displacement -- see
-# src.data.load_hcpya_movement. Naming it meanRelRMS_* keeps that distinction visible; do not
-# report it as FD. fig3/fig4 only ever run HCP-D or PNC, so this entry does not reach them.
-FD_COLUMN = {'HCP-D': 'meanFD', 'PNC': 'meanFD_rest', 'HCP-YA': 'meanRelRMS_rest'}
+FD_COLUMN = {'HCP-D': 'meanFD', 'PNC': 'meanFD_rest', 'HCP-YA': 'meanRelRMS_rest',
+             'AOMIC_PIOP1': 'meanFD_rest', 'AOMIC_PIOP2': 'meanFD_rest',
+             'WAND': 'meanFD_rest', 'Penn_LEAD': 'meanFD_rest'}
 
 
 def build_nuisance(df_behavior, rest, dataset, include_age=False, fd_columns=None):

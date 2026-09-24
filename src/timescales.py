@@ -17,6 +17,167 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+# ==================== Run vocabulary ====================
+#: 3T rest runs. HCP-YA uses LR/RL phase encoding, HCP-D uses PA.
+REST_RUNS_3T = ['rfMRIREST1LR', 'rfMRIREST1RL', 'rfMRIREST2LR', 'rfMRIREST2RL',   # HCP-YA
+                'rfMRIREST1PA', 'rfMRIREST2PA']                                   # HCP-D
+#: 7T rest runs (HCP-YA), alternating PA/AP.
+REST_RUNS_7T = ['rfMRIREST17TPA', 'rfMRIREST27TAP', 'rfMRIREST37TPA', 'rfMRIREST47TAP']
+#: 7T movie runs (HCP-YA), alternating AP/PA -- note the offset against REST_RUNS_7T.
+MOVIE_RUNS_7T = ['tfMRIMOVIE17TAP', 'tfMRIMOVIE27TPA', 'tfMRIMOVIE37TPA', 'tfMRIMOVIE47TAP']
+REST_RUNS_MEG = ['3Restin', '4Restin', '5Restin']
+TASK_RUNS_MEG = ['6Wrkmem', '7Wrkmem']
+
+#: Task runs grouped into the condition they are averaged into: ``[(runs, condition_key), ...]``.
+TASK_RUN_GROUPS = [
+    # HCP-YA — LR/RL counterbalanced pairs
+    (['tfMRIWMLR',          'tfMRIWMRL'],          'task-WM'),
+    (['tfMRIEMOTIONLR',     'tfMRIEMOTIONRL'],     'task-EMOTION'),
+    (['tfMRIGAMBLINGLR',    'tfMRIGAMBLINGRL'],    'task-GAMBLING'),
+    (['tfMRILANGUAGELR',    'tfMRILANGUAGERL'],    'task-LANGUAGE'),
+    (['tfMRIRELATIONALLR',  'tfMRIRELATIONALRL'],  'task-RELATIONAL'),
+    (['tfMRISOCIALLR',      'tfMRISOCIALRL'],      'task-SOCIAL'),
+    # HCP-D — single PA direction (no LR/RL counterpart)
+    (['tfMRICARITPA'],                              'task-CARIT'),
+    (['tfMRIEMOTIONPA'],                            'task-EMOTION'),
+    (['tfMRIGUESSINGPA'],                           'task-GUESSING'),
+]
+
+#: Condition key for the 7T movies, which TASK_RUN_GROUPS does not cover because
+#: _apply_scan_groupings collapses them with a separate flag (``average_7t_movies``).
+MOVIE_GROUP = (MOVIE_RUNS_7T, 'task-Movies')
+
+# ==================== Rest-control window offset ====================
+REST_CONTROL_OFFSET_SECONDS = {
+    ('HCP-YA',    'MRI3T'): 126.0,
+    ('HCP-YA',    'MRI7T'): 0.0,
+    ('HCP-YA',    'MEG'):   0.0,
+    ('HCP-D',     'MRI3T'): 0.0,
+    ('Penn_LEAD', 'MRI3T'): 0.0,
+}
+
+#: Offset for a (dataset, modality) that has not been measured.
+REST_CONTROL_OFFSET_DEFAULT = 0.0
+
+
+def rest_control_offset_seconds(dataset, modality):
+    """Scan-onset offset in seconds for a dataset's matched rest control window.
+
+    Parameters
+    ----------
+    dataset : str
+        Dataset name, as :class:`Timescales` carries it.
+    modality : str
+        Modality token, e.g. ``'MRI3T'``. HCP-YA needs it: its 3T runs carry a transient and its
+        7T runs do not, so a dataset-only table would be wrong for one of them.
+
+    Returns
+    -------
+    float
+        Offset in seconds, or :data:`REST_CONTROL_OFFSET_DEFAULT` when the pair is not listed.
+    """
+    return float(REST_CONTROL_OFFSET_SECONDS.get((dataset, modality),
+                                                 REST_CONTROL_OFFSET_DEFAULT))
+
+
+def rest_control_offset_frames(dataset, modality, tr):
+    """The offset above, in frames of a scan sampled at ``tr``.
+
+    Parameters
+    ----------
+    dataset, modality : str
+        Passed to :func:`rest_control_offset_seconds`.
+    tr : float
+        Repetition time in seconds of the run the window is cut from.
+
+    Returns
+    -------
+    int
+        ``round(offset_seconds / tr)``. HCP-YA 3T: 126 / 0.72 = 175 frames exactly.
+
+    Raises
+    ------
+    ValueError
+        If ``tr`` is not positive -- a zero TR would silently give a zero offset.
+    """
+    tr = float(tr)
+    if not tr > 0:
+        raise ValueError(f'tr must be positive to convert an offset to frames, got {tr!r}')
+    return int(round(rest_control_offset_seconds(dataset, modality) / tr))
+
+REST_WINDOW_MATCH = {
+    ('HCP-YA', 'MRI3T'): {'WM':       ('tfMRIWMLR', 'tfMRIWMRL')},
+    ('HCP-D',  'MRI3T'): {'CARIT':    ('tfMRICARITPA',),
+                          'EMOTION':  ('tfMRIEMOTIONPA',),
+                          'GUESSING': ('tfMRIGUESSINGPA',)},
+}
+
+#: Output-type token prefix for a length-matched rest window.
+REST_WINDOW_TOKEN = 'restlen'
+
+#: Written into every length-matched ACF file so it cannot be misread once it leaves its directory.
+REST_WINDOW_NOTE = ("REST timeseries cut to one window the length of this subject's matched task "
+                    "run, starting at the dataset's scan-onset offset. Nothing projected out.")
+
+
+def rest_window_token(match):
+    """Token of the rest windows matched to ``match``, e.g. ``'CARIT'`` -> ``'restlen-CARIT'``.
+
+    The hyphenated token-value form of ``restctrl-drift`` and ``bp-0.01-0.08hz``: a rest run is cut
+    to a different length per matched task, so each set of windows needs its own name.
+    """
+    if not isinstance(match, str) or not match:
+        raise ValueError(f'a length-matched rest token needs a match name (e.g. CARIT); got {match!r}')
+    return f'{REST_WINDOW_TOKEN}-{match}'
+
+
+def rest_window_output_type(base, match):
+    """Append the length-matched-rest token, e.g. ``autocorr`` -> ``autocorr_restlen-CARIT``.
+
+    Same last slot as ``_resids`` and ``_restctrl``: a file is at most one of them. ``base``
+    must already carry ``_resampled`` and any frequency-filter token.
+    """
+    return f'{base}_{rest_window_token(match)}'
+
+
+def rest_window_matches(dataset, modality=None):
+    """Names of the tasks this dataset's rest runs are matched to, over every covered modality or one."""
+    names = []
+    for (ds, mod), table in REST_WINDOW_MATCH.items():
+        if ds == dataset and (modality is None or mod == modality):
+            names += [m for m in table if m not in names]
+    return tuple(names)
+
+
+def rest_window_covered(dataset, modality, match=None):
+    """True when rest runs of this dataset x modality have length-matched windows (to ``match``, if given)."""
+    table = REST_WINDOW_MATCH.get((dataset, modality), {})
+    return bool(table) if match is None else match in table
+
+
+def rest_window_match_for(dataset, task):
+    """The match whose windows are as long as ``task``, e.g. ``('HCP-D', 'tfMRICARITPA') -> 'CARIT'``.
+
+    The one place a consumer turns the task it analyses into the rest it contrasts it with, so fig3,
+    fig4 and hcpd_behavior cannot pick different windows for the same task.
+
+    Raises
+    ------
+    ValueError
+        If no rest window of this dataset is matched to ``task``.
+    """
+    available = {}
+    for (ds, _), table in REST_WINDOW_MATCH.items():
+        if ds != dataset:
+            continue
+        for name, tasks in table.items():
+            if task in tasks:
+                return name
+            available[name] = tasks
+    raise ValueError(f'no length-matched rest for {dataset} {task}; matched tasks: {available or "none"}. '
+                     'See src.timescales.REST_WINDOW_MATCH.')
+
+
 class Timescales(DataLoader):
     """Per-scan INT estimation with a disk cache, on top of :class:`~src.data.DataLoader`.
 
@@ -82,11 +243,16 @@ class Timescales(DataLoader):
         """
         # Call the parent class's constructor
         super().__init__(dataset=dataset, load_behavior=load_behavior, verbose=verbose)
-        
+
         self.timeseries_data = timeseries_data
         if timeseries_data is not None:
             self.scans = list(timeseries_data.keys())
-        
+        self.autocorr_rest_control = None
+        self.autocorr_rest_control_drift = None
+        self.rest_control_meta = None
+        self.rest_window_span = None
+        self.rest_window_meta = None
+
         if verbose:
             print(f"\n\tInitialized Timescales for dataset: {dataset}")
             if timeseries_data is not None:
@@ -268,11 +434,27 @@ class Timescales(DataLoader):
         return parse_scan_string(scan_key)
 
     # ============== Computation Methods ==============
+    def _rest_control_source(self, kind: str) -> dict:
+        """The control ACF dict for ``kind``, or a message saying what has not been run yet."""
+        if kind not in REST_CONTROL_KINDS:
+            raise ValueError(f"unknown rest-control kind {kind!r}; "
+                             f"available: {sorted(REST_CONTROL_KINDS)}")
+        source = (self.autocorr_rest_control if kind == 'full'
+                  else self.autocorr_rest_control_drift)
+        if source is None:
+            raise ValueError(
+                f"no {kind!r} rest control available. Call regress_task_structure() and then "
+                "build_rest_controls() before requesting use_rest_control.")
+        return source
+
     def _run_for_all_scans(
         self,
         compute_fn,
         output_type: str,
         use_residuals: bool = False,
+        use_rest_control: str = None,
+        use_rest_window: str = None,
+        metadata_fn=None,
         force_recompute: bool = False,
         save_outputs: bool = True,
         verbose: bool = True,
@@ -295,6 +477,22 @@ class Timescales(DataLoader):
         use_residuals : bool
             If True and condition == 'task', use self.timeseries_residuals instead
             of self.timeseries_data.
+        use_rest_control : {'full', 'drift'} or None
+            Third source: the matched rest control built by :meth:`build_rest_controls`. Rest
+            scans are skipped entirely (they have no control), so they neither hit the cache nor
+            count as failures. The values in those dicts are already ACFs -- see the note on
+            :attr:`autocorr_rest_control` -- so ``compute_fn`` receives an ACF rather than a
+            timeseries on this path. Mutually exclusive with ``use_residuals``.
+        use_rest_window : str or None
+            Fourth source: the rest windows matched to this task name (a key of
+            ``self.rest_window_span``), resolved by :meth:`resolve_rest_windows`. Only covered
+            rest scans have one; task scans and uncovered rest scans are skipped, not counted as
+            misses or failures. The window is a timeseries, so ``compute_fn`` runs exactly as for
+            full-length rest.
+        metadata_fn : callable or None
+            ``(scan_key, kv_dict) -> dict``, the metadata written alongside each result. None
+            uses the default identifying dict. The control path needs per-scan metadata (which
+            rest run, which window), which a fixed dict cannot carry.
         force_recompute : bool
             Skip cache lookup if True.
         save_outputs : bool
@@ -321,6 +519,15 @@ class Timescales(DataLoader):
             run        = kv_dict.get('run')
             tr         = kv_dict.get('tr', '')
 
+            # A rest scan has no matched control, so it is not a cache miss and not a failure.
+            if use_rest_control is not None and condition != 'task':
+                results[scan_key] = None
+                continue
+            # Likewise only covered rest scans have a length-matched window.
+            if use_rest_window is not None and scan_key not in self.rest_window_span[use_rest_window]:
+                results[scan_key] = None
+                continue
+
             if not force_recompute:
                 cached = self._load_subject_output(
                     subject_id=subject_id, output_type=output_type,
@@ -333,7 +540,12 @@ class Timescales(DataLoader):
                     continue
 
             try:
-                if use_residuals and condition == 'task':
+                if use_rest_control is not None:
+                    timeseries_scan = self._rest_control_source(use_rest_control)[scan_key]
+                elif use_rest_window is not None:
+                    start, stop = self.rest_window_span[use_rest_window][scan_key]
+                    timeseries_scan = np.asarray(self.timeseries_data[scan_key])[:, start:stop]
+                elif use_residuals and condition == 'task':
                     timeseries_scan = self.timeseries_residuals[scan_key]
                 else:
                     timeseries_scan = self.timeseries_data[scan_key]
@@ -343,6 +555,10 @@ class Timescales(DataLoader):
                 n_computed += 1
 
                 if save_outputs:
+                    metadata = (metadata_fn(scan_key, kv_dict)
+                                if metadata_fn is not None
+                                else {'output_type': output_type, 'tr': tr, 'modality': modality,
+                                      'dataset': self.dataset})
                     self._save_subject_output(
                         data=result,
                         subject_id=subject_id,
@@ -353,8 +569,7 @@ class Timescales(DataLoader):
                         space=space,
                         session=session,
                         run=run,
-                        metadata={'output_type': output_type, 'tr': tr, 'modality': modality,
-                                  'dataset': self.dataset},
+                        metadata=metadata,
                     )
             except Exception as e:
                 logger.warning("Failed to compute %s for %s: %s", output_type, scan_key, e)
@@ -378,6 +593,8 @@ class Timescales(DataLoader):
         save_outputs: bool = True,
         suffix: str = None,
         use_residuals: bool = False,
+        use_rest_control: str = None,
+        use_rest_window: str = None,
         lowpass: float = None,
         highpass: float = None,
         resampled: bool = False,
@@ -401,6 +618,18 @@ class Timescales(DataLoader):
             Extra tag appended to output_type.
         use_residuals : bool
             Use self.timeseries_residuals for task scans instead of raw timeseries.
+        use_rest_control : {'full', 'drift'} or None
+            Cache the matched rest control instead, appending ``_restctrl`` / ``_restctrl-drift``.
+            The ACFs come from :meth:`build_rest_controls`; this call caches them and writes their
+            metadata. The control inherits ``resampled`` and the frequency-filter tokens from this
+            call, so pass the same values used for the task side -- a control built without them
+            is silently comparing unlike things.
+        use_rest_window : str or None
+            Cache the rest windows matched to this task name instead (e.g. ``'CARIT'``), appending
+            ``_restlen-CARIT``. Requires :meth:`resolve_rest_windows`; call once per match. Each
+            window goes through the same ``compute_acf`` call as full-length rest, so the two
+            cannot drift apart. Inherits ``resampled`` and the frequency-filter tokens from this
+            call, as the controls do.
         lowpass, highpass : float or None
             Used only for output naming (see above).
         resampled : bool
@@ -422,8 +651,28 @@ class Timescales(DataLoader):
             output_type = f'{output_type}_lp-{lowpass}hz'
         if suffix:
             output_type = f'{output_type}_{suffix}'
+        if use_residuals and use_rest_control is not None:
+            raise ValueError('use_residuals and use_rest_control are mutually exclusive: a file '
+                             'is either the task residual or the rest control, never both')
         if use_residuals:
             output_type = f'{output_type}_resids'
+        if use_rest_control is not None:
+            output_type = rest_control_output_type(output_type, use_rest_control)
+        if use_rest_window is not None:
+            if use_residuals or use_rest_control is not None:
+                raise ValueError('use_rest_window is mutually exclusive with use_residuals and '
+                                 'use_rest_control: a file is a task residual, a rest control or '
+                                 'a length-matched rest window, never two of them')
+            if not isinstance(use_rest_window, str):
+                raise ValueError(f'use_rest_window takes the name of a matched task (one of '
+                                 f'{list(rest_window_matches(self.dataset))}), not {use_rest_window!r}')
+            if getattr(self, 'rest_window_span', None) is None:
+                raise ValueError('no length-matched rest windows; call resolve_rest_windows() '
+                                 'before requesting use_rest_window')
+            if use_rest_window not in self.rest_window_span:
+                raise ValueError(f'no length-matched rest windows named {use_rest_window!r} for '
+                                 f'{self.dataset}; resolved: {sorted(self.rest_window_span)}')
+            output_type = rest_window_output_type(output_type, use_rest_window)
 
         # lowpass/highpass are used for output naming only; filtering is applied at load time via load_batch
         def _compute(timeseries_scan, kv_dict):
@@ -431,10 +680,38 @@ class Timescales(DataLoader):
             # format (and every downstream estimator) assumes (n_regions, n_lags).
             return np.atleast_2d(compute_acf(timeseries_scan, use_fft=use_fft))
 
+        def _passthrough(acf, kv_dict):
+            # build_rest_controls already reduced the control window to an ACF and threw the
+            # window away, so there is nothing left to compute here -- this call exists for the
+            # caching, the metadata and the token.
+            return np.atleast_2d(acf)
+
+        def _control_metadata(scan_key, kv_dict):
+            meta = dict(self.rest_control_meta.get(scan_key, {}))
+            meta['output_type'] = output_type
+            meta['control_kind'] = REST_CONTROL_KINDS[use_rest_control][1]
+            meta['control_note'] = REST_CONTROL_NOTE
+            return meta
+
+        def _window_metadata(scan_key, kv_dict):
+            meta = dict(self.rest_window_meta[use_rest_window].get(scan_key, {}))
+            meta['output_type'] = output_type
+            return meta
+
+        if use_rest_control is not None:
+            metadata_fn = _control_metadata
+        elif use_rest_window is not None:
+            metadata_fn = _window_metadata
+        else:
+            metadata_fn = None
+
         self.autocorr_dict = self._run_for_all_scans(
-            compute_fn=_compute,
+            compute_fn=_passthrough if use_rest_control is not None else _compute,
             output_type=output_type,
             use_residuals=use_residuals,
+            use_rest_control=use_rest_control,
+            use_rest_window=use_rest_window,
+            metadata_fn=metadata_fn,
             force_recompute=force_recompute,
             save_outputs=save_outputs,
             verbose=verbose,
@@ -722,6 +999,261 @@ class Timescales(DataLoader):
         self.task_events_acf = task_events_acf
         self.task_contrasts = task_contrasts
     
+    def resolve_rest_windows(self, verbose: bool = True):
+        """Fix every length-matched window of every covered rest scan (see REST_WINDOW_MATCH).
+
+        Sets
+        ----
+        self.rest_window_span : dict
+            ``match -> {scan_key -> (start, stop)}``, covered rest scans only. Every match of every
+            covered modality present has an entry, empty when no subject has that task run.
+        self.rest_window_meta : dict
+            ``match -> {scan_key -> metadata}``, written into each length-matched ACF file.
+
+        Raises
+        ------
+        ValueError
+            If there is no timeseries data, or a window does not fit inside its rest run.
+        """
+        if getattr(self, 'timeseries_data', None) is None:
+            raise ValueError('no timeseries data; length-matched windows are cut from loaded runs')
+
+        groups = defaultdict(lambda: {'task': {}, 'rest': []})
+        for scan_key in self.scans:
+            kv = self._parse_scan_string(scan_key)
+            if not rest_window_covered(self.dataset, kv.get('modality', '')):
+                continue
+            group = (kv.get('sub', ''), kv.get('ses'), kv.get('modality', ''))
+            if kv.get('condition') == 'rest':
+                groups[group]['rest'].append((scan_key, kv))
+            elif kv.get('condition') == 'task':
+                groups[group]['task'][kv.get('task', '')] = scan_key
+
+        spans, meta, n_skipped = {}, {}, defaultdict(int)
+        for (_, _, modality), members in groups.items():
+            for match, tasks in REST_WINDOW_MATCH[(self.dataset, modality)].items():
+                spans.setdefault(match, {})
+                meta.setdefault(match, {})
+                task_keys = [members['task'].get(t) for t in tasks]
+                lengths = [int(np.asarray(self.timeseries_data[k]).shape[1]) for k in task_keys
+                           if k is not None and self.timeseries_data.get(k) is not None]
+                if not lengths:                     # no run of this task -> nothing to match to
+                    n_skipped[match] += len(members['rest'])
+                    continue
+                n_target = min(lengths)
+                for scan_key, kv in members['rest']:
+                    rest = self.timeseries_data.get(scan_key)
+                    if rest is None:
+                        n_skipped[match] += 1
+                        continue
+                    tr = float(kv.get('tr'))
+                    offset_seconds = rest_control_offset_seconds(self.dataset, modality)
+                    offset_frames = rest_control_offset_frames(self.dataset, modality, tr)
+                    n_rest = int(np.asarray(rest).shape[1])
+                    if offset_frames + n_target > n_rest:
+                        raise ValueError(
+                            f'{scan_key}: offset {offset_frames} + {match}-matched {n_target} frames '
+                            f'exceeds the {n_rest}-frame rest run; REST_WINDOW_MATCH or the offset '
+                            f'table is wrong for {self.dataset} {modality}')
+                    spans[match][scan_key] = (int(offset_frames), int(offset_frames + n_target))
+                    meta[match][scan_key] = {
+                        'window_kind':       'length_matched_rest',
+                        'window_note':       REST_WINDOW_NOTE,
+                        'rest_match':        match,
+                        'matched_task':      list(tasks),
+                        'target_frames':     int(n_target),
+                        'source_window':     [int(offset_frames), int(offset_frames + n_target)],
+                        'source_run_frames': int(n_rest),
+                        'offset_seconds':    float(offset_seconds),
+                        'offset_frames':     int(offset_frames),
+                        'tr':                kv.get('tr', ''),
+                        'modality':          modality,
+                        'dataset':           self.dataset,
+                    }
+        self.rest_window_span, self.rest_window_meta = spans, meta
+        if verbose:
+            for match, by_scan in spans.items():
+                print(f'Length-matched rest windows ({rest_window_token(match)}): {len(by_scan)} '
+                      f'resolved, {n_skipped[match]} rest scan(s) skipped (no {match} run or no '
+                      f'rest data)')
+        return spans
+
+    def build_rest_controls(self, int_method: str = 'auc_zero_crossing', use_fft: bool = True,
+                            dtype=np.float32, verbose: bool = True):
+        """Build the matched rest control for every task scan, as ACFs.
+
+        Two controls are built from the same design in one pass:
+
+        ``full``
+            the complete design -- task regressors, drift basis and constant -- via ``fit_glm``.
+        ``drift``
+            the drift basis and constant only, via ``drift_only_control``. This is what separates
+            "the cosine basis did it" from "the task regressors did it", and on these data the
+            drift term is the larger of the two for every condition except WM.
+
+        Parameters
+        ----------
+        int_method : str
+            Passed to ``drift_only_control``; only its ``acf`` output is kept, so this affects
+            nothing that is cached. Left configurable so it matches the analysis if that ever
+            changes.
+        use_fft : bool
+            Passed to ``compute_acf``. Pass what the task side used.
+        dtype : numpy dtype
+            Storage dtype for the ACFs. float32 by default: ACF values are bounded in [-1, 1] and
+            every estimator integrates or thresholds them, so float32 is far beyond the precision
+            of the estimate and halves the cache.
+        verbose : bool
+            Print a summary, including how many designs had to be truncated.
+
+        Sets
+        ----
+        self.autocorr_rest_control, self.autocorr_rest_control_drift : dict
+            ``scan_key -> (n_regions, n_lags)`` ACF, keyed by the **task** scan. None for rest
+            scans and for any task scan whose control could not be built.
+        self.rest_control_meta : dict
+            ``scan_key -> metadata dict``, the per-file provenance required by the contract.
+
+        Raises
+        ------
+        ValueError
+            If the offset leaves no window in a paired rest run, or if a non-zero offset leaves
+            too little room for a length-matched control. Both mean the offset table is wrong for
+            this dataset, so they are raised rather than counted as per-scan failures.
+
+        """
+        if getattr(self, 'design_matrices', None) is None:
+            raise ValueError('no design matrices; call regress_task_structure() first')
+
+        control_full = dict.fromkeys(self.scans)
+        control_drift = dict.fromkeys(self.scans)
+        control_meta = {}
+
+        # Group by subject x session x modality: pairing is only meaningful inside an
+        # acquisition. A 3T task must never be paired to a 7T rest run, and Penn LEAD's two
+        # sessions must not borrow from each other.
+        groups = defaultdict(lambda: {'task': [], 'rest': []})
+        parsed = {}
+        for scan_key in self.scans:
+            kv = self._parse_scan_string(scan_key)
+            parsed[scan_key] = kv
+            group = (kv.get('sub', ''), kv.get('ses'), kv.get('modality', ''))
+            if kv.get('condition') == 'task':
+                groups[group]['task'].append(scan_key)
+            elif kv.get('condition') == 'rest':
+                groups[group]['rest'].append(scan_key)
+
+        n_built = n_truncated = n_skipped = n_failed = 0
+        for group, members in tqdm(groups.items(), desc='Building matched rest controls'):
+            rest_key_of = {parsed[k].get('task', ''): k for k in members['rest']}
+            pairing = pair_rest_runs([parsed[k].get('task', '') for k in members['task']],
+                                     [parsed[k].get('task', '') for k in members['rest']])
+
+            for scan_key in members['task']:
+                kv = parsed[scan_key]
+                design = self.design_matrices.get(scan_key)
+                events = self.task_events.get(scan_key)
+                pair = pairing.get(kv.get('task', ''))
+                if design is None or pair is None:
+                    n_skipped += 1
+                    continue
+
+                rest_task, pe_matched = pair
+                rest_scan = self.timeseries_data.get(rest_key_of.get(rest_task))
+                if rest_scan is None:
+                    n_skipped += 1
+                    continue
+
+                # The window is resolved outside the try: a window that does not fit is a
+                # wrong offset table, not a scan that happened to fail, and it must not be
+                # swallowed into the failure count.
+                tr = float(kv.get('tr'))
+                modality = kv.get('modality', '')
+                offset_seconds = rest_control_offset_seconds(self.dataset, modality)
+                offset_frames = rest_control_offset_frames(self.dataset, modality, tr)
+                n_rest = int(np.asarray(rest_scan).shape[1])
+                # Actual run length, never the nominal one: 14 of HCP-YA's 3,864 3T rest runs
+                # are shorter than 1200 frames and one 7T run is 887 rather than 900.
+                if offset_frames >= n_rest:
+                    raise ValueError(
+                        f'{scan_key}: rest-control offset {offset_seconds} s '
+                        f'({offset_frames} frames) leaves no window in a {n_rest}-frame '
+                        f'{rest_task} run')
+                n_frames = min(design.shape[0], n_rest - offset_frames)
+                truncated = n_frames < design.shape[0]
+                if truncated and offset_frames > 0:
+                    # Truncation is tolerated only at offset 0, where it is the known 7T-movie
+                    # case. Combined with a non-zero offset it would mean the offset itself had
+                    # eaten the task's frames, which is a bad offset rather than a short run.
+                    raise ValueError(
+                        f'{scan_key}: offset {offset_frames} + task {design.shape[0]} frames '
+                        f'exceeds the {n_rest}-frame {rest_task} run; the offset table gives '
+                        f'this dataset/modality no room for a length-matched control')
+
+                try:
+                    if truncated:
+                        # 7T movies only: the movie is longer than a 7T rest run. Rebuild rather
+                        # than slice the design -- the cosine basis is defined over the run
+                        # length, so a sliced drift column is not the basis for this window.
+                        design = create_design_matrix_nilearn(
+                            events, n_frames, tr,
+                            hrf_model=None if modality == 'MEG' else 'glover',
+                            drift_model=None if modality == 'MEG' else 'cosine')
+                    window = np.asarray(rest_scan, dtype=float)[
+                        :, offset_frames:offset_frames + n_frames]
+
+                    resid_full, _, _ = fit_glm(window, design)
+                    control_full[scan_key] = np.atleast_2d(
+                        compute_acf(resid_full, use_fft=use_fft)).astype(dtype)
+                    del resid_full
+
+                    drift = drift_only_control(window, design, tr, int_method=int_method,
+                                               use_fft=use_fft)
+                    control_drift[scan_key] = np.atleast_2d(drift['acf']).astype(dtype)
+                    del drift, window
+
+                    task_cols, nuisance_cols = split_design_columns(design)
+                    control_meta[scan_key] = {
+                        'design_from_task': kv.get('task', ''),
+                        'source_rest_task': rest_task,
+                        'source_window':    [int(offset_frames),
+                                             int(offset_frames + n_frames)],
+                        'source_run_frames': int(n_rest),
+                        'offset_seconds':   float(offset_seconds),
+                        'offset_frames':    int(offset_frames),
+                        'design_truncated': bool(truncated),
+                        'pe_matched':       bool(pe_matched),
+                        'n_task_cols':      len(task_cols),
+                        'n_drift_cols':     len([c for c in nuisance_cols if c != 'constant']),
+                        'tr':               kv.get('tr', ''),
+                        'modality':         kv.get('modality', ''),
+                        'dataset':          self.dataset,
+                    }
+                    n_built += 1
+                    n_truncated += int(truncated)
+                except Exception as e:
+                    logger.warning("Failed to build rest control for %s: %s", scan_key, e)
+                    control_full[scan_key] = None
+                    control_drift[scan_key] = None
+                    n_failed += 1
+
+        self.autocorr_rest_control = control_full
+        self.autocorr_rest_control_drift = control_drift
+        self.rest_control_meta = control_meta
+
+        if verbose:
+            offsets = sorted({(m['offset_seconds'], m['offset_frames'])
+                              for m in control_meta.values()})
+            print("\nMatched rest controls built:")
+            print(f"  Built:              {n_built}")
+            print("  Window offset:      " + (', '.join(f'{s:g}s ({f} frames)'
+                                                        for s, f in offsets) or 'n/a'))
+            print(f"  Design truncated:   {n_truncated}")
+            if n_skipped:
+                print(f"  Skipped (no design or no paired rest run): {n_skipped}")
+            if n_failed:
+                print(f"  Failed:             {n_failed}")
+
     # ==================== Analysis Functions ====================        
     def match_registry_to_behavior(self):
         """Subset behavioral data to the subjects present in the scan registry.
@@ -800,7 +1332,7 @@ def create_design_matrix_nilearn(
     Parameters
     ----------
     events : pd.DataFrame
-        Events with columns onset, duration, trial_type.
+        Events with columns onset, duration, trial_type. Must be non-empty -- see Raises.
     n_timepoints : int
         Number of timepoints (frames).
     tr : float
@@ -818,8 +1350,27 @@ def create_design_matrix_nilearn(
     -------
     pd.DataFrame
         nilearn design matrix (task regressors, drift terms, constant).
+
+    Raises
+    ------
+    ValueError
+        If ``events`` is None or empty. nilearn accepts that and returns a perfectly valid
+        drift-and-constant design with **no task regressors at all**, so a caller whose events
+        failed to resolve gets a complete, plausible-looking set of results that measures the
+        drift basis and calls it task regression. ``DataLoader.get_task_events`` returns None for
+        any id it cannot resolve -- a malformed subject id is enough -- and that has already
+        produced one full run of wrong numbers in ``sfig_drift_spec``. There is no legitimate
+        caller here that wants a task-free design: ask for ``drift_model`` alone if that is what
+        is meant, or use :func:`drift_only_control`.
     """
-    
+    if events is None or len(events) == 0:
+        raise ValueError(
+            'create_design_matrix_nilearn received no task events '
+            f'({"None" if events is None else "an empty frame"}). nilearn would build a design '
+            'with drift and constant but no task regressors, and every downstream number would '
+            'look fine. Check that the subject id reached get_task_events in the form its '
+            'handler expects.')
+
     # Create frame times
     frame_times = np.arange(n_timepoints) * tr
     
@@ -1017,6 +1568,153 @@ def drift_only_control(raw_data, design_matrix, tr, int_method='auc_zero_crossin
         'nuisance_cols': nuisance_cols,
         'n_valid': int(finite.sum()),
     }
+
+
+#: Phase-encoding tokens a task name may end in. Matched case-sensitively: UCLA's ``scap`` ends
+#: in a lowercase "ap" and is not an AP-encoded scan.
+PE_DIRECTIONS = ('LR', 'RL', 'AP', 'PA')
+
+#: Control kind -> (output_type token, ``control_kind`` metadata value).
+REST_CONTROL_KINDS = {
+    'full':  ('restctrl',       'matched_rest_control'),
+    'drift': ('restctrl-drift', 'drift_only_rest_control'),
+}
+
+#: Written into every control file so the file cannot be misread once it leaves its directory.
+REST_CONTROL_NOTE = ("REST timeseries with this task run's design projected out. "
+                     "Not a measurement of rest during the task. Contains no task.")
+
+
+def phase_encoding_direction(task):
+    """Phase-encoding direction of a task name, or None when it does not encode one.
+
+    Read as the last two characters, case-sensitively, which is what separates HCP's
+    ``tfMRIGUESSINGPA`` (PA-encoded) from UCLA's ``scap`` (not AP-encoded). Datasets whose task
+    names carry no direction (``rest``, ``nback``, ``reversallearning``) return None and pair by
+    index instead -- see :func:`pair_rest_runs`.
+
+    Parameters
+    ----------
+    task : str
+        Task/run label as it appears in the scan registry.
+
+    Returns
+    -------
+    str or None
+        One of ``PE_DIRECTIONS``, or None.
+    """
+    tail = str(task)[-2:]
+    return tail if tail in PE_DIRECTIONS else None
+
+
+def condition_of(task):
+    """The condition a task run is averaged into, from the shared run vocabulary.
+
+    Uses :data:`TASK_RUN_GROUPS` and :data:`MOVIE_GROUP` -- the same lists
+    :func:`_apply_scan_groupings` averages by -- so a control is always built for the grouping the
+    notebooks actually use. A run that belongs to no group is its own condition, which is the
+    right answer for single-run datasets (Penn LEAD's ``nback``, PNC's ``frac2back``).
+
+    Parameters
+    ----------
+    task : str
+        Task/run label.
+
+    Returns
+    -------
+    str
+        Condition key, e.g. ``'task-WM'``.
+    """
+    for runs, condition in list(TASK_RUN_GROUPS) + [MOVIE_GROUP]:
+        if task in runs:
+            return condition
+    return f'task-{task}'
+
+
+def pair_rest_runs(task_runs, rest_runs):
+    """Pair each task run with the rest run its matched control is built from.
+
+    **Phase encoding first, then index within the condition.** For a task run, the candidate pool
+    is the rest runs sharing its phase-encoding direction; the run picked is the one at the task
+    run's ordinal position *within its own condition*, cycling if the condition has more runs than
+    the pool holds. Where no direction can be read on either side, the pool is every rest run and
+    the pairing is index-only.
+
+    Matching phase encoding matches susceptibility distortion and dropout, so the control shares
+    the task run's geometry as well as its design and its length. Index-only pairing is not a
+    substitute and the 7T movies are the proof: the movie runs are AP, PA, PA, AP while the 7T
+    rest runs are PA, AP, PA, AP, so pairing by position mismatches ``tfMRIMOVIE17TAP`` and
+    ``tfMRIMOVIE27TPA`` and gets the other two right by luck. On HCP-YA 3T the two rules agree
+    entirely, because ``…LR`` sorts before ``…RL`` on both sides -- which is exactly why the
+    intent has to be written down rather than inferred from a case where it does not bite.
+
+    Parameters
+    ----------
+    task_runs : sequence of str
+        The subject's task run labels, in registry order.
+    rest_runs : sequence of str
+        The subject's rest run labels *of the same modality*, in registry order. Pairing a 3T task
+        to a 7T rest run would defeat the point of the control.
+
+    Returns
+    -------
+    dict
+        ``task_run -> (rest_run, pe_matched)``. ``pe_matched`` is False when the fallback was
+        used, and is recorded in each control file's metadata. Task runs are omitted when
+        ``rest_runs`` is empty.
+
+    Examples
+    --------
+    >>> pair_rest_runs(['tfMRIWMLR', 'tfMRIWMRL'],
+    ...                ['rfMRIREST1LR', 'rfMRIREST1RL', 'rfMRIREST2LR', 'rfMRIREST2RL'])
+    {'tfMRIWMLR': ('rfMRIREST1LR', True), 'tfMRIWMRL': ('rfMRIREST1RL', True)}
+    """
+    rest_runs = list(rest_runs)
+    if not rest_runs:
+        return {}
+
+    by_direction = defaultdict(list)
+    for rest_run in rest_runs:
+        by_direction[phase_encoding_direction(rest_run)].append(rest_run)
+
+    pairing = {}
+    seen = defaultdict(int)      # (condition, direction) -> runs of this kind already paired
+    for task_run in task_runs:
+        direction = phase_encoding_direction(task_run)
+        pool = by_direction.get(direction) if direction is not None else None
+        pe_matched = bool(pool)
+        if not pe_matched:
+            pool = rest_runs
+        key = (condition_of(task_run), direction if pe_matched else None)
+        pairing[task_run] = (pool[seen[key] % len(pool)], pe_matched)
+        seen[key] += 1
+    return pairing
+
+
+def rest_control_output_type(base, kind):
+    """Append a control token to an ``output_type``, e.g. ``autocorr`` -> ``autocorr_restctrl``.
+
+    Kept next to :data:`REST_CONTROL_KINDS` so the token cannot be spelled two ways. The token
+    goes last, in the slot ``_resids`` occupies for the task side -- both answer "what was
+    projected out of what", and a file never carries both.
+
+    Parameters
+    ----------
+    base : str
+        Output type built so far, including any ``_resampled`` and frequency-filter tokens. Those
+        must already be present: a control that does not inherit them is silently comparing
+        unlike things.
+    kind : {'full', 'drift'}
+        Which control.
+
+    Returns
+    -------
+    str
+    """
+    if kind not in REST_CONTROL_KINDS:
+        raise ValueError(f"unknown rest-control kind {kind!r}; "
+                         f"available: {sorted(REST_CONTROL_KINDS)}")
+    return f'{base}_{REST_CONTROL_KINDS[kind][0]}'
 
 
 def compute_deflections(rest_timescales, task_timescales, absolute=False):
@@ -1244,16 +1942,26 @@ def _apply_scan_groupings(
     average_3t_tasks: bool = False,
     average_meg_rest: bool = False,
     average_meg_task: bool = False,
+    statistic: str = 'mean',
 ) -> dict:
     """
-    Apply scan-grouping/averaging logic to a data_dict.
+    Apply scan-grouping logic to a data_dict.
 
     All keys in data_dict are expected to be scan-key strings; values are
     1-D arrays of shape (n_regions,).  Returns a new dict with the same
-    structure after the requested averaging operations are applied.
+    structure after the requested grouping operations are applied.
 
-    Raises ValueError on mutually-exclusive flag combinations.
+    statistic : {'mean', 'median'}
+        How runs are collapsed into a condition. 'mean' is the default and the historical
+        behaviour. It makes no difference for a two-run pair (the median of two values is their
+        mean), so it only bites where a group has three or more runs -- HCP-YA's four rest runs,
+        or average_3t_tasks over twelve.
+
+    Raises ValueError on mutually-exclusive flag combinations, or an unknown statistic.
     """
+    if statistic not in ('mean', 'median'):
+        raise ValueError(f"statistic must be 'mean' or 'median'; got {statistic!r}")
+    _reduce = np.nanmean if statistic == 'mean' else np.nanmedian
     if average_3t_rest and average_all_rest:
         raise ValueError("average_3t_rest and average_all_rest are mutually exclusive")
     if average_7t_rest and average_all_rest:
@@ -1264,39 +1972,23 @@ def _apply_scan_groupings(
     out = dict(data_dict)  # shallow copy — we replace keys, not mutate values
 
     def _avg_group(keys_to_merge, new_key):
-        """Average a list of keys into new_key; remove originals."""
+        """Collapse a list of keys into new_key with `statistic`; remove originals."""
         arrays = [out[k] for k in keys_to_merge if k in out and out[k] is not None]
         if not arrays:
             return
-        out[new_key] = np.nanmean(np.stack(arrays, axis=0), axis=0)
+        out[new_key] = _reduce(np.stack(arrays, axis=0), axis=0)
         for k in keys_to_merge:
             out.pop(k, None)
 
     def _keys_matching(patterns):
         return [k for k in list(out) if any(p in k for p in patterns)]
 
-    # HCP-YA 3T rest (LR/RL phase-encoding) and HCP-D 3T rest (AP/PA phase-encoding)
-    _3t_rest_tasks  = ['rfMRIREST1LR', 'rfMRIREST1RL', 'rfMRIREST2LR', 'rfMRIREST2RL',   # HCP-YA
-                       'rfMRIREST1PA', 'rfMRIREST2PA']   # HCP-D
-                    #    'rfMRIREST1AP', 'rfMRIREST1PA', 'rfMRIREST2AP', 'rfMRIREST2PA']   # HCP-D
-                    
-    _7t_rest_tasks  = ['rfMRIREST17TPA', 'rfMRIREST27TAP', 'rfMRIREST37TPA', 'rfMRIREST47TAP']
-    _7t_movie_tasks = ['tfMRIMOVIE17TAP', 'tfMRIMOVIE27TPA', 'tfMRIMOVIE37TPA', 'tfMRIMOVIE47TAP']
-    _3t_task_pairs  = [
-        # HCP-YA — LR/RL counterbalanced pairs
-        (['tfMRIWMLR',          'tfMRIWMRL'],          'task-WM'),
-        (['tfMRIEMOTIONLR',     'tfMRIEMOTIONRL'],     'task-EMOTION'),
-        (['tfMRIGAMBLINGLR',    'tfMRIGAMBLINGRL'],    'task-GAMBLING'),
-        (['tfMRILANGUAGELR',    'tfMRILANGUAGERL'],    'task-LANGUAGE'),
-        (['tfMRIRELATIONALLR',  'tfMRIRELATIONALRL'],  'task-RELATIONAL'),
-        (['tfMRISOCIALLR',      'tfMRISOCIALRL'],      'task-SOCIAL'),
-        # HCP-D — single PA direction (no LR/RL counterpart)
-        (['tfMRICARITPA'],                              'task-CARIT'),
-        (['tfMRIEMOTIONPA'],                            'task-EMOTION'),
-        (['tfMRIGUESSINGPA'],                           'task-GUESSING'),
-    ]
-    _meg_rest_tasks = ['3Restin', '4Restin', '5Restin']
-    _meg_task_tasks = ['6Wrkmem', '7Wrkmem']
+    _3t_rest_tasks  = REST_RUNS_3T
+    _7t_rest_tasks  = REST_RUNS_7T
+    _7t_movie_tasks = MOVIE_RUNS_7T
+    _3t_task_pairs  = TASK_RUN_GROUPS
+    _meg_rest_tasks = REST_RUNS_MEG
+    _meg_task_tasks = TASK_RUNS_MEG
 
     if average_3t_rest:
         _avg_group(_keys_matching(_3t_rest_tasks), 'task-REST_3T')
@@ -1332,9 +2024,10 @@ def create_ints_dataframe_custom_grouping(
     average_meg_rest=False,
     average_meg_task=False,
     sort_by_median=False,
+    statistic='mean',
 ):
     """
-    Create a DataFrame (regions × scan-types) of mean INTs.
+    Create a DataFrame (regions × scan-types) of group-level INTs.
 
     Parameters
     ----------
@@ -1343,10 +2036,20 @@ def create_ints_dataframe_custom_grouping(
     n_regions : int
         Number of brain regions (used only to initialise the output DataFrame)
     average_* : bool
-        Averaging flags — see _apply_scan_groupings for semantics.
+        Scan-grouping flags — see _apply_scan_groupings for semantics.
     sort_by_median : bool
-        Sort columns by descending median across regions.
+        Sort columns by descending median across regions. This is a sort KEY and is unrelated to
+        `statistic`: it orders columns the same way whichever statistic produced their values.
+    statistic : {'mean', 'median'}
+        How subjects are collapsed into one value per region, and how runs are collapsed into a
+        condition (it is passed to :func:`_apply_scan_groupings`, so both steps use the same one
+        and the result is never a mixture). 'mean' is the default and the historical behaviour.
+        The median is the more robust summary where a few subjects carry extreme INTs, which is
+        what an ACF-based estimator produces for a scan that barely decorrelates.
     """
+    if statistic not in ('mean', 'median'):
+        raise ValueError(f"statistic must be 'mean' or 'median'; got {statistic!r}")
+    _reduce = np.nanmean if statistic == 'mean' else np.nanmedian
     def _extract_scan_name(scan_key):
         """Return the task-entity value from a scan key string."""
         for part in scan_key.split('_'):
@@ -1354,20 +2057,20 @@ def create_ints_dataframe_custom_grouping(
                 return part[len('task-'):]
         return scan_key
 
-    # Group by scan type (strip per-subject info), averaging across subjects
+    # Group by scan type (strip per-subject info), collapsing subjects with `statistic`
     by_scan_type = defaultdict(list)
     for scan_key, arr in data_dict.items():
         if arr is not None:
             by_scan_type[_extract_scan_name(scan_key)].append(arr)
 
-    scan_type_means = {
-        name: np.nanmean(np.stack(arrs, axis=0), axis=0)
+    scan_type_stat = {
+        name: _reduce(np.stack(arrs, axis=0), axis=0)
         for name, arrs in by_scan_type.items()
     }
 
-    # Apply grouping/averaging
-    scan_type_means = _apply_scan_groupings(
-        scan_type_means,
+    # Apply grouping, with the same statistic so the two steps cannot disagree
+    scan_type_stat = _apply_scan_groupings(
+        scan_type_stat,
         average_3t_rest=average_3t_rest,
         average_7t_rest=average_7t_rest,
         average_all_rest=average_all_rest,
@@ -1376,9 +2079,10 @@ def create_ints_dataframe_custom_grouping(
         average_3t_tasks=average_3t_tasks,
         average_meg_rest=average_meg_rest,
         average_meg_task=average_meg_task,
+        statistic=statistic,
     )
 
-    df = pd.DataFrame(scan_type_means, index=range(n_regions))
+    df = pd.DataFrame(scan_type_stat, index=range(n_regions))
 
     if sort_by_median:
         order = df.median(axis=0).sort_values(ascending=False).index
