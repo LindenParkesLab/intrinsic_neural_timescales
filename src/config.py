@@ -105,7 +105,8 @@ DATASET_PARAMS = {
         'modalities':  ['MRI3T'],
         'seg':         'Schaefer4007',
         'space':       'MNI152NLin2009cAsym',
-        'sessions':    ['1', '2'],  # add '3' for subjects with a third visit
+        # Longitudinal: 132 subjects at session 1, 73 at session 2, 20 at session 3.
+        'sessions':    ['1', '2', '3'],
         'tasks': {
             'MRI3T': ['rest', 'nback'],
         },
@@ -114,6 +115,10 @@ DATASET_PARAMS = {
         'nuisance_regression': False,
         'task_regression':     True,
         'remove_incomplete_subjects': True,
+        # Completeness is judged per (subject, session): a session missing rest or nback is
+        # dropped, the subject's other sessions are kept. Per subject, every subject not scanned
+        # at every timepoint would be discarded.
+        'incomplete_unit':     'session',
     },
     'AOMIC_PIOP2': {
         'modalities':  ['MRI3T'],

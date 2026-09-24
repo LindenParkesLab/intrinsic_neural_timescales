@@ -9,10 +9,20 @@ modalities:
     data_subdir: xcpd
     dir_template: "sub-{subject_id}/ses-{session}/func"
     filename_template: "sub-{subject_id}_ses-{session}_task-{task}_run-01_space-{space}_seg-{seg}_stat-mean_timeseries{ext}"
+    # CuBIDS renamed scans outside the dominant acquisition group with an acq-VARIANT* label.
+    # VARIANTObliquity differs only in slice obliquity, which a parcellated timeseries does not
+    # see, so it is read. VARIANTNumVolumes runs have the wrong frame count and must NOT be: name
+    # the one variant explicitly here, never a wildcard. DataLoader.get_scan_acq reports which
+    # scans came in this way, for the sensitivity analysis that drops them.
+    filename_template_fallbacks:
+      - "sub-{subject_id}_ses-{session}_task-{task}_acq-VARIANTObliquity_run-01_space-{space}_seg-{seg}_stat-mean_timeseries{ext}"
     file_ext: .tsv
     task_events_handler: bids_tsv
-    task_events_file_template: "sub-{subject_id}_ses-{session}_task-{task}_run-01_events.tsv"
-    task_events_use_glob: false
+    # Globbed so a variant scan's events (named with its acq label) are found. The timeseries
+    # fallback above is what admits or refuses a variant; a scan whose timeseries is not found
+    # never reaches this lookup.
+    task_events_file_template: "sub-{subject_id}_ses-{session}_task-{task}*_run-01_events.tsv"
+    task_events_use_glob: true
 behavior:
   handler: penn_lead
 rbc: false

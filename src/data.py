@@ -676,12 +676,17 @@ def _behavior_penn_lead(loader: 'DataLoader') -> pd.DataFrame:
 XCPD_MOTION_CACHE = '{dataset}_motion_xcpd.csv'
 XCPD_QC_FIELDS = ('mean_fd', 'mean_relative_rms', 'max_relative_rms',
                   'num_censored_volumes', 'num_retained_volumes')
+#: Optional keys: ``runs`` keeps only these run labels, ``exclude_acq`` drops these acq labels, so
+#: the covariate describes the runs the analysis reads. Penn_LEAD analyses rest run-01 only (522
+#: frames, before the n-back); run-02 is 383 frames and acquired after it, and CuBIDS's
+#: VARIANTNumVolumes runs are wrong-length runs the loader never picks up.
 XCPD_MOTION_SPEC = {
     'AOMIC_PIOP1': dict(rest_task='restingstate', task_tasks=None,           per_session=False, alias_session=None),
     'AOMIC_PIOP2': dict(rest_task='restingstate', task_tasks=None,           per_session=False, alias_session=None),
     'WAND':        dict(rest_task='rest',         task_tasks=None,           per_session=False, alias_session=None),
     'PNC':         dict(rest_task='rest',         task_tasks=('frac2back',), per_session=False, alias_session=None),
-    'Penn_LEAD':   dict(rest_task='rest',         task_tasks=('nback',),     per_session=True,  alias_session='1'),
+    'Penn_LEAD':   dict(rest_task='rest',         task_tasks=('nback',),     per_session=True,  alias_session='1',
+                        runs=('01',), exclude_acq=('VARIANTNumVolumes',)),
 }
 
 
@@ -771,6 +776,11 @@ def xcpd_motion_columns(loader: 'DataLoader', force: bool = False) -> pd.DataFra
     long = load_xcpd_motion(loader, force=force)
     if long.empty:
         return pd.DataFrame()
+
+    if spec.get('runs') is not None:
+        long = long[long['run'].isin(spec['runs'])]
+    if spec.get('exclude_acq'):
+        long = long[~long['acq'].isin(spec['exclude_acq'])]
 
     # Runs (and XCP-D's acq variants) collapse first, so a task has one value per session.
     per_ses = (long.groupby(['subject_id', 'session', 'task'], dropna=False)['mean_fd']
@@ -1209,6 +1219,7 @@ class DataLoader:
         self,
         verbose: bool = True,
         remove_incomplete_subjects: bool = False,
+        incomplete_unit: str = 'subject',
     ) -> Dict[str, List]:
         """Check which registered scans exist on disk and remove missing ones.
 
@@ -1224,18 +1235,28 @@ class DataLoader:
         verbose : bool
             Print detailed validation report.
         remove_incomplete_subjects : bool
-            If True, remove all scans for any subject that had at least one
-            missing scan.
+            If True, remove the remaining scans of any unit (see ``incomplete_unit``) that had at
+            least one missing scan.
+        incomplete_unit : {'subject', 'session'}
+            What "incomplete" is judged over. ``'subject'`` (the default) removes every scan of a
+            subject with any missing scan, in any session. ``'session'`` removes only the
+            (subject, session) pairs with a missing scan and keeps that subject's complete
+            sessions -- for a longitudinal dataset (Penn_LEAD), where requiring every session
+            would discard every subject not scanned at every timepoint.
 
         Returns
         -------
         dict
-            Keys 'existing', 'missing', 'removed_subjects'.
+            Keys 'existing', 'missing', 'removed_subjects' (subjects with no scans left),
+            'removed_sessions' (``(subject_id, session)`` pairs removed as incomplete; empty under
+            ``'subject'``).
         """
+        if incomplete_unit not in ('subject', 'session'):
+            raise ValueError(f"incomplete_unit must be 'subject' or 'session'; got {incomplete_unit!r}")
         if not self.scan_registry:
             if verbose:
                 print("Scan registry is empty.")
-            return {'existing': [], 'missing': [], 'removed_subjects': []}
+            return {'existing': [], 'missing': [], 'removed_subjects': [], 'removed_sessions': []}
 
         initial_count = len(self.scan_registry)
         if verbose:
@@ -1285,20 +1306,26 @@ class DataLoader:
             if scan in self.scan_registry:
                 self.scan_registry.remove(scan)
 
-        removed_subjects = []
+        removed_subjects, removed_sessions = [], []
         if remove_incomplete_subjects and missing_scans:
+            by_session = incomplete_unit == 'session'
+            unit_of = ((lambda s: (s.subject_id, s.session)) if by_session
+                       else (lambda s: s.subject_id))
             if verbose:
-                print("\nRemoving all scans for subjects with incomplete data...")
-            subjects_with_missing = {scan.subject_id for scan, _ in missing_scans}
-            scans_to_remove = [
-                s for s in self.scan_registry
-                if s.subject_id in subjects_with_missing
-            ]
+                print(f"\nRemoving all scans for {'sessions' if by_session else 'subjects'} "
+                      "with incomplete data...")
+            subjects_before = {s.subject_id for s in self.scan_registry} | {
+                s.subject_id for s, _ in missing_scans}
+            units_with_missing = {unit_of(scan) for scan, _ in missing_scans}
+            scans_to_remove = [s for s in self.scan_registry if unit_of(s) in units_with_missing]
             for scan in scans_to_remove:
                 self.scan_registry.remove(scan)
                 if verbose:
-                    print(f"  Removed: {scan} (subject {scan.subject_id} incomplete)")
-            removed_subjects = sorted(subjects_with_missing)
+                    print(f"  Removed: {scan} ({incomplete_unit} {unit_of(scan)} incomplete)")
+            subjects_left = {s.subject_id for s in self.scan_registry}
+            removed_subjects = sorted(subjects_before - subjects_left)
+            if by_session:
+                removed_sessions = sorted(units_with_missing, key=lambda u: (u[0], str(u[1])))
 
         if verbose:
             print(f"\nValidation Summary:")
@@ -1306,7 +1333,9 @@ class DataLoader:
             print(f"  Existing:              {len(existing_scans)}")
             print(f"  Missing/Removed:       {len(missing_scans)} scans")
             if remove_incomplete_subjects:
-                print(f"  Incomplete subjects:   {len(removed_subjects)}")
+                if incomplete_unit == 'session':
+                    print(f"  Incomplete sessions:   {len(removed_sessions)}")
+                print(f"  Subjects removed:      {len(removed_subjects)}")
             print(f"  Final registry:        {len(self.scan_registry)} scans")
 
             if missing_scans or existing_scans:
@@ -1342,6 +1371,7 @@ class DataLoader:
             'existing': existing_scans,
             'missing': missing_scans,
             'removed_subjects': removed_subjects,
+            'removed_sessions': removed_sessions,
         }
 
     # --------------------------------------------------------------------------
@@ -1417,6 +1447,18 @@ class DataLoader:
                     return fallback
 
         return filepath
+
+    def get_scan_acq(self, scan: ScanInfo) -> Optional[str]:
+        """The ``acq-`` label of the file a scan resolves to, or None when it has none.
+
+        ``acq`` is not a ScanInfo entity -- adding one would rename every cached output -- so a
+        scan found through a fallback template (PNC's ``acq-singleband``, Penn_LEAD's CuBIDS
+        ``acq-VARIANTObliquity``) looks identical to a dominant-group scan everywhere else. This
+        reads it back off the resolved filename, which is what a sensitivity analysis that drops
+        the variant scans needs.
+        """
+        match = re.search(r'_acq-([a-zA-Z0-9]+)_', self.get_scan_filepath(scan).name)
+        return match.group(1) if match else None
 
     # --------------------------------------------------------------------------
     # Task events
