@@ -211,13 +211,38 @@ def _scan_key(sub, task, condition, modality, tr):
                              seg='Schaefer4007', tr=tr, condition=condition)
 
 
+class TestPairingStaysInsideASession:
+    """Penn LEAD's sessions are ~2 years apart: a control built from another session's rest would
+    be a different brain at a different age. Groups are subject x session x modality."""
+
+    @staticmethod
+    def _key(ses, task, condition):
+        return build_scan_string(sub='20188', ses=ses, modality='MRI3T', task=task, space='fsLR',
+                                 seg='Schaefer4007', tr='0.8', condition=condition)
+
+    def test_a_session_without_rest_gets_no_control_rather_than_borrowing_one(self, rng):
+        n = 120
+        design = pd.DataFrame({'trial': rng.standard_normal(n), 'constant': np.ones(n)})
+        task1, rest1 = self._key('1', 'nback', 'task'), self._key('1', 'rest', 'rest')
+        task2, rest2 = self._key('2', 'nback', 'task'), self._key('2', 'rest', 'rest')
+        processor = _stub_processor(
+            'Penn_LEAD', [task1, rest1, task2, rest2],
+            {task1: rng.standard_normal((4, n)), rest1: rng.standard_normal((4, n)),
+             task2: rng.standard_normal((4, n)), rest2: None},          # session 2 lost its rest
+            {task1: design, task2: design}, {task1: None, task2: None})
+        processor.build_rest_controls(use_fft=True, verbose=False)
+        assert processor.autocorr_rest_control[task1] is not None
+        assert processor.autocorr_rest_control[task2] is None
+        assert task2 not in processor.rest_control_meta
+
+
 class TestRestControlOffset:
     """The window start. Source: ONSET_OFFSET_ALL_DATASETS.md §1, ``auc_zero_crossing``."""
 
     def test_the_table_is_the_diagnostic(self):
         """HCP-YA 3T is the only measured transient; everything else is zero, deliberately."""
         assert REST_CONTROL_OFFSET_SECONDS[('HCP-YA', 'MRI3T')] == 126.0
-        for key in [('HCP-YA', 'MRI7T'), ('HCP-D', 'MRI3T'), ('Penn_LEAD', 'MRI3T')]:
+        for key in [('HCP-YA', 'MRI7T'), ('HCP-D', 'MRI3T'), ('Penn_LEAD', 'MRI3T'), ('TCP', 'MRI3T')]:
             assert REST_CONTROL_OFFSET_SECONDS[key] == 0.0
         assert REST_CONTROL_OFFSET_DEFAULT == 0.0
 

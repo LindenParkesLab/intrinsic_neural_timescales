@@ -1,0 +1,40 @@
+name: TCP
+paths:
+  base: /mnt/lindenmp_bignas/lindenmp/research_data/TCP
+  rawdata_subdir: bids
+  derivatives_subdir: derivatives
+modalities:
+  MRI3T:
+    tr: 0.8
+    data_subdir: xcpd
+    # No session level in this dataset (config.py registers it with sessions: [None]).
+    dir_template: "sub-{subject_id}/func"
+    # The registry's task names are NOT the BIDS task names. BIDS names the two rest runs of one
+    # phase-encoding direction restAP run-01 / run-02; the registry calls them rest1AP / rest2AP,
+    # HCP-YA's rfMRIREST1LR convention. Every consumer keys runs by task name (the control
+    # pairing's rest_key_of, the run groupings, create_ints_dataframe_custom_grouping), so two runs
+    # sharing one would silently collide -- run-02 overwriting run-01 in the pairing. task_params
+    # maps each registry name back to its BIDS {bids_task} and {run} for both templates. The PE
+    # direction stays the last two characters, which is what phase_encoding_direction reads.
+    filename_template: "sub-{subject_id}_task-{bids_task}_run-{run}_space-{space}_seg-{seg}_stat-mean_timeseries{ext}"
+    file_ext: .tsv
+    # Exact template, not a glob: rest has no events file anywhere in the dataset, which is what
+    # validate_scan_registry's rest branch requires.
+    task_events_handler: tcp_bids_tsv
+    task_events_file_template: "sub-{subject_id}_task-{bids_task}_run-{run}_events.tsv"
+    task_events_use_glob: false
+    # rest run-01 is acquired BEFORE the tasks and run-02 AFTER them (201 of the 207 subjects with
+    # all seven runs share the order rest1AP, rest1PA, stroopAP, stroopPA, hammerAP, rest2AP,
+    # rest2PA, from AcquisitionTime). So rest1* is the pre-task baseline, rest2* the post-task one.
+    task_params:
+      rest1AP:  {bids_task: restAP,   run: '01'}
+      rest1PA:  {bids_task: restPA,   run: '01'}
+      rest2AP:  {bids_task: restAP,   run: '02'}
+      rest2PA:  {bids_task: restPA,   run: '02'}
+      stroopAP: {bids_task: stroopAP, run: '01'}
+      stroopPA: {bids_task: stroopPA, run: '01'}
+      hammerAP: {bids_task: hammerAP, run: '01'}
+behavior:
+  handler: tcp
+rbc: false
+subject_id_rawdata_transform: null

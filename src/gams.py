@@ -114,7 +114,7 @@ def gam_cache_path(gam_out_dir, dataset, n_regions, task_scan, tags):
 # Head-motion column(s) per dataset; None means this dataset gets no nuisance covariates.
 FD_COLUMN = {'HCP-D': 'meanFD', 'PNC': 'meanFD_rest', 'HCP-YA': 'meanRelRMS_rest',
              'AOMIC_PIOP1': 'meanFD_rest', 'AOMIC_PIOP2': 'meanFD_rest',
-             'WAND': 'meanFD_rest', 'Penn_LEAD': 'meanFD_rest'}
+             'WAND': 'meanFD_rest', 'Penn_LEAD': 'meanFD_rest', 'TCP': 'meanFD_rest'}
 
 
 def build_nuisance(df_behavior, rest, dataset, include_age=False, fd_columns=None):

@@ -640,9 +640,21 @@ def _behavior_pnc_rbc(loader: 'DataLoader') -> pd.DataFrame:
     return df.join(motion, how='left')
 
 
+#: In-scanner n-back performance carried per session in ``sub-*_sessions.tsv``.
+PENN_LEAD_DPRIME = {'0_back_dprime': 'dprime_0back', '2_back_dprime': 'dprime_2back'}
+
+
 def _behavior_penn_lead(loader: 'DataLoader') -> pd.DataFrame:
+    """Penn_LEAD demographics, baseline diagnoses, per-session age / n-back d' / head motion.
+
+    ``study_group`` and every ``dx_*`` column are from the timepoint-1 clinical interview -- the
+    release has no follow-up diagnoses -- so they are baseline groups, not per-session states.
+    Per-session columns carry a ``_ses<N>`` suffix: ``age_ses<N>``, ``dprime_{0,2}back_ses<N>``,
+    ``meanFD_<task>_ses<N>``.
+    """
     df = pd.read_csv(loader.config.base_path / 'participants.tsv', delimiter='\t')
-    df = df[['participant_id', 'age_months', 'sex']]
+    dx_cols = [c for c in df.columns if c.startswith('dx_')]
+    df = df[['participant_id', 'age_months', 'sex', 'study_group'] + dx_cols]
     df.rename(columns={'participant_id': 'subject_id', 'age_months': 'age'}, inplace=True)
     df['subject_id'] = [s.split('-')[1] for s in df['subject_id']]
     df['age'] = df['age'] / 12
@@ -664,6 +676,10 @@ def _behavior_penn_lead(loader: 'DataLoader') -> pd.DataFrame:
             ses_label = row['session_id'].replace('ses-', '')
             delta_years = (row['acq_time'] - base_time).days / 365.25
             df.loc[subject_id, f'age_ses{ses_label}'] = df.loc[subject_id, 'age'] + delta_years
+            for src_col, name in PENN_LEAD_DPRIME.items():
+                if src_col in df_ses.columns:
+                    df.loc[subject_id, f'{name}_ses{ses_label}'] = pd.to_numeric(
+                        row[src_col], errors='coerce')
 
     # Head motion, per session as well as pooled
     motion = xcpd_motion_columns(loader)
@@ -687,6 +703,13 @@ XCPD_MOTION_SPEC = {
     'PNC':         dict(rest_task='rest',         task_tasks=('frac2back',), per_session=False, alias_session=None),
     'Penn_LEAD':   dict(rest_task='rest',         task_tasks=('nback',),     per_session=True,  alias_session='1',
                         runs=('01',), exclude_acq=('VARIANTNumVolumes',)),
+    # TCP's runs are relabelled to their registry names first (see _registry_task_labels), so its
+    # two rest runs per direction stay apart rather than averaging pre- and post-task rest.
+    # meanFD_rest is the pre-task rest the matched controls are cut from; meanFD_task the primary
+    # task, stroop. The other runs keep their own meanFD_<task> columns.
+    'TCP':         dict(rest_task=('rest1AP', 'rest1PA'), task_tasks=('stroopAP', 'stroopPA'),
+                        per_session=False, alias_session=None,
+                        aliases={'meanFD_rest_post': ('rest2AP', 'rest2PA')}),
 }
 
 
@@ -700,10 +723,23 @@ def _qc_entities(filename: str) -> dict:
     return dict(re.findall(r'([a-zA-Z]+)-([a-zA-Z0-9]+)', filename))
 
 
+def _registry_task_labels(loader: 'DataLoader') -> Dict[Tuple[str, str], str]:
+    """``(bids_task, run) -> registry task name``, from the YAML's ``task_params``.
+
+    Only a dataset whose registry renames its BIDS runs (TCP: ``restAP`` run-02 -> ``rest2AP``)
+    has entries; for every other dataset this is empty and a QC row keeps its BIDS task name.
+    """
+    config = getattr(loader, 'config', None)
+    if config is None or 'MRI3T' not in config.modalities:
+        return {}
+    return {(p['bids_task'], str(p['run'])): task
+            for task, p in config.modalities['MRI3T'].task_params.items() if 'bids_task' in p}
+
+
 def load_xcpd_motion(loader: 'DataLoader', force: bool = False) -> pd.DataFrame:
     """Per-run head motion for every subject of an XCP-D-processed dataset, one row per run.
 
-    Shared by AOMIC-PIOP1/PIOP2, WAND, PNC and Penn_LEAD, whose XCP-D outputs carry the same
+    Shared by AOMIC-PIOP1/PIOP2, WAND, PNC, Penn_LEAD and TCP, whose XCP-D outputs carry the same
     ``*_desc-linc_qc.tsv`` file.
 
     Returns
@@ -762,8 +798,13 @@ def xcpd_motion_columns(loader: 'DataLoader', force: bool = False) -> pd.DataFra
                                  longitudinal sample into one number. The per-session columns below
                                  are where the other sessions live.
     ``meanFD_<task>_ses<N>``     per session, for datasets with ``per_session`` set
-    ``meanFD_rest``              the dataset's rest task (from ``alias_session`` when set)
+    ``meanFD_rest``              the dataset's rest task (from ``alias_session`` when set); the
+                                 mean over them where ``rest_task`` names several (TCP)
     ``meanFD_task``              mean over its analysed non-rest tasks (likewise)
+    ``<alias>``                  each ``aliases`` entry of the spec: the mean over its tasks
+
+    Tasks are the REGISTRY's names (:func:`_registry_task_labels`), so a dataset that renames its
+    BIDS runs (TCP) gets one column per registry run rather than a mean over same-named runs.
 
     ``meanFD_rest`` and ``meanFD_task`` are what :func:`src.gams.build_nuisance` reads by default.
     They are kept separate rather than averaged into one number for the reason given in
@@ -781,6 +822,9 @@ def xcpd_motion_columns(loader: 'DataLoader', force: bool = False) -> pd.DataFra
         long = long[long['run'].isin(spec['runs'])]
     if spec.get('exclude_acq'):
         long = long[~long['acq'].isin(spec['exclude_acq'])]
+    labels = _registry_task_labels(loader)
+    if labels:
+        long = long.assign(task=[labels.get((t, r), t) for t, r in zip(long['task'], long['run'])])
 
     # Runs (and XCP-D's acq variants) collapse first, so a task has one value per session.
     per_ses = (long.groupby(['subject_id', 'session', 'task'], dropna=False)['mean_fd']
@@ -802,14 +846,22 @@ def xcpd_motion_columns(loader: 'DataLoader', force: bool = False) -> pd.DataFra
                 return named
         return f'meanFD_{task}'
 
-    rest_col = _column(spec['rest_task'])
-    if rest_col in out.columns:
-        out['meanFD_rest'] = out[rest_col]
+    rest_tasks = ((spec['rest_task'],) if isinstance(spec['rest_task'], str)
+                  else tuple(spec['rest_task']))
+    rest_cols = [c for c in (_column(t) for t in rest_tasks) if c in out.columns]
+    if len(rest_cols) == 1:
+        out['meanFD_rest'] = out[rest_cols[0]]
+    elif rest_cols:
+        out['meanFD_rest'] = out[rest_cols].mean(axis=1)
     task_names = (spec['task_tasks'] if spec['task_tasks'] is not None
-                  else sorted({t for t in per_ses['task'].unique() if t != spec['rest_task']}))
+                  else sorted({t for t in per_ses['task'].unique() if t not in rest_tasks}))
     task_cols = [c for c in (_column(t) for t in task_names) if c in out.columns]
     if task_cols:
         out['meanFD_task'] = out[task_cols].mean(axis=1)
+    for alias, tasks in (spec.get('aliases') or {}).items():
+        cols = [c for c in (_column(t) for t in tasks) if c in out.columns]
+        if cols:
+            out[alias] = out[cols].mean(axis=1)
 
     out.index.name = 'subject_id'
     return out
@@ -855,6 +907,56 @@ def _behavior_wand(loader: 'DataLoader') -> pd.DataFrame:
     return df.join(motion, how='left')
 
 
+#: demos.tsv columns carried into the TCP behaviour table, verbatim or renamed.
+TCP_DEMOS_COLUMNS = {'Primary_Dx': 'dx_primary', 'Non-Primary_Dx': 'dx_nonprimary',
+                     'Active Psychosis': 'active_psychosis',
+                     'meds_yes_no': 'meds_any_raw', 'psych_meds': 'psych_meds_raw'}
+
+
+def _behavior_tcp(loader: 'DataLoader') -> pd.DataFrame:
+    """TCP demographics, clinical group, diagnoses, medication and per-run head motion.
+
+    ``group`` is the release's ``Patient`` / ``GenPop``; ``patient`` codes it 1 / 0. The diagnosis
+    columns are the release's FREE TEXT (``BP1`` and ``BPI``, ``past MDD`` and ``Past MDD``, ...),
+    kept verbatim: turning them into diagnostic classes is an analysis decision, not a loading one.
+    Several ``Patient`` rows carry only past diagnoses.
+
+    Medication: ``demos.tsv`` has no definitions file, so the 1 / 2 coding of ``meds_yes_no`` and
+    ``psych_meds`` is INFERRED from the cross-tab with group -- 89 of 95 GenPop are 1 on
+    ``psych_meds``, 80 of 140 coded patients are 2 -- as 1 = no, 2 = yes. ``meds_any`` and
+    ``psych_meds`` carry that reading (1 = yes); the ``*_raw`` columns keep the release's codes.
+    """
+    base = loader.config.base_path
+    df = pd.read_csv(base / 'participants.tsv', delimiter='\t')
+    df['subject_id'] = [s.split('-')[1] if str(s).startswith('sub-') else str(s)
+                        for s in df['participant_id']]
+    # Match the coding every other handler uses (M -> 1). Missing sex stays NaN rather than
+    # becoming 0, which an == comparison would silently produce.
+    df['sex'] = df['sex'].map({'M': 1, 'F': 0})
+    df = df.rename(columns={'Site': 'site', 'Group': 'group'})
+    df['patient'] = df['group'].map({'Patient': 1, 'GenPop': 0})
+    df = df[['subject_id', 'age', 'sex', 'site', 'group', 'patient']].set_index('subject_id')
+
+    # demos.tsv is comma-separated despite its name, Latin-1 encoded, and carries NDA's
+    # 'demos,1' line above the header; 999 is missing. Its subjectkey is NDAR_INV..., the
+    # registry's id with the underscore.
+    demos = pd.read_csv(base / 'phenotype' / 'demos.tsv', skiprows=[0], encoding='latin-1',
+                        na_values=[HCPD_SENTINEL, str(HCPD_SENTINEL)], low_memory=False)
+    demos['subject_id'] = demos['subjectkey'].str.replace('_', '', regex=False)
+    demos = demos.set_index('subject_id')[list(TCP_DEMOS_COLUMNS)].rename(columns=TCP_DEMOS_COLUMNS)
+    for col in ('dx_primary', 'dx_nonprimary', 'active_psychosis'):
+        demos[col] = demos[col].astype('string').str.strip()
+    demos['meds_any'] = demos['meds_any_raw'].map({1: 0, 2: 1})
+    demos['psych_meds'] = demos['psych_meds_raw'].map({1: 0, 2: 1})
+    df = df.join(demos, how='left')
+
+    motion = xcpd_motion_columns(loader)
+    if motion.empty:
+        logger.warning("No TCP motion data found; meanFD columns not added.")
+        return df
+    return df.join(motion, how='left')
+
+
 def _behavior_hbn_rbc(loader: 'DataLoader') -> pd.DataFrame:
     df = pd.read_csv(
         loader.config.base_path / 'study-HBN_desc-participants.tsv',
@@ -874,6 +976,7 @@ BEHAVIOR_HANDLERS = {
     'aomic_piop1': _behavior_aomic,
     'aomic_piop2': _behavior_aomic,
     'wand': _behavior_wand,
+    'tcp': _behavior_tcp,
     'hbn_rbc': _behavior_hbn_rbc,
 }
 
@@ -1019,12 +1122,64 @@ def _events_ucla_bids_tsv(loader: 'DataLoader', scan: ScanInfo) -> pd.DataFrame:
         return _clean(df)
 
 
+#: Stroop stimulus duration in seconds (Chopra et al. 2025, Fig. 2a). The release's ``duration``
+#: column is NOT this: it runs to the next trial's onset, so the 78 trials tile the run from 2 s to
+#: 398 s and, used as given, congruent + incongruent would sum to a boxcar nearly collinear with
+#: the constant.
+TCP_STROOP_STIMULUS_SECONDS = 0.25
+
+
+def _events_tcp_bids_tsv(loader: 'DataLoader', scan: ScanInfo) -> pd.DataFrame:
+    """TCP events: the BIDS file, recoded into the regressors task regression should remove.
+
+    stroop
+        The nine trial types collapse to ``congruent`` (``con1-3``) and ``incongruent``
+        (``inc1-6``), each modelled at the 0.25 s stimulus (:data:`TCP_STROOP_STIMULUS_SECONDS`).
+        Error and no-response trials are kept: the aim is to remove every evoked response.
+    hammer (Emotional Faces)
+        ``face`` / ``shape`` trials as given (stimulus ~1.9 s), plus a ``cue`` event for each
+        block's 3 s "Match Faces" / "Match Shapes" screen, which the release carries only in the
+        ``cueStartTime`` / ``cueEndTime`` columns of each block's first trial.
+
+    Rest has no events file, so the underlying reader raises and rest resolves to None.
+    """
+    events = _events_bids_tsv(loader, scan)
+    bids_task = loader.config.modalities[scan.modality].template_fields(scan.task).get(
+        'bids_task', scan.task)
+
+    if bids_task.startswith('stroop'):
+        trial_type = events['trial_type'].astype(str)
+        out = pd.DataFrame({
+            'onset': events['onset'],
+            'duration': TCP_STROOP_STIMULUS_SECONDS,
+            'trial_type': np.where(trial_type.str.startswith('con'), 'congruent',
+                                   np.where(trial_type.str.startswith('inc'), 'incongruent', None)),
+        })
+        if out['trial_type'].isna().any():
+            raise ValueError(f"unexpected stroop trial_type in {scan}: "
+                             f"{sorted(set(trial_type[out['trial_type'].isna()]))}")
+    elif bids_task.startswith('hammer'):
+        trials = events[['onset', 'duration', 'trial_type']]
+        cues = events.dropna(subset=['cueStartTime', 'cueEndTime'])
+        cues = pd.DataFrame({'onset': cues['cueStartTime'],
+                             'duration': cues['cueEndTime'] - cues['cueStartTime'],
+                             'trial_type': 'cue'})
+        out = pd.concat([trials, cues], ignore_index=True)
+    else:
+        raise ValueError(f"no TCP events recoding for task {scan.task!r} ({bids_task})")
+
+    out = out.dropna(subset=['onset', 'duration', 'trial_type'])
+    out['trial_type'] = out['trial_type'].astype(str)
+    return out.sort_values('onset').reset_index(drop=True)
+
+
 TASK_EVENTS_HANDLERS = {
     'hcp_fmri': _events_hcp_fmri,
     'hcp_meg': _events_hcp_meg,
     'hcp_7t_movie': _events_hcp_7t_movie,
     'bids_tsv': _events_bids_tsv,
     'ucla_bids_tsv': _events_ucla_bids_tsv,
+    'tcp_bids_tsv': _events_tcp_bids_tsv,
 }
 
 

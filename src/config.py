@@ -151,6 +151,27 @@ DATASET_PARAMS = {
         'task_regression':     True,
         'remove_incomplete_subjects': True,
     },
+    'TCP': {
+        'modalities':  ['MRI3T'],
+        'seg':         'Schaefer4007',
+        'space':       'MNI152NLin2009cAsym',
+        'sessions':    [None],
+        'tasks': {
+            # Registry names, mapped to BIDS task/run by the YAML's task_params. rest1* is the
+            # pre-task rest, rest2* the post-task rest. Order matters: the matched-control pairing
+            # takes the first same-PE rest run in registry order, so rest1* must precede rest2*
+            # (stroopAP, hammerAP -> rest1AP; stroopPA -> rest1PA).
+            'MRI3T': ['rest1AP', 'rest1PA', 'rest2AP', 'rest2PA',
+                      'stroopAP', 'stroopPA', 'hammerAP'],
+        },
+        # Every subject, no motion cut (decided 2026-09-24): motion enters as a covariate only,
+        # as for Penn_LEAD. Completeness still requires all seven runs: 207 of 241 subjects.
+        'subject_ids_file': 'subject_ids.txt',
+        'detrend':             False,
+        'nuisance_regression': False,
+        'task_regression':     True,
+        'remove_incomplete_subjects': True,
+    },
     'HBN': {
         'modalities':  ['MRI3T'],
         'seg':         'Schaefer2018p400n17',

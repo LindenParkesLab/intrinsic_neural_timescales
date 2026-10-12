@@ -41,6 +41,8 @@ TASK_RUN_GROUPS = [
     (['tfMRICARITPA'],                              'task-CARIT'),
     (['tfMRIEMOTIONPA'],                            'task-EMOTION'),
     (['tfMRIGUESSINGPA'],                           'task-GUESSING'),
+    # TCP — AP/PA pair of one Stroop task. hammerAP is a single run and needs no entry.
+    (['stroopAP',           'stroopPA'],            'task-stroop'),
 ]
 
 #: Condition key for the 7T movies, which TASK_RUN_GROUPS does not cover because
@@ -54,6 +56,12 @@ REST_CONTROL_OFFSET_SECONDS = {
     ('HCP-YA',    'MEG'):   0.0,
     ('HCP-D',     'MRI3T'): 0.0,
     ('Penn_LEAD', 'MRI3T'): 0.0,
+    # TCP: measured 2026-09-25, and 0 on the evidence, not only for want of headroom. Every run
+    # is depressed at BOTH ends (auc: lead -12 to -16 %, trail -8 to -10 %), rest and task
+    # residual alike -- XCP-D's bandpass edge, not an onset transient. The control spans its whole
+    # rest run as the task side spans its own, so the edges cancel; an offset would strip one edge
+    # from the control only. See the TCP section of CLAUDE.md.
+    ('TCP',       'MRI3T'): 0.0,
 }
 
 #: Offset for a (dataset, modality) that has not been measured.
