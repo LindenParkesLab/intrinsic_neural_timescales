@@ -12,6 +12,33 @@ import nibabel as nib
 from snaplab_tools.topology import threshold_adjacency_consistency, volume_normalize_adjacency
 
 
+def region_sizes_file(dataset, derivdata_dir, sub, n_regions):
+    """Path of one subject's T1w-space parcel voxel counts, which volume normalisation divides by.
+
+    The one definition of this path: the connectivity loaders below and :mod:`src.nct` both read it.
+    """
+    if dataset == 'HCP-YA':
+        return os.path.join(derivdata_dir, 'parcellations', f'sub-{sub}',
+                            f'sub-{sub}_atlas-Schaefer{n_regions}7_space-T1w_res-1_regionsizes.txt')
+    if dataset == 'HCP-D':
+        return os.path.join(derivdata_dir, 'parcellations', f'sub-{sub}', 'ses-01',
+                            f'sub-{sub}_ses-01_atlas-Schaefer{n_regions}7_space-T1w_res-1_regionsizes.txt')
+    raise ValueError(f'no region-size files for {dataset}; only HCP-YA and HCP-D have connectomes')
+
+
+def load_region_sizes(dataset, derivdata_dir, subject_ids, n_regions):
+    """Per-subject parcel voxel counts, ``(n_regions, n_subjects)`` in ``subject_ids`` order.
+
+    A subject without a region-size file gets an all-NaN column, as the connectivity loaders treat it.
+    """
+    sizes = np.full((n_regions, len(subject_ids)), np.nan)
+    for i, sub in enumerate(subject_ids):
+        path = region_sizes_file(dataset, derivdata_dir, sub, n_regions)
+        if os.path.exists(path):
+            sizes[:, i] = np.loadtxt(path)
+    return sizes
+
+
 def _record_connectivity_subject(i, adjacency, voxel_counts_file, adjacency_matrices, strength, missing_label):
     """Volume-normalize one subject's adjacency and record it, or mark the subject missing.
 
@@ -64,8 +91,7 @@ def _load_hcpya_connectivity(derivdata_dir, subject_ids, n_regions):
         sub = subject_ids[i]
         adjacency_file = os.path.join(derivdata_dir, 'mrtrix_10m', f'sub-{sub}',
                                       f'sub-{sub}_atlas-Schaefer{n_regions}7_space-T1w_stat-streamlinecount_relmat.csv')
-        voxel_counts_file = os.path.join(derivdata_dir, 'parcellations', f'sub-{sub}',
-                                         f'sub-{sub}_atlas-Schaefer{n_regions}7_space-T1w_res-1_regionsizes.txt')
+        voxel_counts_file = region_sizes_file('HCP-YA', derivdata_dir, sub, n_regions)
 
         adjacency = np.loadtxt(adjacency_file, delimiter=',', dtype=float) if os.path.exists(adjacency_file) else None
         _record_connectivity_subject(i, adjacency, voxel_counts_file, adjacency_matrices, strength, f'sub-{sub}')
@@ -103,11 +129,6 @@ def _load_hcpd_connectivity(derivdata_dir, subject_ids, n_regions):
     adjacency_matrices = np.full((n_regions, n_regions, n_subs), np.nan)
     strength = np.full((n_regions, n_subs), np.nan)
 
-    voxel_counts_file_tpl = os.path.join(
-        derivdata_dir, 'parcellations', 'sub-{sub}', 'ses-01',
-        f'sub-{{sub}}_ses-01_atlas-Schaefer{n_regions}7_space-T1w_res-1_regionsizes.txt'
-    )
-
     for i in np.arange(n_subs):
         sub = subject_ids[i]
 
@@ -124,7 +145,7 @@ def _load_hcpd_connectivity(derivdata_dir, subject_ids, n_regions):
                 n_found += 1
 
         adjacency = adj_sum / n_found if n_found > 0 else None
-        voxel_counts_file = voxel_counts_file_tpl.format(sub=sub)
+        voxel_counts_file = region_sizes_file('HCP-D', derivdata_dir, sub, n_regions)
         _record_connectivity_subject(i, adjacency, voxel_counts_file, adjacency_matrices, strength, f'sub-{sub}')
 
     adjacency_mean = threshold_adjacency_consistency(adjacency_matrices)
