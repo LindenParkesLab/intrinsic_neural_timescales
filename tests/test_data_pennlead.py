@@ -527,3 +527,125 @@ class TestRegistryRoundtrip:
         df = pd.read_csv(tmp_path / 'test_registry.csv', index_col=0)
         for col in ('sub', 'ses', 'task', 'modality', 'condition', 'tr', 'scan_string'):
             assert col in df.columns, f"Missing column: {col}"
+
+
+# ==============================================================================
+# Longitudinal registry: per-session completeness, session 3, CuBIDS variants
+# ==============================================================================
+
+def _stub_loader(present):
+    """A DataLoader carrying only what validate_scan_registry reads. ``present`` is the set of
+    (subject, session, task) whose file exists; every task scan found also has events.
+
+    Built through ``__new__`` so the test needs no data mount.
+    """
+    loader = DataLoader.__new__(DataLoader)
+    loader.dataset = 'Penn_LEAD'
+    loader.config = load_dataset_config('Penn_LEAD')
+    loader.scan_registry = [_make_scan(subject_id=s, session=ses, task=t)
+                            for s in ('A', 'B') for ses in ('1', '2', '3') for t in ('rest', 'nback')]
+    loader.get_scan_filepath = lambda scan: type('P', (), {
+        'exists': lambda self: (scan.subject_id, scan.session, scan.task) in present})()
+    loader.get_task_events = lambda scan: object() if scan.condition == 'task' else None
+    return loader
+
+
+# A has sessions 1 and 2 complete and session 3 missing its n-back; B has only session 1.
+PRESENT = {('A', '1', 'rest'), ('A', '1', 'nback'), ('A', '2', 'rest'), ('A', '2', 'nback'),
+           ('A', '3', 'rest'), ('B', '1', 'rest'), ('B', '1', 'nback')}
+
+
+class TestPerSessionCompleteness:
+
+    def test_session_unit_drops_only_the_incomplete_session(self):
+        loader = _stub_loader(PRESENT)
+        res = loader.validate_scan_registry(verbose=False, remove_incomplete_subjects=True,
+                                            incomplete_unit='session')
+        kept = {(s.subject_id, s.session) for s in loader.scan_registry}
+        assert kept == {('A', '1'), ('A', '2'), ('B', '1')}
+        assert ('A', '3') in res['removed_sessions']
+        assert res['removed_subjects'] == []            # nobody lost every session
+
+    def test_subject_unit_is_the_unchanged_default(self):
+        """Every other dataset: one missing scan removes the subject from every session."""
+        loader = _stub_loader(PRESENT)
+        res = loader.validate_scan_registry(verbose=False, remove_incomplete_subjects=True)
+        assert loader.scan_registry == []                # both A and B miss something
+        assert res['removed_subjects'] == ['A', 'B'] and res['removed_sessions'] == []
+
+    def test_a_subject_with_no_complete_session_is_reported_removed(self):
+        loader = _stub_loader({('A', '1', 'rest')})
+        res = loader.validate_scan_registry(verbose=False, remove_incomplete_subjects=True,
+                                            incomplete_unit='session')
+        assert loader.scan_registry == [] and res['removed_subjects'] == ['A', 'B']
+
+    def test_an_unknown_unit_raises(self):
+        with pytest.raises(ValueError, match='incomplete_unit'):
+            _stub_loader(PRESENT).validate_scan_registry(verbose=False, incomplete_unit='run')
+
+    def test_config_registers_three_sessions_judged_per_session(self):
+        from src.config import DATASET_PARAMS
+        params = DATASET_PARAMS['Penn_LEAD']
+        assert params['sessions'] == ['1', '2', '3']
+        assert params['incomplete_unit'] == 'session'
+        # every other dataset keeps the per-subject rule
+        assert all(p.get('incomplete_unit', 'subject') == 'subject'
+                   for name, p in DATASET_PARAMS.items() if name != 'Penn_LEAD')
+
+
+class TestCubidsVariants:
+    """CuBIDS renamed non-dominant scans ``acq-VARIANT<reason>``. VARIANTObliquity is read;
+    VARIANTNumVolumes (wrong frame count) must never be."""
+
+    def test_fallback_names_obliquity_and_nothing_else(self):
+        mod = load_dataset_config('Penn_LEAD').modalities['MRI3T']
+        assert len(mod.filename_template_fallbacks) == 1
+        fallback = mod.filename_template_fallbacks[0]
+        assert 'acq-VARIANTObliquity' in fallback
+        assert '*' not in fallback and 'NumVolumes' not in fallback
+        assert not mod.use_glob                           # a timeseries glob could admit NumVolumes
+
+    def test_events_are_globbed_so_a_variants_events_are_found(self):
+        mod = load_dataset_config('Penn_LEAD').modalities['MRI3T']
+        assert mod.task_events_use_glob
+        assert mod.task_events_file_template.endswith('_run-01_events.tsv')
+
+    @pytest.mark.parametrize('name, acq', [
+        ('sub-1_ses-2_task-rest_acq-VARIANTObliquity_run-01_space-X_seg-Y_stat-mean_timeseries.tsv',
+         'VARIANTObliquity'),
+        ('sub-1_ses-2_task-rest_run-01_space-X_seg-Y_stat-mean_timeseries.tsv', None),
+    ])
+    def test_get_scan_acq_reads_the_resolved_name(self, name, acq):
+        loader = DataLoader.__new__(DataLoader)
+        loader.get_scan_filepath = lambda scan: Path('/x') / name
+        assert loader.get_scan_acq(_make_scan()) == acq
+
+
+@integration
+class TestCubidsVariantsOnDisk:
+    """Scans identified from the QC tables on 2026-09-24."""
+
+    def test_an_obliquity_scan_resolves(self, penn_lead_loader):
+        scan = _make_scan(subject_id='21553', session=SESSION_2, task='nback')
+        path = penn_lead_loader.get_scan_filepath(scan)
+        assert path.exists() and 'acq-VARIANTObliquity' in path.name
+        assert penn_lead_loader.get_scan_acq(scan) == 'VARIANTObliquity'
+
+    def test_an_obliquity_scans_events_share_its_acq(self, penn_lead_loader):
+        """The events glob could in principle find a different run's file; it must find this one."""
+        from src.data import _events_bids_tsv
+        import glob as _glob
+        scan = _make_scan(subject_id='21553', session=SESSION_2, task='nback')
+        assert penn_lead_loader.get_task_events(scan) is not None
+        func = penn_lead_loader.rawdata_dir / 'sub-21553' / 'ses-2' / 'func'
+        matches = _glob.glob(str(func / 'sub-21553_ses-2_task-nback*_run-01_events.tsv'))
+        assert len(matches) == 1 and 'acq-VARIANTObliquity' in matches[0]
+
+    def test_a_numvolumes_scan_is_never_found(self, penn_lead_loader):
+        """sub-20139 ses-1's only n-back is a 521-frame VARIANTNumVolumes run."""
+        path = penn_lead_loader.get_scan_filepath(
+            _make_scan(subject_id='20139', session=SESSION_1, task='nback'))
+        assert not path.exists()
+
+    def test_a_dominant_scan_reports_no_acq(self, penn_lead_loader):
+        assert penn_lead_loader.get_scan_acq(_make_scan(subject_id=SUBJECT_A)) is None
