@@ -158,6 +158,7 @@ data/
 results/
 packages/
 scripts/scratch/
+scratch/
 backup/
 
 # Generated scan registries (written by DataLoader.export_scan_registry in
