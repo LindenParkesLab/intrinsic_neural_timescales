@@ -158,6 +158,7 @@ data/
 results/
 packages/
 scripts/scratch/
+scripts/untracked/
 scratch/
 backup/
 
