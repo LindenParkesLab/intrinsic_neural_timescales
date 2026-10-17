@@ -8,9 +8,11 @@ modalities:
     tr: 0.72
     data_subdir: parcellated_data
     dir_template: "sub-{subject_id}/ses-{session}/func"
-    filename_template: "sub-{subject_id}_ses-{session}_task-{task}_space-{space}_seg-{seg}_stat-mean_timeseries{ext}"
+    filename_template: "sub-{subject_id}_ses-{session}_task-{task}_space-{space}_seg-{seg}{desc}_stat-mean_timeseries{ext}"
     file_ext: .ptseries.nii
     task_events_handler: hcp_fmri
+    # Alternative sources for the rest runs (rfMRIREST*), selected by DATASET_PARAMS' rest_variant. This is only relevant to HCP-YA.
+    rest_variants: [noFIX]
   MRI7T:
     tr: 1.0
     data_subdir: parcellated_data_7T
@@ -18,13 +20,6 @@ modalities:
     filename_template: "sub-{subject_id}_ses-{session}_task-{task}_space-{space}_seg-{seg}_stat-mean_timeseries{ext}"
     file_ext: .ptseries.nii
     task_events_handler: hcp_7t_movie
-  MEG:
-    tr: 0.001966  # 1 / 508.63 Hz sampling rate
-    data_subdir: parcellated_data_meg
-    dir_template: "sub-{subject_id}/ses-{session}/func"
-    filename_template: "sub-{subject_id}_ses-{session}_task-{task}_space-{space}_seg-{seg}_stat-mean_timeseries{ext}"
-    file_ext: .ptseries.npy
-    task_events_handler: hcp_meg
 behavior:
   handler: hcp_unrestricted_restricted
 rbc: false
