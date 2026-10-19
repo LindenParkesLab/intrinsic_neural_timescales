@@ -154,6 +154,9 @@ cython_debug/
 
 # Project stuff
 .idea/
+src_backup/
+tests_backup/
+scripts_backup/
 data/
 results/
 packages/
@@ -161,6 +164,7 @@ scripts/scratch/
 scripts/untracked/
 scratch/
 backup/
+intrinsic_neural_timescales.code-workspace
 
 # Generated scan registries (written by DataLoader.export_scan_registry in
 # timescales_process.ipynb; regenerated from the raw data, never edited by hand)
