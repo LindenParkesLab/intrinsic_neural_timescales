@@ -9,9 +9,10 @@ import pytest
 
 from snaplab_tools.timescales import compute_acf
 from src.data import build_scan_string
+from src import timescales as timescales_module
 from src.notebook import _resolve_rest_match, _substitute_rest_windows, load_notebook_data
 from src.timescales import (REST_WINDOW_MATCH, REST_WINDOW_NOTE, REST_WINDOW_TOKEN, Timescales,
-                            rest_window_covered, rest_window_match_for, rest_window_matches,
+                            frequency_filter_token, rest_window_covered, rest_window_match_for, rest_window_matches,
                             rest_window_output_type, rest_window_token)
 
 HCPD_TASKS = (('tfMRICARITPA', 290), ('tfMRIEMOTIONPA', 168), ('tfMRIGUESSINGPA', 270))
@@ -57,14 +58,18 @@ def _hcpd_subject(rng, sub='HCD001', rest_frames=478, tasks=HCPD_TASKS):
 class TestTable:
     def test_scope_is_wm_for_hcpya_and_carit_emotion_guessing_for_hcpd(self):
         assert REST_WINDOW_MATCH == {
-            ('HCP-YA', 'MRI3T'): {'WM': ('tfMRIWMLR', 'tfMRIWMRL')},
+            ('HCP-YA', 'MRI3T'): {'EMOTION': ('tfMRIEMOTIONLR', 'tfMRIEMOTIONRL'),
+                                  'GAMBLING': ('tfMRIGAMBLINGLR', 'tfMRIGAMBLINGRL'),
+                                  'LANGUAGE': ('tfMRILANGUAGELR', 'tfMRILANGUAGERL'),
+                                  'RELATIONAL': ('tfMRIRELATIONALLR', 'tfMRIRELATIONALRL'),
+                                  'SOCIAL': ('tfMRISOCIALLR', 'tfMRISOCIALRL'),
+                                  'WM': ('tfMRIWMLR', 'tfMRIWMRL')},
             ('HCP-D', 'MRI3T'): {'CARIT': ('tfMRICARITPA',), 'EMOTION': ('tfMRIEMOTIONPA',),
                                  'GUESSING': ('tfMRIGUESSINGPA',)}}
 
     def test_everything_else_is_uncovered(self):
         # HCP-YA 7T rest and movies are already matched; the XCP-D datasets are out of scope.
-        for dataset, modality in [('HCP-YA', 'MRI7T'), ('HCP-YA', 'MEG'), ('WAND', 'MRI3T'),
-                                  ('AOMIC_PIOP2', 'MRI3T'), ('PNC', 'MRI3T')]:
+        for dataset, modality in [('HCP-YA', 'MRI7T'), ('WAND', 'MRI3T'), ('Penn_LEAD', 'MRI3T')]:
             assert not rest_window_covered(dataset, modality)
         assert rest_window_covered('HCP-D', 'MRI3T', 'EMOTION')
         assert not rest_window_covered('HCP-D', 'MRI3T', 'WM')
@@ -73,8 +78,8 @@ class TestTable:
         assert REST_WINDOW_TOKEN == 'restlen'
         assert rest_window_token('CARIT') == 'restlen-CARIT'
         assert rest_window_output_type('autocorr', 'WM') == 'autocorr_restlen-WM'
-        assert (rest_window_output_type('autocorr_resampled_bp-0.01-0.08hz', 'EMOTION')
-                == 'autocorr_resampled_bp-0.01-0.08hz_restlen-EMOTION')
+        assert (rest_window_output_type('autocorr_bp-0.01-0.08hz', 'EMOTION')
+                == 'autocorr_bp-0.01-0.08hz_restlen-EMOTION')
         assert (rest_window_output_type('timescale_auc_zero_crossing_bp-0.01-0.08hz', 'GUESSING')
                 == 'timescale_auc_zero_crossing_bp-0.01-0.08hz_restlen-GUESSING')
 
@@ -85,7 +90,8 @@ class TestTable:
             rest_window_token(bad)
 
     def test_matches_per_dataset(self):
-        assert rest_window_matches('HCP-YA') == ('WM',)
+        assert rest_window_matches('HCP-YA') == ('EMOTION', 'GAMBLING', 'LANGUAGE', 'RELATIONAL',
+                                                  'SOCIAL', 'WM')
         assert rest_window_matches('HCP-D') == ('CARIT', 'EMOTION', 'GUESSING')
         assert rest_window_matches('HCP-YA', 'MRI7T') == ()
         assert rest_window_matches('WAND') == ()
@@ -93,11 +99,12 @@ class TestTable:
     @pytest.mark.parametrize('dataset,task,match', [
         ('HCP-D', 'tfMRICARITPA', 'CARIT'), ('HCP-D', 'tfMRIEMOTIONPA', 'EMOTION'),
         ('HCP-D', 'tfMRIGUESSINGPA', 'GUESSING'), ('HCP-YA', 'tfMRIWMLR', 'WM'),
-        ('HCP-YA', 'tfMRIWMRL', 'WM')])
+        ('HCP-YA', 'tfMRIWMRL', 'WM'), ('HCP-YA', 'tfMRIEMOTIONLR', 'EMOTION'),
+        ('HCP-YA', 'tfMRISOCIALRL', 'SOCIAL')])
     def test_the_task_being_analysed_picks_its_match(self, dataset, task, match):
         assert rest_window_match_for(dataset, task) == match
 
-    @pytest.mark.parametrize('dataset,task', [('HCP-YA', 'tfMRIEMOTIONLR'), ('HCP-D', 'tfMRIWMLR'),
+    @pytest.mark.parametrize('dataset,task', [('HCP-YA', 'tfMRIMOVIE17TAP'), ('HCP-D', 'tfMRIWMLR'),
                                               ('WAND', 'reversallearning')])
     def test_an_unmatched_task_raises(self, dataset, task):
         with pytest.raises(ValueError, match='no length-matched rest'):
@@ -114,8 +121,11 @@ class TestResolveRestWindows:
         proc = _stub('HCP-YA', ts)
         spans = proc.resolve_rest_windows(verbose=False)
         rest = [k for k in ts if 'condition-rest' in k]
-        assert set(spans) == {'WM'}
+        assert set(spans) == set(REST_WINDOW_MATCH['HCP-YA', 'MRI3T'])
         assert set(spans['WM']) == set(rest)                # task scans get no window
+        # The subject's 176-frame EMOTION LR run gets the window its restctrl uses, [175, 351).
+        assert all(spans['EMOTION'][k] == (175, 351) for k in rest)
+        assert all(spans[m] == {} for m in ('GAMBLING', 'LANGUAGE', 'RELATIONAL', 'SOCIAL'))
         for k in rest:
             assert spans['WM'][k] == (175, 580)
             meta = proc.rest_window_meta['WM'][k]
@@ -161,7 +171,10 @@ class TestResolveRestWindows:
     def test_no_matched_task_run_means_no_window_not_an_error(self, rng):
         ts = {_key('100206', 'rfMRIREST1LR', 'rest'): rng.standard_normal((5, 1200)),
               _key('100206', 'tfMRIEMOTIONLR', 'task'): rng.standard_normal((5, 176))}
-        assert _stub('HCP-YA', ts).resolve_rest_windows(verbose=False) == {'WM': {}}
+        spans = _stub('HCP-YA', ts).resolve_rest_windows(verbose=False)
+        rest = _key('100206', 'rfMRIREST1LR', 'rest')
+        assert spans['WM'] == {} and spans['EMOTION'] == {rest: (175, 351)}
+        assert all(spans[m] == {} for m in ('GAMBLING', 'LANGUAGE', 'RELATIONAL', 'SOCIAL'))
 
     def test_a_window_that_does_not_fit_raises(self, rng):
         """175 + 405 > 500: a wrong table, not a failed scan -- raised, never swallowed."""
@@ -349,8 +362,14 @@ class TestLoaderSubstitution:
 
 
 class TestResolveRestMatch:
-    def test_a_single_match_is_picked_automatically(self):
-        assert _resolve_rest_match('HCP-YA', None) == 'WM'
+    def test_a_single_match_is_picked_automatically(self, monkeypatch):
+        monkeypatch.setattr(timescales_module, 'REST_WINDOW_MATCH', {('X', 'MRI3T'): {'WM': ('t',)}})
+        assert _resolve_rest_match('X', None) == 'WM'
+
+    def test_hcpya_now_needs_an_explicit_choice_too(self):
+        """Every HCP-YA 3T task is matched, so None no longer means WM."""
+        with pytest.raises(ValueError, match='several tasks'):
+            _resolve_rest_match('HCP-YA', None)
 
     def test_several_matches_need_an_explicit_choice(self):
         """HCP-D has three: guessing would load CARIT-length rest for an EMOTION analysis."""
@@ -365,3 +384,57 @@ class TestResolveRestMatch:
     def test_an_uncovered_dataset_raises(self):
         with pytest.raises(ValueError, match='no length-matched rest'):
             _resolve_rest_match('WAND', None)
+
+
+class TestWindowMetric:
+    """Per-scan metrics on the same windows, named with the same tokens as the window's ACF."""
+
+    @staticmethod
+    def _saved_names(proc, **kwargs):
+        saved = []
+        proc._save_subject_output = lambda **kw: saved.append(kw)
+        proc.compute_timeseries_measures(method='var', force_recompute=True, verbose=False, **kwargs)
+        return {s['output_type'] for s in saved}
+
+    def test_window_variance_is_the_variance_of_the_slice(self, rng):
+        ts = _hcpya_subject(rng)
+        proc = _stub('HCP-YA', ts)
+        proc.resolve_rest_windows(verbose=False)
+        proc.compute_timeseries_measures(method='var', use_rest_window='WM', force_recompute=True,
+                                         save_outputs=False, verbose=False)
+        for k, v in ts.items():
+            if 'condition-rest' in k:
+                np.testing.assert_array_equal(proc.data_dict[k], np.var(v[:, 175:580], axis=1))
+            else:
+                assert proc.data_dict[k] is None
+
+    def test_names_mirror_the_acf_and_unfiltered_names_are_unchanged(self, rng):
+        ts = _hcpya_subject(rng)
+        proc = _stub('HCP-YA', ts)
+        proc.timeseries_residuals = {k: v for k, v in ts.items() if 'condition-task' in k}
+        proc.resolve_rest_windows(verbose=False)
+        assert self._saved_names(proc) == {'metric_var'}
+        assert self._saved_names(proc, use_residuals=True) == {'metric_var_resids'}
+        assert self._saved_names(proc, use_rest_window='WM') == {'metric_var_restlen-WM'}
+        bp = dict(highpass=0.01, lowpass=0.08)
+        assert self._saved_names(proc, use_residuals=True, **bp) == {'metric_var_bp-0.01-0.08hz_resids'}
+        assert (self._saved_names(proc, use_rest_window='WM', **bp)
+                == {'metric_var_bp-0.01-0.08hz_restlen-WM'})
+
+    def test_residual_and_window_are_mutually_exclusive(self, rng):
+        proc = _stub('HCP-YA', _hcpya_subject(rng))
+        proc.resolve_rest_windows(verbose=False)
+        with pytest.raises(ValueError, match='mutually exclusive'):
+            proc.compute_timeseries_measures(method='var', use_residuals=True, use_rest_window='WM',
+                                             save_outputs=False, verbose=False)
+
+    def test_windows_must_be_resolved_first(self, rng):
+        with pytest.raises(ValueError, match='resolve_rest_windows'):
+            _stub('HCP-YA', _hcpya_subject(rng)).compute_timeseries_measures(
+                method='var', use_rest_window='WM', save_outputs=False, verbose=False)
+
+    def test_the_filter_token_is_the_one_the_acf_uses(self):
+        assert frequency_filter_token() is None
+        assert frequency_filter_token(0.01, 0.08) == 'bp-0.01-0.08hz'
+        assert frequency_filter_token(highpass=0.01) == 'hp-0.01hz'
+        assert frequency_filter_token(lowpass=0.08) == 'lp-0.08hz'

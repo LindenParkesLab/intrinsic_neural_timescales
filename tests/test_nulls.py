@@ -8,8 +8,6 @@ the project has one import point) and that the project cache-dir convention is c
 
 import os
 
-import pytest
-
 from src import nulls
 
 

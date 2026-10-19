@@ -11,7 +11,7 @@ Integration tests (require Penn_LEAD data mount, auto-skipped if unavailable):
     TestPathConstruction — get_scan_filepath template rendering and exact path assertions
     TestFileExistence    — expected files are present on disk for both sessions
     TestTimeseries       — loaded array shape, dtype, NaN, cache, and nuisance regression
-    TestLongitudinal     — multi-session registry and get_longitudinal_array
+    TestLongitudinal     — both sessions of a subject resolve to files on disk
     TestRegistryRoundtrip — export → CSV → reload preserves ScanInfo objects exactly
 
 Notes
@@ -27,7 +27,7 @@ import pytest
 import numpy as np
 from pathlib import Path
 
-from src.data import DataLoader, ScanInfo, load_dataset_config, get_longitudinal_array
+from src.data import DataLoader, ScanInfo, load_dataset_config
 from tests.conftest import integration_pennlead as integration
 
 
@@ -52,9 +52,9 @@ REST_SHAPE = (N_PARCELS, 522)   # task-rest, ses-1
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _make_scan(subject_id=SUBJECT_A, task='rest', modality='MRI3T',
-               session=SESSION_1, seg=SEG, space=SPACE, tr=0.8, rbc=False):
+               session=SESSION_1, seg=SEG, space=SPACE, tr=0.8):
     return ScanInfo(subject_id=subject_id, task=task, space=space, seg=seg,
-                    modality=modality, tr=tr, session=session, rbc=rbc)
+                    modality=modality, tr=tr, session=session)
 
 
 # ==============================================================================
@@ -75,8 +75,6 @@ class TestConfig:
         cfg = load_dataset_config('Penn_LEAD')
         assert cfg.modalities['MRI3T'].tr == pytest.approx(0.8)
 
-    def test_rbc_false(self):
-        assert load_dataset_config('Penn_LEAD').rbc is False
 
     def test_behavior_handler(self):
         assert load_dataset_config('Penn_LEAD').behavior_handler == 'penn_lead'
@@ -139,7 +137,7 @@ class TestScanInfo:
     def test_to_dict_keys(self):
         d = _make_scan().to_dict()
         for key in ('sub', 'ses', 'task', 'space', 'seg', 'modality', 'tr',
-                    'condition', 'rbc', 'scan_string'):
+                    'condition', 'scan_string'):
             assert key in d
 
     def test_different_subjects_not_equal(self):
@@ -366,8 +364,7 @@ class TestTimeseries:
 class TestLongitudinal:
     """
     Tests for the longitudinal data structure unique to Penn_LEAD.
-    Verifies that multi-session data loads correctly and that
-    get_longitudinal_array produces the expected shape and content.
+    Verifies that multi-session data resolves correctly.
     """
 
     def test_both_sessions_load_for_subject_a(self, penn_lead_loader):
@@ -377,94 +374,6 @@ class TestLongitudinal:
                 _make_scan(subject_id=SUBJECT_A, session=session)
             )
             assert fp.exists(), f"Session {session} file missing: {fp}"
-
-    def test_longitudinal_array_shape(self, penn_lead_loader):
-        """
-        Register two subjects × two sessions × rest task, build a small
-        data_dict, then verify get_longitudinal_array returns the right shape.
-        """
-        loader = DataLoader('Penn_LEAD', load_behavior=False, verbose=False)
-        loader.register_scans(
-            subject_ids=[SUBJECT_A, SUBJECT_B],
-            sessions=[SESSION_1, SESSION_2],
-            tasks=['rest'],
-            space=SPACE, seg=SEG, modality='MRI3T',
-        )
-
-        data_dict = {}
-        for scan in loader.scan_registry:
-            ts = loader.load_scan_timeseries(scan, nuisance_regression=False, cache=False)
-            data_dict[str(scan)] = ts[:, 0]   # use first timepoint → (n_parcels,)
-
-        array, subject_ids = get_longitudinal_array(
-            data_dict,
-            loader.scan_registry,
-            sessions=[SESSION_1, SESSION_2],
-            task='rest',
-        )
-
-        assert array.ndim == 3
-        assert array.shape == (2, 2, N_PARCELS), (
-            f"Expected (2 subjects, 2 sessions, {N_PARCELS} parcels), got {array.shape}"
-        )
-        assert len(subject_ids) == 2
-
-    def test_longitudinal_array_nan_parcels_bounded(self, penn_lead_loader):
-        """
-        NaN parcels in the longitudinal array should be bounded (edge-of-mask effect).
-        The same small set of parcels (~3) will be NaN in every session for every subject.
-        """
-        loader = DataLoader('Penn_LEAD', load_behavior=False, verbose=False)
-        loader.register_scans(
-            subject_ids=[SUBJECT_A, SUBJECT_B],
-            sessions=[SESSION_1, SESSION_2],
-            tasks=['rest'],
-            space=SPACE, seg=SEG, modality='MRI3T',
-        )
-
-        data_dict = {}
-        for scan in loader.scan_registry:
-            ts = loader.load_scan_timeseries(scan, nuisance_regression=False, cache=False)
-            data_dict[str(scan)] = ts[:, 0]
-
-        array, _ = get_longitudinal_array(
-            data_dict,
-            loader.scan_registry,
-            sessions=[SESSION_1, SESSION_2],
-            task='rest',
-        )
-
-        # NaN parcels should be a consistent small set (< 10), not scattered randomly
-        nan_parcels = np.isnan(array).any(axis=(0, 1)).sum()
-        assert nan_parcels <= 10, (
-            f"Too many NaN parcels in longitudinal array: {nan_parcels}"
-        )
-
-    def test_longitudinal_session2_minus_session1(self, penn_lead_loader):
-        """Change scores (ses2 - ses1) should be computable and non-zero."""
-        loader = DataLoader('Penn_LEAD', load_behavior=False, verbose=False)
-        loader.register_scans(
-            subject_ids=[SUBJECT_A, SUBJECT_B],
-            sessions=[SESSION_1, SESSION_2],
-            tasks=['rest'],
-            space=SPACE, seg=SEG, modality='MRI3T',
-        )
-
-        data_dict = {}
-        for scan in loader.scan_registry:
-            ts = loader.load_scan_timeseries(scan, nuisance_regression=False, cache=False)
-            data_dict[str(scan)] = ts[:, 0]
-
-        array, _ = get_longitudinal_array(
-            data_dict,
-            loader.scan_registry,
-            sessions=[SESSION_1, SESSION_2],
-            task='rest',
-        )
-
-        delta = array[:, 1, :] - array[:, 0, :]   # ses2 - ses1
-        assert delta.shape == (2, N_PARCELS)
-        assert not np.allclose(delta, 0), "Change scores are all zero — sessions may be identical."
 
 
 # ==============================================================================
@@ -603,7 +512,6 @@ class TestCubidsVariants:
         fallback = mod.filename_template_fallbacks[0]
         assert 'acq-VARIANTObliquity' in fallback
         assert '*' not in fallback and 'NumVolumes' not in fallback
-        assert not mod.use_glob                           # a timeseries glob could admit NumVolumes
 
     def test_events_are_globbed_so_a_variants_events_are_found(self):
         mod = load_dataset_config('Penn_LEAD').modalities['MRI3T']
@@ -633,7 +541,6 @@ class TestCubidsVariantsOnDisk:
 
     def test_an_obliquity_scans_events_share_its_acq(self, penn_lead_loader):
         """The events glob could in principle find a different run's file; it must find this one."""
-        from src.data import _events_bids_tsv
         import glob as _glob
         scan = _make_scan(subject_id='21553', session=SESSION_2, task='nback')
         assert penn_lead_loader.get_task_events(scan) is not None

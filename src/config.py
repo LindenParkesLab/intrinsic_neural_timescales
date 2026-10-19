@@ -6,9 +6,7 @@ loaded and processed. Kept free of imports so it can be read as pure configurati
 
 DATASET_PARAMS = {
     'HCP-YA': {
-        'modalities':  ['MRI3T'],  # also supports 'MRI7T', 'MEG'
-        # 'modalities':  ['MRI3T', 'MRI7T'],  # also supports 'MRI7T', 'MEG'
-        # 'modalities':  ['MEG'],  # also supports 'MRI7T', 'MEG'
+        'modalities':  ['MRI3T'],
         'seg':         'Schaefer4007',
         'space':       'fsLR',
         'sessions':    ['01'],
@@ -22,9 +20,9 @@ DATASET_PARAMS = {
                       'tfMRISOCIALLR', 'tfMRISOCIALRL'],
             'MRI7T': ['rfMRIREST17TPA', 'rfMRIREST27TAP', 'rfMRIREST37TPA', 'rfMRIREST47TAP',
                       'tfMRIMOVIE17TAP', 'tfMRIMOVIE27TPA', 'tfMRIMOVIE37TPA', 'tfMRIMOVIE47TAP'],
-            'MEG':   ['3Restin', '4Restin', '5Restin', '6Wrkmem', '7Wrkmem'],
         },
-        'subject_ids_file': 'subject_ids.txt',       # or 'subject_ids_subsample.txt'
+        'subject_ids_file': 'subject_ids.txt',
+        'rest_variant':        'clean',
         'detrend':             True,
         'nuisance_regression': True,
         'task_regression':     True,
@@ -59,48 +57,6 @@ DATASET_PARAMS = {
         'task_regression':     False,
         'remove_incomplete_subjects': True,
     },
-    'PNC': {
-        'modalities':  ['MRI3T'],
-        'seg':         '4S456Parcels',
-        'space':       'fsLR',
-        'sessions':    ['PNC1'],
-        'tasks': {
-            'MRI3T': ['rest', 'frac2back'],
-        },
-        'subject_ids_file': 'subject_ids_lowmotion.txt',
-        'detrend':             False,
-        'nuisance_regression': False,
-        'task_regression':     True,
-        'remove_incomplete_subjects': True,
-    },
-    'UCLA': {
-        'modalities':  ['MRI3T'],
-        'seg':         'Schaefer4007',
-        'space':       'MNI152NLin2009cAsym',
-        'sessions':    [None],
-        'tasks': {
-            'MRI3T': ['rest', 'bart', 'stopsignal', 'scap'],
-        },
-        'subject_ids_file': 'subject_ids_not1_hc.txt',
-        'detrend':             False,
-        'nuisance_regression': False,
-        'task_regression':     True,
-        'remove_incomplete_subjects': True,
-    },
-    'NKI': {
-        'modalities':  ['MRI3T'],
-        'seg':         'Schaefer2018p400n17',
-        'space':       'MNI152NLin6ASym',
-        'sessions':    ['BAS1'],
-        'tasks': {
-            'MRI3T': ['rest', 'CHECKERBOARD'],
-        },
-        'subject_ids_file': 'subject_ids.txt',
-        'detrend':             False,
-        'nuisance_regression': False,
-        'task_regression':     True,
-        'remove_incomplete_subjects': True,
-    },
     'Penn_LEAD': {
         'modalities':  ['MRI3T'],
         'seg':         'Schaefer4007',
@@ -115,82 +71,15 @@ DATASET_PARAMS = {
         'nuisance_regression': False,
         'task_regression':     True,
         'remove_incomplete_subjects': True,
-        # Completeness is judged per (subject, session): a session missing rest or nback is
-        # dropped, the subject's other sessions are kept. Per subject, every subject not scanned
-        # at every timepoint would be discarded.
+        # Here, a session missing rest or nback is dropped, the subject's other sessions are kept. 
         'incomplete_unit':     'session',
-    },
-    'AOMIC_PIOP2': {
-        'modalities':  ['MRI3T'],
-        'seg':         'Schaefer4007',
-        'space':       'MNI152NLin2009cAsym',
-        'sessions':    [None],
-        'tasks': {
-            'MRI3T': ['restingstate', 'stopsignal', 'workingmemory', 'emomatching'],
-        },
-        'subject_ids_file': 'subject_ids_lowmotion.txt',
-        'detrend':             False,
-        'nuisance_regression': False,
-        'task_regression':     True,
-        'remove_incomplete_subjects': True,
-    },
-    'AOMIC_PIOP1': {
-        'modalities':  ['MRI3T'],
-        'seg':         'Schaefer4007',
-        'space':       'MNI152NLin2009cAsym',
-        'sessions':    [None],
-        'tasks': {
-            # restingstate and faces are multiband at TR 0.75 s; the other four sequential at
-            # TR 2.0 s. The per-task TR lives in the YAML's task_params.
-            'MRI3T': ['restingstate', 'faces', 'anticipation', 'emomatching', 'gstroop',
-                      'workingmemory'],
-        },
-        'subject_ids_file': 'subject_ids_lowmotion.txt',
-        'detrend':             False,
-        'nuisance_regression': False,
-        'task_regression':     True,
-        'remove_incomplete_subjects': True,
-    },
-    'TCP': {
-        'modalities':  ['MRI3T'],
-        'seg':         'Schaefer4007',
-        'space':       'MNI152NLin2009cAsym',
-        'sessions':    [None],
-        'tasks': {
-            # Registry names, mapped to BIDS task/run by the YAML's task_params. rest1* is the
-            # pre-task rest, rest2* the post-task rest. Order matters: the matched-control pairing
-            # takes the first same-PE rest run in registry order, so rest1* must precede rest2*
-            # (stroopAP, hammerAP -> rest1AP; stroopPA -> rest1PA).
-            'MRI3T': ['rest1AP', 'rest1PA', 'rest2AP', 'rest2PA',
-                      'stroopAP', 'stroopPA', 'hammerAP'],
-        },
-        # Every subject, no motion cut (decided 2026-09-24): motion enters as a covariate only,
-        # as for Penn_LEAD. Completeness still requires all seven runs: 207 of 241 subjects.
-        'subject_ids_file': 'subject_ids.txt',
-        'detrend':             False,
-        'nuisance_regression': False,
-        'task_regression':     True,
-        'remove_incomplete_subjects': True,
-    },
-    'HBN': {
-        'modalities':  ['MRI3T'],
-        'seg':         'Schaefer2018p400n17',
-        'space':       'MNI152NLin6ASym',
-        'sessions':    ['HBNsiteCBIC', 'HBNsiteRU', 'HBNsiteCUNY'],
-        'tasks': {
-            'MRI3T': ['rest'],
-        },
-        'subject_ids_file': 'subject_ids.txt',
-        'detrend':             False,
-        'nuisance_regression': False,
-        'task_regression':     False,
-        'remove_incomplete_subjects': True,
     },
 }
 
 
-def get_dataset_params(dataset, seg=None):
-    """Return the processing parameters for ``dataset``, optionally overriding ``seg``.
+def get_dataset_params(dataset, seg=None, rest_variant=None, modalities=None):
+    """Return the processing parameters for ``dataset``, optionally overriding ``seg``, ``rest_variant``
+    and ``modalities``.
 
     Parameters
     ----------
@@ -202,12 +91,19 @@ def get_dataset_params(dataset, seg=None):
         DATASET_PARAMS is used. This controls the ``seg-`` token written into the
         scan registry, and therefore which parcellation resolution the precomputed
         timescale outputs are loaded at.
+    rest_variant : str, optional
+        Source of the rest runs (e.g. 'noFIX'). If provided, it overrides the dataset's
+        default; if None, the default is kept, and a dataset without the key reads
+        'clean'. A variant the dataset's YAML does not list raises at registration.
+    modalities : list of str, optional
+        Modalities to register (e.g. ``['MRI3T', 'MRI7T']`` for HCP-YA's multi registry). Each must
+        have a ``tasks`` entry. If None, the default in DATASET_PARAMS is used.
 
     Returns
     -------
     dict
-        A shallow copy of ``DATASET_PARAMS[dataset]`` with ``seg`` applied. The copy
-        prevents callers from mutating the module-level defaults.
+        A shallow copy of ``DATASET_PARAMS[dataset]`` with the overrides applied; ``rest_variant``
+        is always present. The copy prevents callers from mutating the module-level defaults.
     """
     if dataset not in DATASET_PARAMS:
         raise KeyError(
@@ -215,5 +111,13 @@ def get_dataset_params(dataset, seg=None):
     params = dict(DATASET_PARAMS[dataset])
     if seg is not None:
         params['seg'] = seg
+    params.setdefault('rest_variant', 'clean')
+    if rest_variant is not None:
+        params['rest_variant'] = rest_variant
+    if modalities is not None:
+        unknown = [m for m in modalities if m not in params['tasks']]
+        if unknown:
+            raise ValueError(f"{dataset} has no tasks for modalities {unknown}; it has {sorted(params['tasks'])}.")
+        params['modalities'] = list(modalities)
     return params
 

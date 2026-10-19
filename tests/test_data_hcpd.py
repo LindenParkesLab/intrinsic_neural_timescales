@@ -48,9 +48,9 @@ REST_SHAPE = (N_PARCELS, 478)   # rfMRIREST1AP
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _make_scan(subject_id=SUBJECT_A, task='rfMRIREST1AP', modality='MRI3T',
-               session=SESSION, seg=SEG, space=SPACE, tr=0.80, rbc=False):
+               session=SESSION, seg=SEG, space=SPACE, tr=0.80):
     return ScanInfo(subject_id=subject_id, task=task, space=space, seg=seg,
-                    modality=modality, tr=tr, session=session, rbc=rbc)
+                    modality=modality, tr=tr, session=session)
 
 
 # ==============================================================================
@@ -71,8 +71,6 @@ class TestConfig:
         cfg = load_dataset_config('HCP-D')
         assert cfg.modalities['MRI3T'].tr == pytest.approx(0.80)
 
-    def test_rbc_false(self):
-        assert load_dataset_config('HCP-D').rbc is False
 
     def test_behavior_handler(self):
         assert load_dataset_config('HCP-D').behavior_handler == 'hcp_d'
@@ -117,9 +115,10 @@ class TestScanInfo:
         assert reconstructed.session is None
         assert reconstructed == scan
 
-    def test_roundtrip_preserves_rbc_false(self):
-        scan = _make_scan(rbc=False)
-        assert ScanInfo.from_dict(scan.to_dict()).rbc is False
+    def test_from_dict_ignores_the_retired_rbc_column(self):
+        """Registries exported before the rbc flag was removed still load."""
+        scan = _make_scan()
+        assert ScanInfo.from_dict({**scan.to_dict(), 'rbc': 'False'}) == scan
 
     def test_str_contains_subject(self):
         assert f'sub-{SUBJECT_A}' in str(_make_scan())
@@ -136,7 +135,7 @@ class TestScanInfo:
     def test_to_dict_keys(self):
         d = _make_scan().to_dict()
         for key in ('sub', 'ses', 'task', 'space', 'seg', 'modality', 'tr',
-                    'condition', 'rbc', 'scan_string'):
+                    'condition', 'scan_string'):
             assert key in d
 
     def test_different_subjects_not_equal(self):

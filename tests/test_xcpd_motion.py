@@ -1,9 +1,8 @@
 """Shared XCP-D head motion (``load_xcpd_motion`` / ``xcpd_motion_columns``).
 
-Every XCP-D dataset here -- AOMIC-PIOP1/PIOP2, WAND, PNC, Penn_LEAD -- carries per-run motion in
-``*_desc-linc_qc.tsv``, and each documents ``mean_fd`` identically in its ``*_motion.json``
-("Power et al. (2012)", HeadRadius 50 mm), so one loader serves all five and the values are
-comparable across them. What these tests pin: that the entities come from the FILENAME (pandas
+Both XCP-D datasets here -- WAND and Penn_LEAD -- carry per-run motion in ``*_desc-linc_qc.tsv``,
+and each documents ``mean_fd`` identically in its ``*_motion.json`` ("Power et al. (2012)",
+HeadRadius 50 mm), so one loader serves both and the values are comparable across them. What these tests pin: that the entities come from the FILENAME (pandas
 drops the zero padding the scan registries use), that runs and acquisition variants collapse
 before anything else, that only a genuinely multi-session dataset grows per-session columns, and
 that the ``meanFD_rest`` / ``meanFD_task`` aliases ``build_nuisance`` reads resolve per dataset.
@@ -54,8 +53,10 @@ class TestEntitiesComeFromTheFilename:
     def test_run_and_acq_are_read(self):
         e = _qc_entities('sub-138950_ses-1_task-rest_run-01_space-MNI152NLin2009cAsym_desc-linc_qc.tsv')
         assert e['sub'] == '138950' and e['ses'] == '1' and e['run'] == '01'
-        e = _qc_entities('sub-0001_task-restingstate_acq-seq_space-MNI152NLin2009cAsym_desc-linc_qc.tsv')
-        assert e['sub'] == '0001' and e['acq'] == 'seq' and 'ses' not in e
+        e = _qc_entities('sub-20188_ses-1_task-nback_acq-VARIANTObliquity_run-01_desc-linc_qc.tsv')
+        assert e['sub'] == '20188' and e['acq'] == 'VARIANTObliquity'
+        e = _qc_entities('sub-0001_task-rest_space-MNI152NLin2009cAsym_desc-linc_qc.tsv')
+        assert e['sub'] == '0001' and 'ses' not in e
 
     def test_a_missing_directory_is_empty_not_an_error(self, tmp_path):
         class _NoDir:
@@ -69,9 +70,8 @@ class TestEntitiesComeFromTheFilename:
 
 
 class TestSpecCoversEveryXcpdDataset:
-    def test_the_six_datasets(self):
-        assert sorted(XCPD_MOTION_SPEC) == ['AOMIC_PIOP1', 'AOMIC_PIOP2', 'PNC', 'Penn_LEAD', 'TCP',
-                                            'WAND']
+    def test_the_two_datasets(self):
+        assert sorted(XCPD_MOTION_SPEC) == ['Penn_LEAD', 'WAND']
 
     def test_every_spec_dataset_has_an_fd_column_entry(self):
         """A dataset with motion but no FD_COLUMN entry silently gets NO nuisance covariates."""
@@ -86,15 +86,13 @@ class TestSpecCoversEveryXcpdDataset:
 
 class TestWideColumns:
     def test_single_session_dataset_gets_one_column_per_task(self, monkeypatch, long_table):
-        df = long_table([('0001', None, 'restingstate', None, 'seq', 0.10),
-                         ('0001', None, 'workingmemory', None, 'seq', 0.20),
-                         ('0001', None, 'emomatching', None, 'seq', 0.30)])
-        out = _columns(monkeypatch, 'AOMIC_PIOP2', df)
-        assert out.loc['0001', 'meanFD_restingstate'] == pytest.approx(0.10)
-        assert out.loc['0001', 'meanFD_rest'] == pytest.approx(0.10)
+        df = long_table([('00395', '03', 'rest', None, None, 0.10),
+                         ('00395', '03', 'reversallearning', None, None, 0.30)])
+        out = _columns(monkeypatch, 'WAND', df)
+        assert out.loc['00395', 'meanFD_reversallearning'] == pytest.approx(0.30)
         # meanFD_task averages the non-rest tasks, never rest itself
-        assert out.loc['0001', 'meanFD_task'] == pytest.approx(0.25)
-        assert not any(c.endswith('_ses') or '_ses' in c for c in out.columns)
+        assert out.loc['00395', 'meanFD_task'] == pytest.approx(0.30)
+        assert not any('_ses' in c for c in out.columns)
 
     def test_runs_average_within_a_session_before_anything_else(self, monkeypatch, long_table):
         """The general rule. Penn_LEAD is the exception -- it reads run-01 only; see
@@ -137,20 +135,11 @@ class TestWideColumns:
         assert out.loc['20188', 'meanFD_nback_ses2'] == pytest.approx(0.30)
 
     def test_run_filters_are_penn_lead_only(self):
-        """Every other XCP-D dataset averages all its runs, as before."""
+        """Every other XCP-D dataset averages all its runs."""
         for dataset, spec in XCPD_MOTION_SPEC.items():
             if dataset != 'Penn_LEAD':
                 assert spec.get('runs') is None and not spec.get('exclude_acq')
 
-    def test_pnc_excludes_idemo_from_the_task_alias(self, monkeypatch, long_table):
-        """idemo is processed but never analysed; averaging it into meanFD_task would import a run
-        the registry does not contain."""
-        df = long_table([('1000393599', 'PNC1', 'rest', None, 'singleband', 0.10),
-                         ('1000393599', 'PNC1', 'frac2back', None, None, 0.20),
-                         ('1000393599', 'PNC1', 'idemo', None, None, 0.90)])
-        out = _columns(monkeypatch, 'PNC', df)
-        assert out.loc['1000393599', 'meanFD_idemo'] == pytest.approx(0.90)   # kept, reportable
-        assert out.loc['1000393599', 'meanFD_task'] == pytest.approx(0.20)    # but not in the alias
 
     def test_wand_task_alias_is_its_one_task(self, monkeypatch, long_table):
         df = long_table([('00395', '03', 'rest', None, None, 0.15),
@@ -161,12 +150,12 @@ class TestWideColumns:
         assert out.index.name == 'subject_id'
 
     def test_a_subject_missing_a_task_keeps_the_others(self, monkeypatch, long_table):
-        df = long_table([('0001', None, 'restingstate', None, 'seq', 0.10),
-                         ('0002', None, 'restingstate', None, 'seq', 0.12),
-                         ('0002', None, 'workingmemory', None, 'seq', 0.22)])
-        out = _columns(monkeypatch, 'AOMIC_PIOP2', df)
-        assert np.isnan(out.loc['0001', 'meanFD_workingmemory'])
-        assert out.loc['0001', 'meanFD_rest'] == pytest.approx(0.10)
+        df = long_table([('00001', '03', 'rest', None, None, 0.10),
+                         ('00002', '03', 'rest', None, None, 0.12),
+                         ('00002', '03', 'reversallearning', None, None, 0.22)])
+        out = _columns(monkeypatch, 'WAND', df)
+        assert np.isnan(out.loc['00001', 'meanFD_reversallearning'])
+        assert out.loc['00001', 'meanFD_rest'] == pytest.approx(0.10)
 
     def test_an_unknown_dataset_raises_rather_than_guessing(self, monkeypatch, long_table):
         monkeypatch.setattr('src.data.load_xcpd_motion', lambda loader, force=False: long_table([]))

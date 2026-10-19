@@ -13,7 +13,6 @@ import scipy as sp
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 
-from src.plotting import style_ax
 from src.timescales import rest_window_token
 from snaplab_tools.gams import (
     fit_series, detect_change_point, integrate_derivative, segment_windows_at,
@@ -35,7 +34,7 @@ from snaplab_tools.gams import (
 SIGNAL_TYPES = ('rest', 'task', 'deflection')
 
 GAM_RECIPES = {
-    # 'historical' -> the original fixed-penalty recipe (writes the untagged cache file).
+    # 'historical' -> the original fixed-penalty recipe.
     # 'gcv'        -> lam chosen per series by GCV on the full sample, then frozen for bootstraps.
     'historical': dict(n_splines=4, lam=0.1),
     'gcv':        dict(n_splines=5, lam='gcv'),
@@ -112,9 +111,8 @@ def gam_cache_path(gam_out_dir, dataset, n_regions, task_scan, tags):
 
 
 # Head-motion column(s) per dataset; None means this dataset gets no nuisance covariates.
-FD_COLUMN = {'HCP-D': 'meanFD', 'PNC': 'meanFD_rest', 'HCP-YA': 'meanRelRMS_rest',
-             'AOMIC_PIOP1': 'meanFD_rest', 'AOMIC_PIOP2': 'meanFD_rest',
-             'WAND': 'meanFD_rest', 'Penn_LEAD': 'meanFD_rest', 'TCP': 'meanFD_rest'}
+FD_COLUMN = {'HCP-D': 'meanFD', 'HCP-YA': 'meanRelRMS_rest',
+             'WAND': 'meanFD_rest', 'Penn_LEAD': 'meanFD_rest'}
 
 
 def build_nuisance(df_behavior, rest, dataset, include_age=False, fd_columns=None):
@@ -304,36 +302,6 @@ def get_draw_order(mode, n_series, sa_axis=None):
     if mode in ('decile', 'wholebrain'):
         return np.arange(n_series)
     return np.argsort(sa_axis)
-
-
-def add_colorbar(fig, ax, cmap, mode, n_series, fontsize=7):
-    """Add a horizontal SA colorbar under ax.
-
-    Parameters
-    ----------
-    fig : matplotlib Figure
-    ax : matplotlib Axes
-        Axes to attach the colorbar to.
-    cmap : matplotlib colormap
-    mode : {'decile', 'region'}
-        Sets the label and ticks (integer deciles vs SA-rank range).
-    n_series : int
-        Number of series, used for the color normalization range.
-    fontsize : int
-        Label and tick font size.
-    """
-    norm = mcolors.Normalize(vmin=1, vmax=n_series)
-    sm   = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
-    sm.set_array([])
-    cb = fig.colorbar(sm, ax=ax, orientation='horizontal', pad=0.2,
-                      fraction=0.05, aspect=20)
-    if mode == 'decile':
-        cb.set_label('SA decile', fontsize=fontsize)
-        cb.set_ticks(list(range(1, n_series + 1)))
-    else:
-        cb.set_label('SA rank (region)', fontsize=fontsize)
-        cb.set_ticks(np.linspace(1, n_series, 5, dtype=int).tolist())
-    cb.ax.tick_params(labelsize=fontsize)
 
 
 # =============================================================================
@@ -644,105 +612,6 @@ def grid_derivatives(pred, x_grid, order):
     for _ in range(int(order)):
         out = np.gradient(out, x_grid, axis=1, edge_order=2)
     return out
-
-
-def compute_deriv_map_corr(deriv, map_vals, method='pearson'):
-    """Pearson/Spearman r between a per-region brain map and the regional derivative at each age.
-
-    Generalises :func:`compute_deriv_sa_corr` (which is S-A-axis specific) to any brain map. For
-    ``method='pearson'`` the correlation is vectorised across grid columns (cheap enough for the
-    bootstrap inner loop); ``method='spearman'`` falls back to a per-column loop. A region is used
-    only if it is finite in ``map_vals`` and across the whole derivative curve.
-
-    Parameters
-    ----------
-    deriv : (n_regions, n_grid) ndarray
-        Per-region temporal derivative (any order).
-    map_vals : (n_regions,) ndarray
-        Brain map in parcellation order; NaN regions are dropped.
-    method : {'pearson', 'spearman'}
-        Correlation type.
-
-    Returns
-    -------
-    r_vals : (n_grid,) ndarray
-        Correlation at each age point; NaN where fewer than 3 regions are valid.
-    """
-    deriv  = np.asarray(deriv, dtype=float)
-    m      = np.asarray(map_vals, dtype=float)
-    n_grid = deriv.shape[1]
-    r      = np.full(n_grid, np.nan)
-
-    fin = np.isfinite(m) & np.isfinite(deriv).all(axis=1)
-    if fin.sum() < 3:
-        return r
-
-    if method == 'pearson':
-        D   = deriv[fin]                              # (n_valid, n_grid)
-        x   = m[fin] - m[fin].mean()
-        Dc  = D - D.mean(axis=0, keepdims=True)
-        den = np.sqrt((Dc ** 2).sum(axis=0)) * np.sqrt((x ** 2).sum())
-        with np.errstate(invalid='ignore', divide='ignore'):
-            r = (Dc.T @ x) / den
-        r[~np.isfinite(r)] = np.nan
-        return r
-
-    xm = m[fin]
-    for t in range(n_grid):
-        col = deriv[fin, t]
-        r[t] = sp.stats.spearmanr(xm, col).statistic
-    return r
-
-
-def _reduce_deriv_maps(preds, derivs, x_grid, *, orders, maps, keys, method='pearson'):
-    """Per-resample reduction for :func:`bootstrap_deriv_map_corr`.
-
-    Ignores the passed 1st-derivative ``derivs``; recomputes every requested derivative order from
-    ``preds`` via :func:`grid_derivatives` (uniform convention across orders), then correlates each
-    map against each order's regional derivative at every age. Module-level so joblib can pickle it
-    (wrap in ``functools.partial`` to bind orders/maps/keys). Returns ``{f'd{order}|{key}': curve}``.
-    """
-    out = {}
-    for order in orders:
-        d = grid_derivatives(preds, x_grid, order)
-        for i, key in enumerate(keys):
-            out[f'd{order}|{key}'] = compute_deriv_map_corr(d, maps[i], method=method)
-    return out
-
-
-def bootstrap_deriv_map_corr(deflection, age, age_grid, maps, keys, *, orders=(1, 2, 3),
-                             method='pearson', n_splines=4, lam=0.1, demean=True, nuisance=None,
-                             n_boot=200, random_state=None, n_jobs=-1, verbose=True):
-    """Subject-bootstrap CI for corr(brain map x kth GAM derivative)(age), for many maps and orders.
-
-    A single bootstrap of the deflection GAMs (via ``snaplab_tools.gams.bootstrap_gam_fits``) serves
-    every (order, map) pair: each resample refits the regional GAMs once, then :func:`_reduce_deriv_maps`
-    computes all correlation curves from the shared refit. Freeze ``lam``/``n_splines``/``random_state``
-    to the full-sample fit to match a reference bootstrap exactly.
-
-    Parameters
-    ----------
-    deflection : (n_subjects, n_regions) ndarray
-    age : (n_subjects,) ndarray
-    age_grid : (n_grid,) ndarray
-    maps : (n_maps, n_regions) array-like
-        Brain maps, one row per curve.
-    keys : sequence of str
-        Labels for ``maps`` (same length/order); form the returned dict keys.
-    orders : sequence of int
-        Derivative orders to compute (default 1, 2, 3).
-    method : {'pearson', 'spearman'}
-
-    Returns
-    -------
-    dict
-        ``{f'd{order}|{key}': (n_boot, n_grid) ndarray}`` for every order x key.
-    """
-    reduce = functools.partial(_reduce_deriv_maps, orders=tuple(orders),
-                               maps=np.asarray(maps, dtype=float), keys=list(keys), method=method)
-    return bootstrap_gam_fits(deflection, age, age_grid, reduce=reduce, n_boot=n_boot,
-                              n_splines=n_splines, lam=lam, nuisance=nuisance, demean=demean,
-                              random_state=random_state, n_jobs=n_jobs, verbose=verbose)
 
 
 def deriv_map_spatial_null_p(deriv, map_vals, map_surrogates, method='pearson'):

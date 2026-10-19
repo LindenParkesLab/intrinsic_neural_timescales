@@ -123,10 +123,9 @@ class TestPhaseEncodingPairing:
         assert pair_rest_runs(['reversallearning'], ['rest']) == {'reversallearning': ('rest', False)}
 
     def test_lowercase_tails_are_not_phase_encoding(self):
-        """UCLA's `scap` ends in 'ap'. Reading it as AP would pair it against AP rest runs."""
+        """A task named e.g. `scap` ends in 'ap'. Reading it as AP would pair it against AP rest runs."""
         assert phase_encoding_direction('scap') is None
-        assert phase_encoding_direction('frac2back') is None
-        assert phase_encoding_direction('bart') is None
+        assert phase_encoding_direction('nback') is None
         assert phase_encoding_direction('rest') is None
         assert phase_encoding_direction('tfMRIGUESSINGPA') == 'PA'
         assert phase_encoding_direction('tfMRIWMLR') == 'LR'
@@ -237,12 +236,12 @@ class TestPairingStaysInsideASession:
 
 
 class TestRestControlOffset:
-    """The window start. Source: ONSET_OFFSET_ALL_DATASETS.md §1, ``auc_zero_crossing``."""
+    """The window start: the scan-onset offsets measured on ``auc_zero_crossing``."""
 
     def test_the_table_is_the_diagnostic(self):
         """HCP-YA 3T is the only measured transient; everything else is zero, deliberately."""
         assert REST_CONTROL_OFFSET_SECONDS[('HCP-YA', 'MRI3T')] == 126.0
-        for key in [('HCP-YA', 'MRI7T'), ('HCP-D', 'MRI3T'), ('Penn_LEAD', 'MRI3T'), ('TCP', 'MRI3T')]:
+        for key in [('HCP-YA', 'MRI7T'), ('HCP-D', 'MRI3T'), ('Penn_LEAD', 'MRI3T')]:
             assert REST_CONTROL_OFFSET_SECONDS[key] == 0.0
         assert REST_CONTROL_OFFSET_DEFAULT == 0.0
 
@@ -259,7 +258,7 @@ class TestRestControlOffset:
     def test_an_undiagnosed_dataset_gets_no_offset(self):
         """Zero, not a borrowed number: an unmeasured correction is worse than none."""
         assert rest_control_offset_seconds('WAND', 'MRI3T') == 0.0
-        assert rest_control_offset_frames('PNC', 'MRI3T', 3.0) == 0
+        assert rest_control_offset_frames('WAND', 'MRI3T', 2.0) == 0
 
     def test_modality_is_part_of_the_key(self):
         """HCP-YA 3T dips and HCP-YA 7T does not, so a dataset-only table would be wrong."""

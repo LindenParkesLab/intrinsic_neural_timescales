@@ -1,12 +1,12 @@
 """Region-level supporting maps: the region-space core plus optional annotation families.
 
 Everything here is indexed by parcel and shared across subjects -- the S-A / S-F axes, Schaefer
-geometry, gene expression and cell-type maps. Per-subject structural data lives in
-:mod:`src.subject_data`.
+geometry, gene expression and cell-type maps, and a dataset's own group-mean T1w/T2w myelin map.
 """
 
 import os
 
+import nibabel as nib
 import numpy as np
 import scipy as sp
 import pandas as pd
@@ -287,3 +287,35 @@ def load_supporting_data(in_dir, n_regions=400, gene_panel='gao'):
         'gene_panel': gene_panel,
     }
 
+
+def load_myelin_map(derivdata_dir, subject_ids, n_regions=400):
+    """Group-mean T1w/T2w myelin over ``subject_ids``, one value per parcel.
+
+    Reads one parcellated pscalar per subject from the ``parcellated_data`` folders for HCP-YA and HCP-D. A subject
+    without a file is skipped.
+
+    Parameters
+    ----------
+    derivdata_dir : str or Path
+        The dataset's derivatives directory.
+    subject_ids : sequence of str
+        Subjects to average over.
+    n_regions : int
+        Parcellation resolution (``seg-Schaefer{n_regions}7``).
+
+    Returns
+    -------
+    ndarray, shape (n_regions,)
+        Per-parcel mean myelin.
+    """
+    myelin = np.full((n_regions, len(subject_ids)), np.nan)
+    n_missing = 0
+    for i, sub in enumerate(subject_ids):
+        myelin_file = os.path.join(derivdata_dir, 'parcellated_data', f'sub-{sub}', 'ses-01', 'anat',
+                                   f'sub-{sub}_ses-01_space-fsLR_seg-Schaefer{n_regions}7_stat-mean_myelin.pscalar.nii')
+        if os.path.exists(myelin_file):
+            myelin[:, i] = np.asarray(nib.load(myelin_file).get_fdata()).squeeze()
+        else:
+            n_missing += 1
+    print(f'Myelin: {len(subject_ids) - n_missing}/{len(subject_ids)} subjects have a map')
+    return np.nanmean(myelin, axis=1)

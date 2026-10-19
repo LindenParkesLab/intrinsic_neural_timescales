@@ -75,7 +75,7 @@ class TestCachePath:
     def test_dataset_and_resolution_separate_files(self):
         tags = gam_variant_tags('historical', True, True)
         a = gam_cache_path('/out', 'HCP-D', 400, 'tfMRICARITPA', tags)
-        b = gam_cache_path('/out', 'PNC', 400, 'tfMRICARITPA', tags)
+        b = gam_cache_path('/out', 'HCP-YA', 400, 'tfMRICARITPA', tags)
         c = gam_cache_path('/out', 'HCP-D', 200, 'tfMRICARITPA', tags)
         assert len({a, b, c}) == 3
 

@@ -1,22 +1,19 @@
 import os
-import warnings
 
 import numpy as np
 import scipy as sp
 import pandas as pd
 import seaborn as sns
-import matplotlib as mpl
 import matplotlib.pyplot as plt
-import matplotlib.colors as mcolors
 import matplotlib.gridspec as gridspec
 import matplotlib.patches as mpatches
-from matplotlib.colors import Normalize
-from matplotlib.cm import ScalarMappable
+import matplotlib.transforms as mtransforms
 
-from snaplab_tools.plotting.utils import (make_diverging_cmap,
-                                          make_sequential_cmap, register_custom_colormaps,
-                                          show_colormaps, cvd_min_delta_e)
-from snaplab_tools.stats import significance_stars
+from snaplab_tools.plotting import plotting as snap_plotting
+from snaplab_tools.plotting.utils import register_custom_colormaps
+from snaplab_tools.stats import winsorize
+
+from src.notebook import data_dict_to_dataframe, ttest_vs_references
 
 try:
     import adjustText
@@ -50,10 +47,9 @@ def setup_notebook_style():
 
 
 # ── Figure export convention ────────────────────────────────────────────────────────────────────
-# save_panel and its DPI constants now live in snaplab_tools.plotting.utils -- the convention is
-# not project-specific. Only the scratch location below is.
-#: Root of the figure scratch tree; see :func:`figure_scratch_dir`.
-FIGURE_SCRATCH_BASE = '/mnt/lindenmp_nas/lindenmp/work/figure_scratch/intrinsic_neural_timescales'
+# save_panel and its DPI constants live in snaplab_tools.plotting.utils
+FIGURE_SCRATCH_BASE = os.environ.get(
+    'INT_FIGURE_DIR', '/mnt/lindenmp_nas/lindenmp/work/figure_scratch/intrinsic_neural_timescales')
 
 
 def annotate_significance_brackets(ax, pairs, labels, y0=None, y_step=None,
@@ -462,7 +458,6 @@ def plot_subject_level_violins(df, ax, observation_indices,
     if fit_trends and n_observations >= 3:
         
         trend_color = "#3B3B3B"  # Soft grey
-        n_conditions = len(condition_names)
         violin_width = 0.8
         violin_spacing = violin_width / n_observations
         
@@ -548,7 +543,6 @@ def plot_subject_level_violins(df, ax, observation_indices,
     
     # Add connecting lines if requested
     if show_lines:
-        n_conditions = len(condition_names)
         violin_width = 0.8
         violin_spacing = violin_width / n_observations
         
@@ -1355,6 +1349,169 @@ def _calculate_annotation_height(data_values, y_min, y_max, offset_fraction=0.05
     y_range = y_max - y_min
     data_max = np.nanmax(data_values)
     return data_max + y_range * offset_fraction
+
+
+# ==============================================================================
+# Figure 1 panels (fig1_super and sfig1)
+# ==============================================================================
+
+def draw_int_rows(ax_a, ax_b, df_ints, data_dict_centiles, reference_of, color_vector, labels, title,
+                  ylabels=None, winsorize_columns=()):
+    """One dataset column of Figure 1: regional-mean INTs (row A) and subject-level INTs across S-A deciles (row B).
+
+    Parameters
+    ----------
+    ax_a, ax_b : matplotlib.axes.Axes
+        Row A and row B axes.
+    df_ints : pd.DataFrame
+        Regions x columns of group-mean INTs, in display order.
+    data_dict_centiles : dict
+        Column -> (n_subjects, n_deciles) INTs.
+    reference_of : dict
+        Condition -> the column it is tested against (raw keys).
+    color_vector : pd.Series
+        The S-A axis, colouring the regions.
+    labels : dict
+        Raw key -> display label.
+    title : str
+        Column title (row A).
+    ylabels : (str, str) or None
+        Row A and row B y labels; None leaves them empty.
+    winsorize_columns : sequence of str
+        Raw keys winsorized in row B only (WAND's reversal learning).
+
+    Returns
+    -------
+    pd.DataFrame
+        Row A's paired t-tests of each condition against its reference (``ttest_vs_references``), whose stars
+        are drawn as brackets.
+    """
+    df_ints = df_ints.copy()
+    df_centiles = data_dict_to_dataframe(data_dict_centiles)
+    for col in winsorize_columns:
+        if col in df_centiles.columns:
+            df_centiles[col] = winsorize(df_centiles[col])
+
+    df_ints = df_ints.rename(columns=labels)
+    df_centiles = df_centiles.rename(columns=labels)
+    cond_cols = [c for c in df_centiles.columns if c != 'subject']
+    ordered = [c for c in df_ints.columns if c in cond_cols]
+    df_centiles = df_centiles[['subject'] + ordered]
+
+    ax_a = plot_repeated_measures_violins(
+        df_ints, ax_a,
+        color_vector=color_vector, colormap='snap_sydnor_sa',
+        add_colorbar=False,
+        point_alpha=1, line_alpha=0.3, point_size=0.25, line_width=0.25,
+        violin_alpha=0.25, correlation_method='spearman', annotate_variance=False,
+    )
+    ax_a.set_xticklabels([])
+    ax_a.set_xlabel('')
+    ax_a.set_title(title, fontsize=8, fontweight='bold')
+
+    # Paired t-tests (regions paired) of each condition against its reference; brackets join the two.
+    label_refs = {labels.get(c, c): labels.get(r, r) for c, r in reference_of.items()}
+    ttests = ttest_vs_references(df_ints, label_refs, alternative='two-sided', correction='fdr_bh')
+    print(ttests)
+    cols = list(df_ints.columns)
+    annotate_significance_brackets(ax_a, [(cols.index(r), cols.index(c)) for c, r in label_refs.items()],
+                                   [ttests.loc[c, 'sig'] for c in label_refs], fontsize=6, text_pad_frac=-0.005)
+
+    ax_b, _ = plot_subject_level_violins(
+        df_centiles, ax_b, np.arange(10),
+        point_alpha=0.75, point_size=0.25,
+        show_violins=False, show_lines=False, fit_trends=True,
+        show_r2_annotation=False, annotate_variance=False,
+        hide_legend=True, sort_by_median=False, fontsize=6,
+    )
+    ax_b.set_xlabel('')
+    for ax, ylabel in zip((ax_a, ax_b), ylabels or ('', '')):
+        ax.set_ylabel(ylabel, fontsize=8) if ylabel else ax.set_ylabel('')
+    for ax in (ax_a, ax_b):
+        ax.tick_params(axis='y', which='major', pad=1)
+        ax.tick_params(axis='x', which='major', pad=1)
+        ax.yaxis.set_label_coords(-0.2, 0.5)
+    return ttests
+
+
+def draw_coupling_boxes(ax, groups, sig_lookup, labels, colors, legend_labels):
+    """Per-subject S-A coupling boxes, grouped by dataset (Figure 1's bottom row, panel A).
+
+    Parameters
+    ----------
+    groups : list of dict
+        One per dataset, in drawing order: ``title``, ``columns`` (raw keys, in order), ``reference_of``
+        (condition -> reference) and ``coupling`` (column -> (n_subjects,)). A column that is no condition's
+        key in ``reference_of`` is a reference and is drawn in ``colors[0]``; conditions in ``colors[1]``.
+    sig_lookup : dict
+        (title, condition label) -> stars, drawn above each condition.
+    labels : dict
+        Raw key -> display label.
+    colors : (color, color)
+    legend_labels : (str, str)
+        Legend entries for the two colours.
+    """
+    positions, box_data, box_colors, xticklabels = [], [], [], []
+    group_spans, star_annots = [], []
+    pos = 0
+    for g in groups:
+        start = pos
+        for cond in g['columns']:
+            is_reference = cond not in g['reference_of']
+            vals = g['coupling'][cond]
+            vals = vals[np.isfinite(vals)]
+            label = labels.get(cond, cond)
+            positions.append(pos)
+            box_data.append(vals)
+            box_colors.append(colors[0] if is_reference else colors[1])
+            xticklabels.append(label)
+            if not is_reference:
+                star_annots.append((pos, vals, sig_lookup.get((g['title'], label), '')))
+            pos += 1
+        group_spans.append(((start + pos - 1) / 2, g['title']))
+        pos += 1  # gap before the next dataset
+
+    bp = ax.boxplot(box_data, positions=positions, widths=0.65, patch_artist=True,
+                    showfliers=False, medianprops=dict(color='black', lw=1))
+    for patch, color in zip(bp['boxes'], box_colors):
+        patch.set_facecolor(color); patch.set_alpha(0.55)
+        patch.set_edgecolor('black'); patch.set_linewidth(0.6)
+    for elem in bp['whiskers'] + bp['caps']:
+        elem.set_color('black'); elem.set_linewidth(0.6)
+
+    ax.axhline(0, color='gray', lw=0.6, ls='--', zorder=0)
+    ax.set_ylabel('S-A coupling (subjects)', fontsize=8)
+    ax.set_xticks(positions)
+    ax.set_xticklabels(xticklabels, rotation=45, ha='right', fontsize=6)
+    ax.set_xlim(-0.8, pos - 1.2)
+
+    ymin, ymax = ax.get_ylim()
+    yr = ymax - ymin
+    for p, vals, stars in star_annots:
+        ax.text(p, np.percentile(vals, 95) + 0.11 * yr, stars, ha='center', va='bottom', fontsize=6)
+    # Dataset labels go exactly where an axes title goes (top edge + titlepad, baseline-aligned),
+    # so they line up with titles of panels sharing this row's top edge.
+    title_trans = mtransforms.offset_copy(
+        mtransforms.blended_transform_factory(ax.transData, ax.transAxes),
+        fig=ax.figure, y=plt.rcParams['axes.titlepad'], units='points',
+    )
+    for center, title in group_spans:
+        ax.text(center, 1.0, title, transform=title_trans, ha='center', va='baseline', fontsize=8,
+                fontweight='bold')
+    ax.set_ylim(ymin, ymax + 0.17 * yr)
+    ax.legend(handles=[mpatches.Patch(facecolor=colors[0], alpha=0.55, label=legend_labels[0]),
+                       mpatches.Patch(facecolor=colors[1], alpha=0.55, label=legend_labels[1])],
+              loc='upper left', fontsize=6, frameon=False, ncol=2, handlelength=1.2)
+
+
+def draw_coupling_scatter(ax, x, y, x_label, y_label, colors, title):
+    """Per-subject coupling of one column against another, with the identity line (bottom row, panels B and C)."""
+    snap_plotting.plot_correlation_unity(x, y, ax, x_label=x_label, y_label=y_label,
+                                         marginal_color_x=colors[0], marginal_color_y=colors[1],
+                                         show_marginals=False, show_correlation=True, correlation_type='pearson',
+                                         grid=False, size=5, fontsize=8)
+    ax.set_title(title, fontsize=8, fontweight='bold')
+    ax.set_aspect('auto')
 
 
 def figure_scratch_dir(dataset=None, base=FIGURE_SCRATCH_BASE):

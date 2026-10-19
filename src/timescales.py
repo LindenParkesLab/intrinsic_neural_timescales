@@ -6,7 +6,8 @@ from tqdm import tqdm
 from nilearn.glm.first_level import make_first_level_design_matrix
 from collections import defaultdict
 
-from src.data import DataLoader, ScanInfo, parse_scan_string, build_scan_string
+from src.data import (DataLoader, ScanInfo, parse_scan_string, build_scan_string,
+                      REST_VARIANT_DEFAULT)
 from snaplab_tools.stats import partial_pearsonr
 # INT estimation lives entirely in snaplab_tools -- this project defines no estimator of its own.
 # What this module owns is the per-scan caching layer around them
@@ -25,8 +26,6 @@ REST_RUNS_3T = ['rfMRIREST1LR', 'rfMRIREST1RL', 'rfMRIREST2LR', 'rfMRIREST2RL', 
 REST_RUNS_7T = ['rfMRIREST17TPA', 'rfMRIREST27TAP', 'rfMRIREST37TPA', 'rfMRIREST47TAP']
 #: 7T movie runs (HCP-YA), alternating AP/PA -- note the offset against REST_RUNS_7T.
 MOVIE_RUNS_7T = ['tfMRIMOVIE17TAP', 'tfMRIMOVIE27TPA', 'tfMRIMOVIE37TPA', 'tfMRIMOVIE47TAP']
-REST_RUNS_MEG = ['3Restin', '4Restin', '5Restin']
-TASK_RUNS_MEG = ['6Wrkmem', '7Wrkmem']
 
 #: Task runs grouped into the condition they are averaged into: ``[(runs, condition_key), ...]``.
 TASK_RUN_GROUPS = [
@@ -41,8 +40,6 @@ TASK_RUN_GROUPS = [
     (['tfMRICARITPA'],                              'task-CARIT'),
     (['tfMRIEMOTIONPA'],                            'task-EMOTION'),
     (['tfMRIGUESSINGPA'],                           'task-GUESSING'),
-    # TCP — AP/PA pair of one Stroop task. hammerAP is a single run and needs no entry.
-    (['stroopAP',           'stroopPA'],            'task-stroop'),
 ]
 
 #: Condition key for the 7T movies, which TASK_RUN_GROUPS does not cover because
@@ -53,15 +50,8 @@ MOVIE_GROUP = (MOVIE_RUNS_7T, 'task-Movies')
 REST_CONTROL_OFFSET_SECONDS = {
     ('HCP-YA',    'MRI3T'): 126.0,
     ('HCP-YA',    'MRI7T'): 0.0,
-    ('HCP-YA',    'MEG'):   0.0,
     ('HCP-D',     'MRI3T'): 0.0,
     ('Penn_LEAD', 'MRI3T'): 0.0,
-    # TCP: measured 2026-09-25, and 0 on the evidence, not only for want of headroom. Every run
-    # is depressed at BOTH ends (auc: lead -12 to -16 %, trail -8 to -10 %), rest and task
-    # residual alike -- XCP-D's bandpass edge, not an onset transient. The control spans its whole
-    # rest run as the task side spans its own, so the edges cancel; an offset would strip one edge
-    # from the control only. See the TCP section of CLAUDE.md.
-    ('TCP',       'MRI3T'): 0.0,
 }
 
 #: Offset for a (dataset, modality) that has not been measured.
@@ -114,7 +104,12 @@ def rest_control_offset_frames(dataset, modality, tr):
     return int(round(rest_control_offset_seconds(dataset, modality) / tr))
 
 REST_WINDOW_MATCH = {
-    ('HCP-YA', 'MRI3T'): {'WM':       ('tfMRIWMLR', 'tfMRIWMRL')},
+    ('HCP-YA', 'MRI3T'): {'EMOTION':    ('tfMRIEMOTIONLR', 'tfMRIEMOTIONRL'),
+                          'GAMBLING':   ('tfMRIGAMBLINGLR', 'tfMRIGAMBLINGRL'),
+                          'LANGUAGE':   ('tfMRILANGUAGELR', 'tfMRILANGUAGERL'),
+                          'RELATIONAL': ('tfMRIRELATIONALLR', 'tfMRIRELATIONALRL'),
+                          'SOCIAL':     ('tfMRISOCIALLR', 'tfMRISOCIALRL'),
+                          'WM':         ('tfMRIWMLR', 'tfMRIWMRL')},
     ('HCP-D',  'MRI3T'): {'CARIT':    ('tfMRICARITPA',),
                           'EMOTION':  ('tfMRIEMOTIONPA',),
                           'GUESSING': ('tfMRIGUESSINGPA',)},
@@ -122,6 +117,9 @@ REST_WINDOW_MATCH = {
 
 #: Output-type token prefix for a length-matched rest window.
 REST_WINDOW_TOKEN = 'restlen'
+
+#: The INT estimator
+INT_METHOD = 'auc_zero_crossing'
 
 #: Written into every length-matched ACF file so it cannot be misread once it leaves its directory.
 REST_WINDOW_NOTE = ("REST timeseries cut to one window the length of this subject's matched task "
@@ -139,11 +137,58 @@ def rest_window_token(match):
     return f'{REST_WINDOW_TOKEN}-{match}'
 
 
+def frequency_filter_token(highpass=None, lowpass=None):
+    """Token a frequency-filtered series carries in every output_type, or None when unfiltered.
+
+    ``bp-{highpass}-{lowpass}hz`` when both are given, else ``hp-{highpass}hz`` / ``lp-{lowpass}hz``.
+    The one definition of the token, shared by the ACF and the per-scan metric caches.
+    """
+    if highpass is not None and lowpass is not None:
+        return f'bp-{highpass}-{lowpass}hz'
+    if highpass is not None:
+        return f'hp-{highpass}hz'
+    if lowpass is not None:
+        return f'lp-{lowpass}hz'
+    return None
+
+
+def rest_variant_of(scan_keys):
+    """The rest source a set of scan keys was loaded from: the ``desc`` of its rest scans.
+
+    ``DataLoader.register_scans`` writes a non-default rest_variant into every rest scan's ``desc``
+    and so into its key, which is how a :class:`Timescales` knows what it was handed without a
+    second setting that could disagree with the loader.
+
+    Raises
+    ------
+    ValueError
+        If the rest scans carry more than one source.
+    """
+    variants = set()
+    for key in scan_keys:
+        kv = parse_scan_string(key)
+        if kv.get('condition') == 'rest':
+            variants.add(kv.get('desc') or REST_VARIANT_DEFAULT)
+    if len(variants) > 1:
+        raise ValueError(f'rest scans from more than one rest source: {sorted(variants)}. One '
+                         'Timescales holds one rest source, so its outputs carry one name.')
+    return variants.pop() if variants else REST_VARIANT_DEFAULT
+
+
+def rest_variant_output_type(base, rest_variant):
+    """Add the rest-source token to a stat name, e.g. ``autocorr`` -> ``autocorr_noFIX``.
+
+    The token goes directly after the stat name, ahead of the frequency-filter token, because the input file precedes every processing step. The default source adds nothing,
+    so its names are unchanged.
+    """
+    return base if rest_variant == REST_VARIANT_DEFAULT else f'{base}_{rest_variant}'
+
+
 def rest_window_output_type(base, match):
     """Append the length-matched-rest token, e.g. ``autocorr`` -> ``autocorr_restlen-CARIT``.
 
     Same last slot as ``_resids`` and ``_restctrl``: a file is at most one of them. ``base``
-    must already carry ``_resampled`` and any frequency-filter token.
+    must already carry any frequency-filter token.
     """
     return f'{base}_{rest_window_token(match)}'
 
@@ -166,8 +211,8 @@ def rest_window_covered(dataset, modality, match=None):
 def rest_window_match_for(dataset, task):
     """The match whose windows are as long as ``task``, e.g. ``('HCP-D', 'tfMRICARITPA') -> 'CARIT'``.
 
-    The one place a consumer turns the task it analyses into the rest it contrasts it with, so fig3,
-    fig4 and hcpd_behavior cannot pick different windows for the same task.
+    The one place a consumer turns the task it analyses into the rest it contrasts it with, so fig2,
+    fig3 and fig4 cannot pick different windows for the same task.
 
     Raises
     ------
@@ -225,7 +270,7 @@ class Timescales(DataLoader):
     -----
     Output filenames are built by :meth:`_get_output_filepath` from the scan's identifying fields
     plus an ``output_type`` tag. The tag encodes the processing that produced the file
-    (``_resids``, ``_resampled``, a frequency-filter token), so variants coexist on disk rather
+    (``_resids``, a frequency-filter token), so variants coexist on disk rather
     than overwriting one another. Renaming a tag orphans its cache.
     """
 
@@ -265,7 +310,19 @@ class Timescales(DataLoader):
             print(f"\n\tInitialized Timescales for dataset: {dataset}")
             if timeseries_data is not None:
                 print(f"\tNumber of scans: {len(self.scans)}")
+                print(f"\tRest source: {self.rest_variant}")
             print(f"\tOutput directory: {self.output_dir}")
+
+    @property
+    def rest_variant(self):
+        """Rest source of the scans held (see :func:`rest_variant_of`).
+
+        Under a non-default source every output this processor writes is rest-derived and carries
+        the token (:func:`rest_variant_output_type`): task scans are skipped where they would
+        otherwise be written, and task residuals are refused, since neither depends on the rest
+        source and the default-source run already caches them.
+        """
+        return rest_variant_of(getattr(self, 'scans', ()))
 
     # ============== Save/Load Infrastructure ==============
     def _get_output_filepath(
@@ -514,6 +571,7 @@ class Timescales(DataLoader):
         """
         results = dict.fromkeys(self.scans)
         n_loaded = n_computed = n_failed = 0
+        rest_only = self.rest_variant != REST_VARIANT_DEFAULT
 
         for scan_key in tqdm(self.scans, desc=f"Computing {output_type}"):
             kv_dict = self._parse_scan_string(scan_key)
@@ -533,6 +591,11 @@ class Timescales(DataLoader):
                 continue
             # Likewise only covered rest scans have a length-matched window.
             if use_rest_window is not None and scan_key not in self.rest_window_span[use_rest_window]:
+                results[scan_key] = None
+                continue
+            # Under a non-default rest source only rest-derived series are written: a task scan's own
+            # series does not depend on it. Its control does, and is kept.
+            if rest_only and use_rest_control is None and condition != 'rest':
                 results[scan_key] = None
                 continue
 
@@ -594,6 +657,25 @@ class Timescales(DataLoader):
 
         return results
 
+    def _check_rest_variant(self, use_residuals):
+        """Raise when task residuals are requested under a non-default rest source."""
+        if use_residuals and self.rest_variant != REST_VARIANT_DEFAULT:
+            raise ValueError(
+                f'use_residuals under rest_variant {self.rest_variant!r}: a task residual does not '
+                f'depend on the rest source, and the {REST_VARIANT_DEFAULT!r} run already caches it.')
+
+    def _check_rest_window(self, use_rest_window):
+        """Raise unless ``use_rest_window`` names a match :meth:`resolve_rest_windows` has resolved."""
+        if not isinstance(use_rest_window, str):
+            raise ValueError(f'use_rest_window takes the name of a matched task (one of '
+                             f'{list(rest_window_matches(self.dataset))}), not {use_rest_window!r}')
+        if getattr(self, 'rest_window_span', None) is None:
+            raise ValueError('no length-matched rest windows; call resolve_rest_windows() '
+                             'before requesting use_rest_window')
+        if use_rest_window not in self.rest_window_span:
+            raise ValueError(f'no length-matched rest windows named {use_rest_window!r} for '
+                             f'{self.dataset}; resolved: {sorted(self.rest_window_span)}')
+
     def compute_autocorrelation_function(
         self,
         use_fft: bool = False,
@@ -605,7 +687,6 @@ class Timescales(DataLoader):
         use_rest_window: str = None,
         lowpass: float = None,
         highpass: float = None,
-        resampled: bool = False,
         verbose: bool = True,
     ):
         """Compute (or load) the ACF for every scan into self.autocorr_dict.
@@ -629,34 +710,30 @@ class Timescales(DataLoader):
         use_rest_control : {'full', 'drift'} or None
             Cache the matched rest control instead, appending ``_restctrl`` / ``_restctrl-drift``.
             The ACFs come from :meth:`build_rest_controls`; this call caches them and writes their
-            metadata. The control inherits ``resampled`` and the frequency-filter tokens from this
+            metadata. The control inherits the frequency-filter token from this
             call, so pass the same values used for the task side -- a control built without them
             is silently comparing unlike things.
         use_rest_window : str or None
             Cache the rest windows matched to this task name instead (e.g. ``'CARIT'``), appending
             ``_restlen-CARIT``. Requires :meth:`resolve_rest_windows`; call once per match. Each
             window goes through the same ``compute_acf`` call as full-length rest, so the two
-            cannot drift apart. Inherits ``resampled`` and the frequency-filter tokens from this
+            cannot drift apart. Inherits the frequency-filter token from this
             call, as the controls do.
+
+            Under a non-default :attr:`rest_variant` every name carries its token after
+            ``autocorr`` (e.g. ``autocorr_noFIX_restctrl``), and ``use_residuals`` raises.
         lowpass, highpass : float or None
             Used only for output naming (see above).
-        resampled : bool
-            Used only for output naming: append '_resampled' so ACFs computed from
-            TR-resampled timeseries are stored separately from native-TR ACFs.
         verbose : bool
             Print summary counts.
         """
-        # Token order mirrors the processing order: resampling is applied before
-        # filtering, so '_resampled' precedes the frequency-filter token.
-        output_type = 'autocorr'
-        if resampled:
-            output_type = f'{output_type}_resampled'
-        if highpass is not None and lowpass is not None:
-            output_type = f'{output_type}_bp-{highpass}-{lowpass}hz'
-        elif highpass is not None:
-            output_type = f'{output_type}_hp-{highpass}hz'
-        elif lowpass is not None:
-            output_type = f'{output_type}_lp-{lowpass}hz'
+        # Token order mirrors the processing order: the rest source is chosen first, so its token
+        # precedes the frequency-filter token.
+        self._check_rest_variant(use_residuals)
+        output_type = rest_variant_output_type('autocorr', self.rest_variant)
+        filter_token = frequency_filter_token(highpass, lowpass)
+        if filter_token:
+            output_type = f'{output_type}_{filter_token}'
         if suffix:
             output_type = f'{output_type}_{suffix}'
         if use_residuals and use_rest_control is not None:
@@ -671,15 +748,7 @@ class Timescales(DataLoader):
                 raise ValueError('use_rest_window is mutually exclusive with use_residuals and '
                                  'use_rest_control: a file is a task residual, a rest control or '
                                  'a length-matched rest window, never two of them')
-            if not isinstance(use_rest_window, str):
-                raise ValueError(f'use_rest_window takes the name of a matched task (one of '
-                                 f'{list(rest_window_matches(self.dataset))}), not {use_rest_window!r}')
-            if getattr(self, 'rest_window_span', None) is None:
-                raise ValueError('no length-matched rest windows; call resolve_rest_windows() '
-                                 'before requesting use_rest_window')
-            if use_rest_window not in self.rest_window_span:
-                raise ValueError(f'no length-matched rest windows named {use_rest_window!r} for '
-                                 f'{self.dataset}; resolved: {sorted(self.rest_window_span)}')
+            self._check_rest_window(use_rest_window)
             output_type = rest_window_output_type(output_type, use_rest_window)
 
         # lowpass/highpass are used for output naming only; filtering is applied at load time via load_batch
@@ -727,7 +796,7 @@ class Timescales(DataLoader):
 
     def compute_timescale_measures(
         self,
-        method: str = 'zero_crossing',
+        method: str = INT_METHOD,
         force_recompute: bool = False,
         save_outputs: bool = True,
         suffix: str = None,
@@ -740,10 +809,13 @@ class Timescales(DataLoader):
         self.autocorr_dict, storing results in self.timescales_dict (with disk
         caching). Requires compute_autocorrelation_function to have been run.
 
+        Under a non-default :attr:`rest_variant` the name carries its token after the stat name
+        (``timescale_{method}_noFIX[_{suffix}]``); ``suffix`` is passed exactly as for the default.
+
         Parameters
         ----------
         method : str
-            Key into TIMESCALE_METHODS (e.g. 'zero_crossing', 'auc_zero_crossing').
+            Key into TIMESCALE_METHODS. Defaults to :data:`INT_METHOD`, the estimator the analyses use.
         force_recompute : bool
             Ignore cached files and recompute.
         save_outputs : bool
@@ -766,7 +838,7 @@ class Timescales(DataLoader):
             )
         method_fn = TIMESCALE_METHODS[method]
 
-        output_type = f'timescale_{method}'
+        output_type = rest_variant_output_type(f'timescale_{method}', self.rest_variant)
         if suffix:
             output_type = f'{output_type}_{suffix}'
 
@@ -846,13 +918,22 @@ class Timescales(DataLoader):
         force_recompute: bool = False,
         save_outputs: bool = True,
         use_residuals: bool = False,
-        resampled: bool = False,
+        use_rest_window: str = None,
+        lowpass: float = None,
+        highpass: float = None,
         verbose: bool = True,
     ):
         """Compute a per-scan timeseries metric into self.data_dict.
 
         Supports 'tsnr' (temporal SNR) and 'var' (temporal variance), applied per
-        scan via _run_for_all_scans with disk caching.
+        scan via _run_for_all_scans with disk caching. The output_type is built exactly as
+        :meth:`compute_autocorrelation_function` builds the ACF's, so a metric and the ACF of the
+        same series carry the same tokens: ``metric_{method}[_{rest_variant}][_{filter}]
+        [_resids | _restlen-<task>]``. An unfiltered name is unchanged by the filter token's existence,
+        and a default-source name by the rest-variant token's.
+
+        tSNR is degenerate on every series this pipeline produces -- the loader's detrend and
+        global-signal regression leave a ~zero mean -- so only 'var' is meaningful here.
 
         Parameters
         ----------
@@ -864,17 +945,28 @@ class Timescales(DataLoader):
             Persist results to disk.
         use_residuals : bool
             Use self.timeseries_residuals for task scans instead of raw timeseries.
-        resampled : bool
-            Used only for output naming: append '_resampled' so metrics computed from
-            TR-resampled timeseries are stored separately from native-TR metrics.
+        use_rest_window : str or None
+            Compute on the rest windows matched to this task (e.g. ``'CARIT'``) instead, appending
+            ``_restlen-CARIT``; as for the ACF, requires :meth:`resolve_rest_windows`, covers only
+            the rest scans with a window, and is mutually exclusive with ``use_residuals``.
+        lowpass, highpass : float or None
+            Used only for output naming, as for the ACF: the filter was applied at load time.
         verbose : bool
             Print summary counts.
         """
-        output_type = f'metric_{method}'
-        if resampled:
-            output_type = f'{output_type}_resampled'
+        self._check_rest_variant(use_residuals)
+        output_type = rest_variant_output_type(f'metric_{method}', self.rest_variant)
+        filter_token = frequency_filter_token(highpass, lowpass)
+        if filter_token:
+            output_type = f'{output_type}_{filter_token}'
+        if use_residuals and use_rest_window is not None:
+            raise ValueError('use_residuals and use_rest_window are mutually exclusive: a metric is '
+                             'of a task residual or of a length-matched rest window, never both')
         if use_residuals:
             output_type = f'{output_type}_resids'
+        if use_rest_window is not None:
+            self._check_rest_window(use_rest_window)
+            output_type = rest_window_output_type(output_type, use_rest_window)
 
         _METRIC_FNS = {
             'tsnr': calculate_tsnr,
@@ -891,6 +983,7 @@ class Timescales(DataLoader):
             compute_fn=_compute,
             output_type=output_type,
             use_residuals=use_residuals,
+            use_rest_window=use_rest_window,
             force_recompute=force_recompute,
             save_outputs=save_outputs,
             verbose=verbose,
@@ -901,7 +994,7 @@ class Timescales(DataLoader):
         """Regress task-evoked structure out of every task scan's timeseries.
 
         For each task scan, builds a nilearn design matrix from its events
-        (HRF-convolved for fMRI; raw for MEG), fits a per-region GLM, and keeps the
+        (HRF-convolved, with a cosine drift basis), fits a per-region GLM, and keeps the
         residuals. Also stores the events, design matrices, per-condition beta
         contrast maps, the flattened (all-conditions-merged) task regressor, and its
         ACF. Rest scans and any failures are stored as None.
@@ -922,7 +1015,7 @@ class Timescales(DataLoader):
         task_events_acf = dict().fromkeys(self.timeseries_data)
         task_contrasts = dict().fromkeys(self.timeseries_data)
 
-        for scan_key in tqdm(self.scans, desc=f"Regressing task structure out of timeseries"):
+        for scan_key in tqdm(self.scans, desc="Regressing task structure out of timeseries"):
             # Parse scan key
             kv_dict = self._parse_scan_string(scan_key)
             condition = kv_dict.get('condition', '')
@@ -934,12 +1027,8 @@ class Timescales(DataLoader):
                     timeseries = self.timeseries_data[scan_key]
                     n_timepoints = timeseries.shape[1]
 
-                    if modality == 'MEG':
-                        hrf_model = None
-                        drift_model = None
-                    elif modality == 'MRI3T' or modality == 'MRI7T':
-                        hrf_model = 'glover'
-                        drift_model = 'cosine'
+                    hrf_model = 'glover'
+                    drift_model = 'cosine'
 
                     # Reconstruct ScanInfo so get_task_events receives the correct type.
                     scan_info = ScanInfo(
@@ -1205,8 +1294,7 @@ class Timescales(DataLoader):
                         # length, so a sliced drift column is not the basis for this window.
                         design = create_design_matrix_nilearn(
                             events, n_frames, tr,
-                            hrf_model=None if modality == 'MEG' else 'glover',
-                            drift_model=None if modality == 'MEG' else 'cosine')
+                            hrf_model='glover', drift_model='cosine')
                     window = np.asarray(rest_scan, dtype=float)[
                         :, offset_frames:offset_frames + n_frames]
 
@@ -1578,8 +1666,8 @@ def drift_only_control(raw_data, design_matrix, tr, int_method='auc_zero_crossin
     }
 
 
-#: Phase-encoding tokens a task name may end in. Matched case-sensitively: UCLA's ``scap`` ends
-#: in a lowercase "ap" and is not an AP-encoded scan.
+#: Phase-encoding tokens a task name may end in. Matched case-sensitively: a task named e.g. ``scap``
+#: ends in a lowercase "ap" and is not an AP-encoded scan.
 PE_DIRECTIONS = ('LR', 'RL', 'AP', 'PA')
 
 #: Control kind -> (output_type token, ``control_kind`` metadata value).
@@ -1597,7 +1685,7 @@ def phase_encoding_direction(task):
     """Phase-encoding direction of a task name, or None when it does not encode one.
 
     Read as the last two characters, case-sensitively, which is what separates HCP's
-    ``tfMRIGUESSINGPA`` (PA-encoded) from UCLA's ``scap`` (not AP-encoded). Datasets whose task
+    ``tfMRIGUESSINGPA`` (PA-encoded) from a task named e.g. ``scap`` (not AP-encoded). Datasets whose task
     names carry no direction (``rest``, ``nback``, ``reversallearning``) return None and pair by
     index instead -- see :func:`pair_rest_runs`.
 
@@ -1621,7 +1709,7 @@ def condition_of(task):
     Uses :data:`TASK_RUN_GROUPS` and :data:`MOVIE_GROUP` -- the same lists
     :func:`_apply_scan_groupings` averages by -- so a control is always built for the grouping the
     notebooks actually use. A run that belongs to no group is its own condition, which is the
-    right answer for single-run datasets (Penn LEAD's ``nback``, PNC's ``frac2back``).
+    right answer for single-run datasets (Penn LEAD's ``nback``).
 
     Parameters
     ----------
@@ -1637,6 +1725,24 @@ def condition_of(task):
         if task in runs:
             return condition
     return f'task-{task}'
+
+
+def condition_runs(condition, runs):
+    """The runs among ``runs`` that a notebook's grouping turns into ``condition``.
+
+    The inverse of :func:`condition_of`: a run belongs to ``condition`` when that is its group, or
+    when it is the condition itself because the notebook keeps it ungrouped (HCP-D's
+    ``tfMRICARITPA``, Penn LEAD's ``nback``).
+
+    Raises
+    ------
+    ValueError
+        If no run in ``runs`` makes up ``condition`` (e.g. ``'task-Tasks'``, which pools every 3T task).
+    """
+    out = [r for r in runs if r == condition or condition_of(r) == condition]
+    if not out:
+        raise ValueError(f'no run in {sorted(runs)} makes up condition {condition!r}')
+    return out
 
 
 def pair_rest_runs(task_runs, rest_runs):
@@ -1709,9 +1815,8 @@ def rest_control_output_type(base, kind):
     Parameters
     ----------
     base : str
-        Output type built so far, including any ``_resampled`` and frequency-filter tokens. Those
-        must already be present: a control that does not inherit them is silently comparing
-        unlike things.
+        Output type built so far, including any frequency-filter token. It must already be
+        present: a control that does not inherit it is silently comparing unlike things.
     kind : {'full', 'drift'}
         Which control.
 
@@ -1948,8 +2053,6 @@ def _apply_scan_groupings(
     average_7t_movies: bool = False,
     average_3t_task_pairs: bool = False,
     average_3t_tasks: bool = False,
-    average_meg_rest: bool = False,
-    average_meg_task: bool = False,
     statistic: str = 'mean',
 ) -> dict:
     """
@@ -1995,8 +2098,6 @@ def _apply_scan_groupings(
     _7t_rest_tasks  = REST_RUNS_7T
     _7t_movie_tasks = MOVIE_RUNS_7T
     _3t_task_pairs  = TASK_RUN_GROUPS
-    _meg_rest_tasks = REST_RUNS_MEG
-    _meg_task_tasks = TASK_RUNS_MEG
 
     if average_3t_rest:
         _avg_group(_keys_matching(_3t_rest_tasks), 'task-REST_3T')
@@ -2012,10 +2113,6 @@ def _apply_scan_groupings(
     if average_3t_tasks:
         all_3t_task_names = [t for pair, _ in _3t_task_pairs for t in pair]
         _avg_group(_keys_matching(all_3t_task_names), 'task-Tasks')
-    if average_meg_rest:
-        _avg_group(_keys_matching(_meg_rest_tasks), 'task-MEG_Rest')
-    if average_meg_task:
-        _avg_group(_keys_matching(_meg_task_tasks), 'task-MEG_Task')
 
     return out
 
@@ -2029,8 +2126,6 @@ def create_ints_dataframe_custom_grouping(
     average_7t_movies=False,
     average_3t_task_pairs=False,
     average_3t_tasks=False,
-    average_meg_rest=False,
-    average_meg_task=False,
     sort_by_median=False,
     statistic='mean',
 ):
@@ -2085,8 +2180,6 @@ def create_ints_dataframe_custom_grouping(
         average_7t_movies=average_7t_movies,
         average_3t_task_pairs=average_3t_task_pairs,
         average_3t_tasks=average_3t_tasks,
-        average_meg_rest=average_meg_rest,
-        average_meg_task=average_meg_task,
         statistic=statistic,
     )
 
@@ -2165,7 +2258,9 @@ def convert_data_dict(data_dict, scan_registry, brain_map=None, verbose=True):
         extracted_data = {key: data_dict[key] for key in sub_list if key in data_dict}
         extracted_data = np.array(list(extracted_data.values()))
 
-        if brain_map is not None:
+        # A task with no scans in data_dict (e.g. a comparator dict holding only its own runs) stays an
+        # empty array: there is nothing to bin.
+        if brain_map is not None and extracted_data.size:
             extracted_data = sort_and_group_timescales(extracted_data, brain_map)
 
         data_dict_converted[task] = extracted_data
@@ -2183,8 +2278,6 @@ def average_data_dict_converted(
     average_7t_movies=False,
     average_3t_task_pairs=False,
     average_3t_tasks=False,
-    average_meg_rest=False,
-    average_meg_task=False,
 ):
     """Average scan groups within a task-keyed dict produced by convert_data_dict."""
     # data_dict_converted is keyed by task name; values are (n_subjects, n_regions) arrays.
@@ -2200,6 +2293,4 @@ def average_data_dict_converted(
         average_7t_movies=average_7t_movies,
         average_3t_task_pairs=average_3t_task_pairs,
         average_3t_tasks=average_3t_tasks,
-        average_meg_rest=average_meg_rest,
-        average_meg_task=average_meg_task,
     )

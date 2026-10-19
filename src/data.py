@@ -9,9 +9,8 @@ import pandas as pd
 import nibabel as nib
 import yaml
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 from dataclasses import dataclass, field
-from fractions import Fraction
 from sklearn.linear_model import LinearRegression
 from collections import defaultdict
 
@@ -21,8 +20,12 @@ logger = logging.getLogger(__name__)
 
 _CONFIG_DIR = Path(__file__).parent / 'configs' / 'datasets'
 
+#: Rest source every dataset reads unless DATASET_PARAMS names another of its YAML's rest_variants.
+#: Its scans carry no ``desc`` and its outputs no rest-variant token.
+REST_VARIANT_DEFAULT = 'clean'
 
-def _find_project_root() -> Path:
+
+def project_root() -> Path:
     """Walk up from cwd looking for setup.py as a project root marker."""
     for parent in [Path.cwd(), *Path.cwd().parents]:
         if (parent / 'setup.py').exists():
@@ -45,13 +48,8 @@ class ModalityConfig:
     task_events_handler: Optional[str] = None
     task_events_file_template: Optional[str] = None
     task_events_use_glob: bool = False
-    use_glob: bool = False
     filename_template_fallbacks: List[str] = field(default_factory=list)
-    task_params: Dict[str, dict] = field(default_factory=dict)
-
-    def template_fields(self, task: str) -> dict:
-        """Extra template fields for ``task``: its ``task_params`` entry minus ``tr``."""
-        return {k: v for k, v in self.task_params.get(task, {}).items() if k != 'tr'}
+    rest_variants: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -63,7 +61,6 @@ class DatasetConfig:
     derivatives_subdir: str
     modalities: Dict[str, ModalityConfig]
     behavior_handler: Optional[str] = None
-    rbc: bool = False
     subject_id_rawdata_transform: Optional[str] = None
 
 
@@ -92,9 +89,8 @@ def load_dataset_config(dataset_name: str) -> DatasetConfig:
             task_events_handler=mod_raw.get('task_events_handler'),
             task_events_file_template=mod_raw.get('task_events_file_template'),
             task_events_use_glob=bool(mod_raw.get('task_events_use_glob', False)),
-            use_glob=bool(mod_raw.get('use_glob', False)),
             filename_template_fallbacks=mod_raw.get('filename_template_fallbacks') or [],
-            task_params={str(t): dict(p) for t, p in (mod_raw.get('task_params') or {}).items()},
+            rest_variants=[str(v) for v in (mod_raw.get('rest_variants') or [])],
         )
 
     return DatasetConfig(
@@ -104,7 +100,6 @@ def load_dataset_config(dataset_name: str) -> DatasetConfig:
         derivatives_subdir=raw['paths']['derivatives_subdir'],
         modalities=modalities,
         behavior_handler=(raw.get('behavior') or {}).get('handler'),
-        rbc=bool(raw.get('rbc', False)),
         subject_id_rawdata_transform=raw.get('subject_id_rawdata_transform'),
     )
 
@@ -134,7 +129,6 @@ class ScanInfo:
     run: Optional[str] = None
     desc: Optional[str] = None
     den: Optional[str] = None
-    rbc: Optional[bool] = False
 
     def __post_init__(self):
         self.condition = 'rest' if 'rest' in self.task.lower() else 'task'
@@ -173,7 +167,6 @@ class ScanInfo:
             'run': self.run,
             'desc': self.desc,
             'den': self.den,
-            'rbc': self.rbc,
             'stat': self.stat,
             'scan_string': str(self),
         }
@@ -184,7 +177,8 @@ class ScanInfo:
 
         Safe against both numeric NaN (float) and the string 'nan' that pandas
         produces when a column is read with dtype=str and the cell was empty.
-        Also handles bool fields correctly when they arrive as strings ('True'/'False').
+        Columns this class no longer has (e.g. the ``rbc`` flag of older registries)
+        are ignored.
         """
         def _opt(val) -> Optional[str]:
             """Return None for any flavour of missing, else the string value."""
@@ -198,19 +192,6 @@ class ScanInfo:
             s = str(val)
             return None if s in ('nan', 'None', '') else s
 
-        def _bool(val) -> bool:
-            """Parse bool fields that may arrive as Python bool or as strings."""
-            if isinstance(val, bool):
-                return val
-            if isinstance(val, str):
-                return val.strip().lower() == 'true'
-            try:
-                if pd.isna(val):
-                    return False
-            except (TypeError, ValueError):
-                pass
-            return bool(val)
-
         return cls(
             subject_id=str(d['sub']),
             task=str(d['task']),
@@ -223,7 +204,6 @@ class ScanInfo:
             run=_opt(d.get('run')),
             desc=_opt(d.get('desc')),
             den=_opt(d.get('den')),
-            rbc=_bool(d.get('rbc', False)),
         )
 
 
@@ -231,10 +211,7 @@ class ScanInfo:
 # Behavior handlers
 # ==============================================================================
 
-# HCP-YA head motion. The S1200 release writes one scalar per run to
-# MNINonLinear/Results/<run>/Movement_RelativeRMS_mean.txt -- the mean *relative RMS
-# displacement* in mm. That is not Power's framewise displacement, so the columns are named
-# meanRelRMS_* rather than meanFD_* and should be reported as such.
+# HCP-YA head motion files
 HCPYA_MOVEMENT_FILE = 'Movement_RelativeRMS_mean.txt'
 HCPYA_MOVEMENT_CACHE = 'hcpya_movement_relativerms.csv'
 
@@ -418,8 +395,7 @@ def _hcpd_self_report(df: pd.DataFrame) -> pd.Series:
 
 
 def _behavior_hcp_d(loader: 'DataLoader') -> pd.DataFrame:
-    beh_dir  = loader.config.base_path / 'behavior'
-    proc_dir = loader.rawdata_dir  # .../HCP_D/processed
+    beh_dir = loader.config.base_path / 'behavior'
 
     # --- Demographics ---
     df = pd.read_csv(beh_dir / 'socdem01.txt', skiprows=[1], delimiter='\t',
@@ -606,40 +582,6 @@ def load_hcpd_carit(loader: 'DataLoader', force: bool = False) -> pd.DataFrame:
     return df
 
 
-def _behavior_pnc_rbc(loader: 'DataLoader') -> pd.DataFrame:
-    base = loader.config.base_path
-    df = pd.read_csv(base / 'study-PNC_desc-participants.tsv', index_col=0, delimiter='\t')
-    df['sex'] = (df['sex'] == 'Male').astype(int)
-    df.index = df.index.astype(str)
-    df.index.name = 'subject_id'
-
-    df_qc = pd.read_csv(base / 'study-PNC_desc-functional_qc.tsv', sep='\t', dtype={'participant_id': str})
-    df_qc = df_qc[df_qc['task'] != 'idemo']
-    exclude_cols = ['normCrossCorrExclude', 'motionExclude', 'fmriExclude']
-    df_qc = df_qc.loc[(df_qc[exclude_cols] == 0).all(axis=1)]
-    has_rest = set(df_qc.loc[df_qc['task'] == 'rest', 'participant_id'])
-    has_frac2back = set(df_qc.loc[df_qc['task'] == 'frac2back', 'participant_id'])
-    passing_ids = has_rest & has_frac2back
-
-    df_qc = df_qc[df_qc['participant_id'].isin(passing_ids)]
-    df_qc = df_qc.groupby(['participant_id', 'task'])['meanFD'].mean().reset_index()
-    rest_rms = df_qc[df_qc['task'] == 'rest'].set_index('participant_id')['meanFD'].rename('meanRelRMS_rest')
-    frac2back_rms = df_qc[df_qc['task'] == 'frac2back'].set_index('participant_id')['meanFD'].rename('meanRelRMS_frac2back')
-    df_qc_final = pd.concat([rest_rms, frac2back_rms], axis=1)
-    df_qc_final.index.name = 'subject_id'
-
-    df = df.loc[df_qc_final.index]
-    df = pd.merge(df, df_qc_final, left_index=True, right_index=True)
-
-    # True framewise displacement, from the same per-run QC files every other XCP-D dataset uses.
-    motion = xcpd_motion_columns(loader)
-    if motion.empty:
-        logger.warning("No PNC per-run motion found; meanFD columns not added (meanRelRMS_* "
-                       "from the study QC table are still present).")
-        return df
-    return df.join(motion, how='left')
-
-
 #: In-scanner n-back performance carried per session in ``sub-*_sessions.tsv``.
 PENN_LEAD_DPRIME = {'0_back_dprime': 'dprime_0back', '2_back_dprime': 'dprime_2back'}
 
@@ -692,24 +634,11 @@ def _behavior_penn_lead(loader: 'DataLoader') -> pd.DataFrame:
 XCPD_MOTION_CACHE = '{dataset}_motion_xcpd.csv'
 XCPD_QC_FIELDS = ('mean_fd', 'mean_relative_rms', 'max_relative_rms',
                   'num_censored_volumes', 'num_retained_volumes')
-#: Optional keys: ``runs`` keeps only these run labels, ``exclude_acq`` drops these acq labels, so
-#: the covariate describes the runs the analysis reads. Penn_LEAD analyses rest run-01 only (522
-#: frames, before the n-back); run-02 is 383 frames and acquired after it, and CuBIDS's
-#: VARIANTNumVolumes runs are wrong-length runs the loader never picks up.
+#: Optional keys: ``runs`` keeps only these run labels, ``exclude_acq`` drops these acq labels.
 XCPD_MOTION_SPEC = {
-    'AOMIC_PIOP1': dict(rest_task='restingstate', task_tasks=None,           per_session=False, alias_session=None),
-    'AOMIC_PIOP2': dict(rest_task='restingstate', task_tasks=None,           per_session=False, alias_session=None),
-    'WAND':        dict(rest_task='rest',         task_tasks=None,           per_session=False, alias_session=None),
-    'PNC':         dict(rest_task='rest',         task_tasks=('frac2back',), per_session=False, alias_session=None),
-    'Penn_LEAD':   dict(rest_task='rest',         task_tasks=('nback',),     per_session=True,  alias_session='1',
-                        runs=('01',), exclude_acq=('VARIANTNumVolumes',)),
-    # TCP's runs are relabelled to their registry names first (see _registry_task_labels), so its
-    # two rest runs per direction stay apart rather than averaging pre- and post-task rest.
-    # meanFD_rest is the pre-task rest the matched controls are cut from; meanFD_task the primary
-    # task, stroop. The other runs keep their own meanFD_<task> columns.
-    'TCP':         dict(rest_task=('rest1AP', 'rest1PA'), task_tasks=('stroopAP', 'stroopPA'),
-                        per_session=False, alias_session=None,
-                        aliases={'meanFD_rest_post': ('rest2AP', 'rest2PA')}),
+    'WAND':      dict(rest_task='rest', task_tasks=None,       per_session=False, alias_session=None),
+    'Penn_LEAD': dict(rest_task='rest', task_tasks=('nback',), per_session=True,  alias_session='1',
+                      runs=('01',), exclude_acq=('VARIANTNumVolumes',)),
 }
 
 
@@ -723,24 +652,10 @@ def _qc_entities(filename: str) -> dict:
     return dict(re.findall(r'([a-zA-Z]+)-([a-zA-Z0-9]+)', filename))
 
 
-def _registry_task_labels(loader: 'DataLoader') -> Dict[Tuple[str, str], str]:
-    """``(bids_task, run) -> registry task name``, from the YAML's ``task_params``.
-
-    Only a dataset whose registry renames its BIDS runs (TCP: ``restAP`` run-02 -> ``rest2AP``)
-    has entries; for every other dataset this is empty and a QC row keeps its BIDS task name.
-    """
-    config = getattr(loader, 'config', None)
-    if config is None or 'MRI3T' not in config.modalities:
-        return {}
-    return {(p['bids_task'], str(p['run'])): task
-            for task, p in config.modalities['MRI3T'].task_params.items() if 'bids_task' in p}
-
-
 def load_xcpd_motion(loader: 'DataLoader', force: bool = False) -> pd.DataFrame:
     """Per-run head motion for every subject of an XCP-D-processed dataset, one row per run.
 
-    Shared by AOMIC-PIOP1/PIOP2, WAND, PNC, Penn_LEAD and TCP, whose XCP-D outputs carry the same
-    ``*_desc-linc_qc.tsv`` file.
+    Shared by WAND and Penn_LEAD, whose XCP-D outputs carry the same ``*_desc-linc_qc.tsv`` file.
 
     Returns
     -------
@@ -772,8 +687,8 @@ def load_xcpd_motion(loader: 'DataLoader', force: bool = False) -> pd.DataFrame:
             ent = _qc_entities(path.name)
             rec = {'subject_id': ent.get('sub'), 'session': ent.get('ses'),
                    'task': ent.get('task'), 'run': ent.get('run'), 'acq': ent.get('acq')}
-            for field in XCPD_QC_FIELDS:
-                rec[field] = float(qc.iloc[0][field]) if field in qc.columns else np.nan
+            for qc_field in XCPD_QC_FIELDS:
+                rec[qc_field] = float(qc.iloc[0][qc_field]) if qc_field in qc.columns else np.nan
             rows.append(rec)
 
     df = pd.DataFrame(rows)
@@ -798,13 +713,8 @@ def xcpd_motion_columns(loader: 'DataLoader', force: bool = False) -> pd.DataFra
                                  longitudinal sample into one number. The per-session columns below
                                  are where the other sessions live.
     ``meanFD_<task>_ses<N>``     per session, for datasets with ``per_session`` set
-    ``meanFD_rest``              the dataset's rest task (from ``alias_session`` when set); the
-                                 mean over them where ``rest_task`` names several (TCP)
+    ``meanFD_rest``              the dataset's rest task (from ``alias_session`` when set)
     ``meanFD_task``              mean over its analysed non-rest tasks (likewise)
-    ``<alias>``                  each ``aliases`` entry of the spec: the mean over its tasks
-
-    Tasks are the REGISTRY's names (:func:`_registry_task_labels`), so a dataset that renames its
-    BIDS runs (TCP) gets one column per registry run rather than a mean over same-named runs.
 
     ``meanFD_rest`` and ``meanFD_task`` are what :func:`src.gams.build_nuisance` reads by default.
     They are kept separate rather than averaged into one number for the reason given in
@@ -822,9 +732,6 @@ def xcpd_motion_columns(loader: 'DataLoader', force: bool = False) -> pd.DataFra
         long = long[long['run'].isin(spec['runs'])]
     if spec.get('exclude_acq'):
         long = long[~long['acq'].isin(spec['exclude_acq'])]
-    labels = _registry_task_labels(loader)
-    if labels:
-        long = long.assign(task=[labels.get((t, r), t) for t, r in zip(long['task'], long['run'])])
 
     # Runs (and XCP-D's acq variants) collapse first, so a task has one value per session.
     per_ses = (long.groupby(['subject_id', 'session', 'task'], dropna=False)['mean_fd']
@@ -846,45 +753,17 @@ def xcpd_motion_columns(loader: 'DataLoader', force: bool = False) -> pd.DataFra
                 return named
         return f'meanFD_{task}'
 
-    rest_tasks = ((spec['rest_task'],) if isinstance(spec['rest_task'], str)
-                  else tuple(spec['rest_task']))
-    rest_cols = [c for c in (_column(t) for t in rest_tasks) if c in out.columns]
-    if len(rest_cols) == 1:
-        out['meanFD_rest'] = out[rest_cols[0]]
-    elif rest_cols:
-        out['meanFD_rest'] = out[rest_cols].mean(axis=1)
+    rest_col = _column(spec['rest_task'])
+    if rest_col in out.columns:
+        out['meanFD_rest'] = out[rest_col]
     task_names = (spec['task_tasks'] if spec['task_tasks'] is not None
-                  else sorted({t for t in per_ses['task'].unique() if t not in rest_tasks}))
+                  else sorted({t for t in per_ses['task'].unique() if t != spec['rest_task']}))
     task_cols = [c for c in (_column(t) for t in task_names) if c in out.columns]
     if task_cols:
         out['meanFD_task'] = out[task_cols].mean(axis=1)
-    for alias, tasks in (spec.get('aliases') or {}).items():
-        cols = [c for c in (_column(t) for t in tasks) if c in out.columns]
-        if cols:
-            out[alias] = out[cols].mean(axis=1)
 
     out.index.name = 'subject_id'
     return out
-
-
-def _behavior_aomic(loader: 'DataLoader') -> pd.DataFrame:
-    """AOMIC (PIOP1 / PIOP2) demographics, questionnaires and per-run head motion.
-
-    """
-    df = pd.read_csv(loader.config.base_path / 'participants.tsv', delimiter='\t')
-    df.rename(columns={'participant_id': 'subject_id'}, inplace=True)
-    df['subject_id'] = [s.split('-')[1] if str(s).startswith('sub-') else str(s)
-                        for s in df['subject_id']]
-    # Match the coding every other handler uses (M -> 1). Missing sex stays NaN rather than
-    # becoming 0, which an == comparison would silently produce.
-    df['sex'] = df['sex'].map({'M': 1, 'F': 0})
-    df.set_index('subject_id', inplace=True)
-
-    motion = xcpd_motion_columns(loader)
-    if motion.empty:
-        logger.warning("No %s motion data found; meanFD columns not added.", loader.dataset)
-        return df
-    return df.join(motion, how='left')
 
 
 def _behavior_wand(loader: 'DataLoader') -> pd.DataFrame:
@@ -907,77 +786,11 @@ def _behavior_wand(loader: 'DataLoader') -> pd.DataFrame:
     return df.join(motion, how='left')
 
 
-#: demos.tsv columns carried into the TCP behaviour table, verbatim or renamed.
-TCP_DEMOS_COLUMNS = {'Primary_Dx': 'dx_primary', 'Non-Primary_Dx': 'dx_nonprimary',
-                     'Active Psychosis': 'active_psychosis',
-                     'meds_yes_no': 'meds_any_raw', 'psych_meds': 'psych_meds_raw'}
-
-
-def _behavior_tcp(loader: 'DataLoader') -> pd.DataFrame:
-    """TCP demographics, clinical group, diagnoses, medication and per-run head motion.
-
-    ``group`` is the release's ``Patient`` / ``GenPop``; ``patient`` codes it 1 / 0. The diagnosis
-    columns are the release's FREE TEXT (``BP1`` and ``BPI``, ``past MDD`` and ``Past MDD``, ...),
-    kept verbatim: turning them into diagnostic classes is an analysis decision, not a loading one.
-    Several ``Patient`` rows carry only past diagnoses.
-
-    Medication: ``demos.tsv`` has no definitions file, so the 1 / 2 coding of ``meds_yes_no`` and
-    ``psych_meds`` is INFERRED from the cross-tab with group -- 89 of 95 GenPop are 1 on
-    ``psych_meds``, 80 of 140 coded patients are 2 -- as 1 = no, 2 = yes. ``meds_any`` and
-    ``psych_meds`` carry that reading (1 = yes); the ``*_raw`` columns keep the release's codes.
-    """
-    base = loader.config.base_path
-    df = pd.read_csv(base / 'participants.tsv', delimiter='\t')
-    df['subject_id'] = [s.split('-')[1] if str(s).startswith('sub-') else str(s)
-                        for s in df['participant_id']]
-    # Match the coding every other handler uses (M -> 1). Missing sex stays NaN rather than
-    # becoming 0, which an == comparison would silently produce.
-    df['sex'] = df['sex'].map({'M': 1, 'F': 0})
-    df = df.rename(columns={'Site': 'site', 'Group': 'group'})
-    df['patient'] = df['group'].map({'Patient': 1, 'GenPop': 0})
-    df = df[['subject_id', 'age', 'sex', 'site', 'group', 'patient']].set_index('subject_id')
-
-    # demos.tsv is comma-separated despite its name, Latin-1 encoded, and carries NDA's
-    # 'demos,1' line above the header; 999 is missing. Its subjectkey is NDAR_INV..., the
-    # registry's id with the underscore.
-    demos = pd.read_csv(base / 'phenotype' / 'demos.tsv', skiprows=[0], encoding='latin-1',
-                        na_values=[HCPD_SENTINEL, str(HCPD_SENTINEL)], low_memory=False)
-    demos['subject_id'] = demos['subjectkey'].str.replace('_', '', regex=False)
-    demos = demos.set_index('subject_id')[list(TCP_DEMOS_COLUMNS)].rename(columns=TCP_DEMOS_COLUMNS)
-    for col in ('dx_primary', 'dx_nonprimary', 'active_psychosis'):
-        demos[col] = demos[col].astype('string').str.strip()
-    demos['meds_any'] = demos['meds_any_raw'].map({1: 0, 2: 1})
-    demos['psych_meds'] = demos['psych_meds_raw'].map({1: 0, 2: 1})
-    df = df.join(demos, how='left')
-
-    motion = xcpd_motion_columns(loader)
-    if motion.empty:
-        logger.warning("No TCP motion data found; meanFD columns not added.")
-        return df
-    return df.join(motion, how='left')
-
-
-def _behavior_hbn_rbc(loader: 'DataLoader') -> pd.DataFrame:
-    df = pd.read_csv(
-        loader.config.base_path / 'study-HBN_desc-participants.tsv',
-        index_col=0, delimiter='\t'
-    )
-    df['sex'] = (df['sex'] == 'Male').astype(int)
-    df.index = df.index.astype(str)
-    df.index.name = 'subject_id'
-    return df
-
-
 BEHAVIOR_HANDLERS = {
     'hcp_unrestricted_restricted': _behavior_hcp_unrestricted_restricted,
     'hcp_d': _behavior_hcp_d,
-    'pnc_rbc': _behavior_pnc_rbc,
     'penn_lead': _behavior_penn_lead,
-    'aomic_piop1': _behavior_aomic,
-    'aomic_piop2': _behavior_aomic,
     'wand': _behavior_wand,
-    'tcp': _behavior_tcp,
-    'hbn_rbc': _behavior_hbn_rbc,
 }
 
 
@@ -1007,22 +820,6 @@ def _events_hcp_fmri(loader: 'DataLoader', scan: ScanInfo) -> pd.DataFrame:
         )
     ev_dir = results_dir / contents[idx] / 'EVs'
     return get_task_events_fmri(str(ev_dir))
-
-
-def _events_hcp_meg(loader: 'DataLoader', scan: ScanInfo) -> pd.DataFrame:
-    rawdata_dir = loader.config.base_path / loader.config.rawdata_subdir
-    task = scan.task
-    subdir_str = f'{task[:1]}-{task[1:]}'
-    pattern = str(
-        rawdata_dir / scan.subject_id / 'unprocessed' / 'MEG'
-        / subdir_str / 'EPRIME'
-        / f'{scan.subject_id}_*_{task[1:]}_*.xlsx'
-    )
-    matches = glob.glob(pattern)
-    if not matches:
-        raise FileNotFoundError(f"MEG task events file not found: {pattern}")
-    events = get_task_events_meg(matches[0], verbose=False)
-    return events[['onset', 'duration', 'trial_type']]
 
 
 def _events_hcp_7t_movie(loader: 'DataLoader', scan: ScanInfo) -> pd.DataFrame:
@@ -1056,12 +853,8 @@ def _events_bids_tsv(loader: 'DataLoader', scan: ScanInfo) -> pd.DataFrame:
         func_dir = func_dir / f'ses-{scan.session}'
     func_dir = func_dir / 'func'
 
-    filename = mod_config.task_events_file_template.format(**{
-        **mod_config.template_fields(scan.task),
-        'subject_id': scan.subject_id,
-        'session': scan.session,
-        'task': scan.task,
-    })
+    filename = mod_config.task_events_file_template.format(
+        subject_id=scan.subject_id, session=scan.session, task=scan.task)
 
     if mod_config.task_events_use_glob:
         matches = glob.glob(str(func_dir / filename))
@@ -1074,112 +867,10 @@ def _events_bids_tsv(loader: 'DataLoader', scan: ScanInfo) -> pd.DataFrame:
         return pd.read_csv(func_dir / filename, sep='\t')
 
 
-def _events_ucla_bids_tsv(loader: 'DataLoader', scan: ScanInfo) -> pd.DataFrame:
-    """UCLA events loader with task-specific post-processing.
-
-    Handled tasks: stopsignal, bart, scap, pamenc, pamret. All return the three
-    BIDS columns onset/duration/trial_type with trial_type coerced to string so
-    nilearn's design matrix yields string-named regressor columns (numeric
-    trial_type codes, e.g. scap's load conditions, otherwise become np.int64
-    column labels that break downstream contrast handling).
-    """
-    mod_config = loader.config.modalities[scan.modality]
-    rawdata_dir = loader.config.base_path / loader.config.rawdata_subdir
-    func_dir = rawdata_dir / f'sub-{scan.subject_id}' / 'func'
-
-    filename = mod_config.task_events_file_template.format(
-        subject_id=scan.subject_id,
-        task=scan.task,
-    )
-    matches = glob.glob(str(func_dir / filename))
-    if not matches:
-        raise FileNotFoundError(f"No events file matched: {func_dir / filename}")
-
-    df = pd.read_csv(matches[0], sep='\t')
-
-    def _clean(events: pd.DataFrame) -> pd.DataFrame:
-        """Drop rows with missing timing/label and stringify trial_type."""
-        events = events[['onset', 'duration', 'trial_type']].dropna(
-            subset=['onset', 'duration', 'trial_type']
-        ).reset_index(drop=True)
-        events['trial_type'] = events['trial_type'].astype(str)
-        return events
-
-    if scan.task == 'bart':
-        # BART events are split across multiple rows per balloon trial; collapse
-        # each trial_number into a single event spanning its full duration.
-        rows = []
-        for _, trial in df[['onset', 'duration', 'trial_type', 'trial_number']].groupby('trial_number'):
-            trial = trial.reset_index(drop=True)
-            rows.append({
-                'onset': trial['onset'].iloc[0],
-                'duration': trial['duration'].sum(),
-                'trial_type': trial['trial_type'].iloc[0],
-            })
-        return _clean(pd.DataFrame(rows))
-    else:
-        # stopsignal, scap, pamenc, pamret: one row per trial already.
-        return _clean(df)
-
-
-#: Stroop stimulus duration in seconds (Chopra et al. 2025, Fig. 2a). The release's ``duration``
-#: column is NOT this: it runs to the next trial's onset, so the 78 trials tile the run from 2 s to
-#: 398 s and, used as given, congruent + incongruent would sum to a boxcar nearly collinear with
-#: the constant.
-TCP_STROOP_STIMULUS_SECONDS = 0.25
-
-
-def _events_tcp_bids_tsv(loader: 'DataLoader', scan: ScanInfo) -> pd.DataFrame:
-    """TCP events: the BIDS file, recoded into the regressors task regression should remove.
-
-    stroop
-        The nine trial types collapse to ``congruent`` (``con1-3``) and ``incongruent``
-        (``inc1-6``), each modelled at the 0.25 s stimulus (:data:`TCP_STROOP_STIMULUS_SECONDS`).
-        Error and no-response trials are kept: the aim is to remove every evoked response.
-    hammer (Emotional Faces)
-        ``face`` / ``shape`` trials as given (stimulus ~1.9 s), plus a ``cue`` event for each
-        block's 3 s "Match Faces" / "Match Shapes" screen, which the release carries only in the
-        ``cueStartTime`` / ``cueEndTime`` columns of each block's first trial.
-
-    Rest has no events file, so the underlying reader raises and rest resolves to None.
-    """
-    events = _events_bids_tsv(loader, scan)
-    bids_task = loader.config.modalities[scan.modality].template_fields(scan.task).get(
-        'bids_task', scan.task)
-
-    if bids_task.startswith('stroop'):
-        trial_type = events['trial_type'].astype(str)
-        out = pd.DataFrame({
-            'onset': events['onset'],
-            'duration': TCP_STROOP_STIMULUS_SECONDS,
-            'trial_type': np.where(trial_type.str.startswith('con'), 'congruent',
-                                   np.where(trial_type.str.startswith('inc'), 'incongruent', None)),
-        })
-        if out['trial_type'].isna().any():
-            raise ValueError(f"unexpected stroop trial_type in {scan}: "
-                             f"{sorted(set(trial_type[out['trial_type'].isna()]))}")
-    elif bids_task.startswith('hammer'):
-        trials = events[['onset', 'duration', 'trial_type']]
-        cues = events.dropna(subset=['cueStartTime', 'cueEndTime'])
-        cues = pd.DataFrame({'onset': cues['cueStartTime'],
-                             'duration': cues['cueEndTime'] - cues['cueStartTime'],
-                             'trial_type': 'cue'})
-        out = pd.concat([trials, cues], ignore_index=True)
-    else:
-        raise ValueError(f"no TCP events recoding for task {scan.task!r} ({bids_task})")
-
-    out = out.dropna(subset=['onset', 'duration', 'trial_type'])
-    out['trial_type'] = out['trial_type'].astype(str)
-    return out.sort_values('onset').reset_index(drop=True)
-
-
 TASK_EVENTS_HANDLERS = {
     'hcp_fmri': _events_hcp_fmri,
-    'hcp_meg': _events_hcp_meg,
     'hcp_7t_movie': _events_hcp_7t_movie,
     'bids_tsv': _events_bids_tsv,
-    'ucla_bids_tsv': _events_ucla_bids_tsv,
-    'tcp_bids_tsv': _events_tcp_bids_tsv,
 }
 
 
@@ -1247,15 +938,12 @@ class DataLoader:
         if output_dir is not None:
             self.output_dir = Path(output_dir).expanduser()
         else:
-            self.output_dir = _find_project_root()
+            self.output_dir = project_root()
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
         self.scan_registry: List[ScanInfo] = []
         self.df_behavior: Optional[pd.DataFrame] = None
         self._data_cache: Dict[str, np.ndarray] = {}
-        # When set (via enable_hcpya_3t_resampling), HCP-YA MRI3T timeseries are
-        # resampled onto this TR grid at load time. None disables resampling.
-        self.resample_to_tr: Optional[float] = None
 
         if load_behavior:
             self.load_behavioral_data()
@@ -1273,42 +961,14 @@ class DataLoader:
     # Config helpers
     # --------------------------------------------------------------------------
 
-    def get_tr(self, modality: str, task: Optional[str] = None) -> float:
-        """Return the TR (seconds) for a modality, or for one task within it.
-
-        """
+    def get_tr(self, modality: str) -> float:
+        """Return the TR (seconds) for a modality."""
         if modality not in self.config.modalities:
             raise ValueError(
                 f"Unknown modality '{modality}' for dataset '{self.dataset}'. "
                 f"Available: {list(self.config.modalities)}"
             )
-        mod_config = self.config.modalities[modality]
-        if task is not None and 'tr' in mod_config.task_params.get(task, {}):
-            return float(mod_config.task_params[task]['tr'])
-        return mod_config.tr
-
-    def enable_hcpya_3t_resampling(self, target_modality: str = 'MRI7T') -> float:
-        """Resample HCP-YA 3T timeseries onto the target modality's TR grid at load time.
-
-        Sets ``self.resample_to_tr`` so that every subsequent load of an HCP-YA
-        MRI3T scan (rest and task) is resampled from its native TR
-        (``get_tr('MRI3T')``) onto the target modality's TR (default MRI7T = 1.0 s).
-        The ``tr`` of every MRI3T scan already in the registry is rewritten to the
-        target so that cache keys, the exported scan registry, and all output
-        filenames consistently reflect the resampled sampling grid. The native TR
-        used to compute the resampling ratio is always read from the config, so it
-        remains recoverable after this rewrite.
-
-        Only valid for HCP-YA. Returns the target TR (seconds).
-        """
-        if self.dataset != 'HCP-YA':
-            raise ValueError("3T->7T resampling is only defined for HCP-YA.")
-        target_tr = self.get_tr(target_modality)
-        self.resample_to_tr = target_tr
-        for scan in self.scan_registry:
-            if scan.modality == 'MRI3T':
-                scan.tr = target_tr
-        return target_tr
+        return self.config.modalities[modality].tr
 
     # --------------------------------------------------------------------------
     # Registration
@@ -1322,6 +982,7 @@ class DataLoader:
         space: str,
         seg: str,
         modality: str,
+        rest_variant: str = REST_VARIANT_DEFAULT,
     ) -> List[ScanInfo]:
         """Register scans for all combinations of subjects × sessions × tasks.
 
@@ -1339,14 +1000,31 @@ class DataLoader:
             Parcellation/segmentation label.
         modality : str
             One of the modalities defined in this dataset's config.
+        rest_variant : str
+            Source of the rest runs. Any value other than the default must be one of the
+            modality's ``rest_variants`` in the YAML; it becomes the ``desc`` of every rest scan,
+            so it is in the scan key and selects the ``desc-<variant>`` file. Task scans never
+            carry it.
 
         Returns
         -------
         list of ScanInfo
             The newly registered scans.
+
+        Raises
+        ------
+        ValueError
+            If ``rest_variant`` is not the default and the modality does not list it.
         """
-        # Per task, not per modality: a dataset may mix acquisitions within one modality.
-        tr_of = {task: self.get_tr(modality, task) for task in tasks}
+        rest_desc = None
+        if rest_variant != REST_VARIANT_DEFAULT:
+            listed = self.config.modalities[modality].rest_variants
+            if rest_variant not in listed:
+                raise ValueError(
+                    f"{self.dataset} {modality} has no rest_variant {rest_variant!r}; its YAML lists "
+                    f"{listed or 'none'} besides {REST_VARIANT_DEFAULT!r}.")
+            rest_desc = rest_variant
+        tr = self.get_tr(modality)
         registered = []
         for subject_id in subject_ids:
             for session in sessions:
@@ -1358,9 +1036,10 @@ class DataLoader:
                         space=space,
                         seg=seg,
                         modality=modality,
-                        tr=tr_of[task],
-                        rbc=self.config.rbc,
+                        tr=tr,
                     )
+                    if scan.condition == 'rest':
+                        scan.desc = rest_desc
                     if scan not in self.scan_registry:
                         self.scan_registry.append(scan)
                     registered.append(scan)
@@ -1483,7 +1162,7 @@ class DataLoader:
                 removed_sessions = sorted(units_with_missing, key=lambda u: (u[0], str(u[1])))
 
         if verbose:
-            print(f"\nValidation Summary:")
+            print("\nValidation Summary:")
             print(f"  Initially:             {initial_count} scans")
             print(f"  Existing:              {len(existing_scans)}")
             print(f"  Missing/Removed:       {len(missing_scans)} scans")
@@ -1537,10 +1216,8 @@ class DataLoader:
         """Construct the expected filepath for a scan's timeseries file.
 
         Uses the filename_template and dir_template from the dataset YAML config.
-        For datasets with use_glob=True (e.g. NKI), the glob is resolved here and
-        the first match is returned; FileNotFoundError is raised if no match. For
-        datasets with filename_template_fallbacks (e.g. PNC), fallbacks are tried
-        in order after the primary template.
+        For datasets with filename_template_fallbacks (e.g. Penn_LEAD), fallbacks are
+        tried in order when the primary template's file does not exist.
 
         Parameters
         ----------
@@ -1550,12 +1227,10 @@ class DataLoader:
         Returns
         -------
         Path
-            Path to the timeseries file (resolved for glob patterns).
+            Path to the timeseries file. It may not exist; callers check.
 
         Raises
         ------
-        FileNotFoundError
-            If use_glob=True and no file matches the pattern.
         ValueError
             If the modality is not recognised for this dataset.
         """
@@ -1572,12 +1247,13 @@ class DataLoader:
             / mod_config.data_subdir
         )
         template_kwargs = {
-            **mod_config.template_fields(scan.task),
             'subject_id': scan.subject_id,
             'session': scan.session,
             'task': scan.task,
             'space': scan.space,
             'seg': scan.seg,
+            # Only a rest scan read from a non-default rest_variant carries a desc (register_scans).
+            'desc': f'_desc-{scan.desc}' if scan.desc else '',
             'ext': mod_config.file_ext,
         }
 
@@ -1585,16 +1261,7 @@ class DataLoader:
         filename = mod_config.filename_template.format(**template_kwargs)
         filepath = dir_path / filename
 
-        # Glob-based resolution (e.g. NKI acq label varies)
-        if mod_config.use_glob:
-            matches = glob.glob(str(filepath))
-            if not matches:
-                raise FileNotFoundError(
-                    f"No file matched glob pattern: {filepath}"
-                )
-            return Path(matches[0])
-
-        # Fallback templates (e.g. PNC acq-singleband variant)
+        # Fallback templates (e.g. Penn_LEAD's CuBIDS acq-VARIANTObliquity scans)
         if not filepath.exists() and mod_config.filename_template_fallbacks:
             for fallback_template in mod_config.filename_template_fallbacks:
                 fallback = dir_path / fallback_template.format(**template_kwargs)
@@ -1607,8 +1274,7 @@ class DataLoader:
         """The ``acq-`` label of the file a scan resolves to, or None when it has none.
 
         ``acq`` is not a ScanInfo entity -- adding one would rename every cached output -- so a
-        scan found through a fallback template (PNC's ``acq-singleband``, Penn_LEAD's CuBIDS
-        ``acq-VARIANTObliquity``) looks identical to a dominant-group scan everywhere else. This
+        scan found through a fallback template (Penn_LEAD's CuBIDS ``acq-VARIANTObliquity``) looks identical to a dominant-group scan everywhere else. This
         reads it back off the resolved filename, which is what a sensitivity analysis that drops
         the variant scans needs.
         """
@@ -1813,28 +1479,9 @@ class DataLoader:
                     timeseries[:, finite_parcels] = (timeseries[:, finite_parcels]
                                                      - regr.predict(nuis))
 
-        # Optional TR resampling (HCP-YA 3T -> 7T grid only). Applied after nuisance
-        # regression and before frequency filtering, so the filter uses the new
-        # sampling rate. Only ever touches HCP-YA MRI3T scans; everything else is a
-        # no-op. The native TR is read from the config so it survives the registry
-        # tr-rewrite done by enable_hcpya_3t_resampling.
-        effective_tr = scan.tr
-        if (self.resample_to_tr is not None and self.dataset == 'HCP-YA'
-                and scan.modality == 'MRI3T'):
-            native_tr = self.get_tr(scan.modality, scan.task)
-            if not np.isclose(native_tr, self.resample_to_tr):
-                ratio = Fraction(native_tr / self.resample_to_tr).limit_denominator(1000)
-                up, down = ratio.numerator, ratio.denominator
-                n_before = timeseries.shape[0]
-                timeseries = sp.signal.resample_poly(timeseries, up, down, axis=0)
-                effective_tr = self.resample_to_tr
-                if verbose:
-                    print(f"    Resampled {native_tr}s -> {self.resample_to_tr}s "
-                          f"(up={up}, down={down}): {n_before} -> {timeseries.shape[0]} frames")
-
         if frequency_filter:
             timeseries = apply_frequency_filter(
-                timeseries.T, 1.0 / effective_tr, lowpass=lowpass, highpass=highpass
+                timeseries.T, 1.0 / scan.tr, lowpass=lowpass, highpass=highpass
             ).T
 
         if standardize:
@@ -2034,70 +1681,6 @@ class DataLoader:
 # Standalone utility functions (also used by timescales.py)
 # ==============================================================================
 
-def get_longitudinal_array(
-    data_dict: Dict[str, Optional[np.ndarray]],
-    scan_registry: List['ScanInfo'],
-    sessions: List[str],
-    task: str,
-) -> Tuple[np.ndarray, List[str]]:
-    """
-    Reshape a flat data_dict into a longitudinal array.
-
-    For each subject in the registry, looks up the data for each requested
-    session and stacks the result into a single array.  Entries missing from
-    data_dict (subject never had that session, or it failed to load) are
-    filled with NaN so the subject axis is always fully populated.
-
-    Parameters
-    ----------
-    data_dict:
-        Flat dict mapping scan-key strings to 1-D region arrays (n_regions,).
-        Typically ``timescales_processor.timescales_dict``.
-    scan_registry:
-        List of ScanInfo objects (e.g. ``data_loader.scan_registry``).
-    sessions:
-        Ordered list of session labels to include (e.g. ['1', '2']).
-    task:
-        Task name to select (e.g. 'rest' or 'nback').
-
-    Returns
-    -------
-    array : np.ndarray, shape (n_subjects, n_sessions, n_regions)
-        NaN where data is absent for a given subject/session combination.
-    subject_ids : list of str
-        Subject IDs corresponding to axis 0, in registry order.
-    """
-    # Unique subjects in registry order
-    subject_ids = list(dict.fromkeys(
-        s.subject_id for s in scan_registry if s.task == task
-    ))
-
-    # Infer n_regions from the first available entry
-    n_regions = None
-    for v in data_dict.values():
-        if v is not None:
-            n_regions = v.shape[0]
-            break
-    if n_regions is None:
-        raise ValueError("data_dict contains no non-None entries.")
-
-    array = np.full((len(subject_ids), len(sessions), n_regions), np.nan)
-
-    # Build a lookup: (subject_id, session) -> scan key
-    lookup: Dict[Tuple[str, str], str] = {}
-    for scan in scan_registry:
-        if scan.task == task and scan.session in sessions:
-            lookup[(scan.subject_id, scan.session)] = str(scan)
-
-    for i, subject_id in enumerate(subject_ids):
-        for j, session in enumerate(sessions):
-            key = lookup.get((subject_id, session))
-            if key and key in data_dict and data_dict[key] is not None:
-                array[i, j, :] = data_dict[key]
-
-    return array, subject_ids
-
-
 def parse_scan_string(scan_string: str) -> Dict[str, str]:
     """
     Parse a key-value formatted scan string into a dictionary.
@@ -2161,103 +1744,6 @@ def get_task_events_fmri(ev_dir: str) -> pd.DataFrame:
         except Exception:
             pass
     return task_events.reset_index(drop=True)
-
-
-def get_task_events_meg(
-    task_events_file_path: str,
-    onset_column: str = 'Stim.OnsetTime',
-    duration_ms: float = 2000,
-    verbose: bool = True,
-) -> pd.DataFrame:
-    """
-    Extract trial onsets and durations from an HCP MEG working-memory Excel file.
-
-    Parameters
-    ----------
-    task_events_file_path : str
-        Path to the MEG working memory Excel file.
-    onset_column : str
-        Column to use for trial onset timing (default: 'Stim.OnsetTime').
-    duration_ms : float
-        Duration of each trial in milliseconds (default: 2000).
-    verbose : bool
-        Print extraction summary.
-
-    Returns
-    -------
-    pd.DataFrame
-        Columns: onset, duration, trial_type, block_number (times in seconds).
-    """
-    try:
-        data = pd.read_excel(task_events_file_path, sheet_name=0)
-    except Exception as e:
-        raise ValueError(f"Could not read Excel file: {e}") from e
-
-    if onset_column not in data.columns:
-        available = [c for c in data.columns if 'OnsetTime' in c]
-        raise ValueError(
-            f"Column '{onset_column}' not found. Available timing columns: {available}"
-        )
-
-    timing_data_count = data[onset_column].notna().sum()
-    if verbose:
-        print(f"Timing column '{onset_column}' has {timing_data_count}/{len(data)} non-null values")
-
-    valid = data[onset_column].notna() & data['BlockType'].notna()
-    data_clean = data[valid].copy()
-    if len(data_clean) == 0:
-        raise ValueError(
-            f"No valid trials found with both {onset_column} and BlockType data"
-        )
-    if verbose:
-        print(f"Found {len(data_clean)} valid trials "
-              f"(removed {len(data) - len(data_clean)} non-task trials)")
-
-    onsets = data_clean[onset_column].values / 1000.0
-    duration_sec = duration_ms / 1000.0
-    durations = np.full(len(onsets), duration_sec)
-    trial_types = determine_trial_types_fixed(data_clean)
-    block_numbers = extract_block_numbers(data_clean)
-
-    events_df = pd.DataFrame({
-        'onset': onsets,
-        'duration': durations,
-        'trial_type': trial_types,
-        'block_number': block_numbers,
-    }).sort_values('onset').reset_index(drop=True)
-
-    if verbose:
-        print(f"\nTrial extraction summary:")
-        print(f"  Total trials: {len(events_df)}")
-        print(f"  Trial duration: {duration_sec:.3f} s")
-        print(f"  Onset range: {events_df['onset'].min():.1f} – {events_df['onset'].max():.1f} s")
-        print(f"  Trial types: {events_df['trial_type'].value_counts().to_dict()}")
-        print(f"  Block numbers: {sorted(events_df['block_number'].unique())}")
-
-    return events_df
-
-
-def determine_trial_types_fixed(data: pd.DataFrame) -> List[str]:
-    """Map BlockType column entries to '0back' / '2back' / 'unknown'."""
-    result = []
-    for bt in data['BlockType'].values:
-        if pd.isna(bt):
-            result.append('unknown')
-        elif '0-Back' in str(bt) or '0Back' in str(bt):
-            result.append('0back')
-        elif '2-Back' in str(bt) or '2Back' in str(bt):
-            result.append('2back')
-        else:
-            result.append('unknown')
-    return result
-
-
-def extract_block_numbers(data: pd.DataFrame) -> List[int]:
-    """Extract block numbers from BlockNumber column."""
-    return [
-        int(n) if not pd.isna(n) else -1
-        for n in data['BlockNumber'].values
-    ]
 
 
 def split_hcpd_string(s: str) -> str:

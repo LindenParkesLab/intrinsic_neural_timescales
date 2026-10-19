@@ -41,9 +41,9 @@ WM_SHAPE       = (N_PARCELS, 405)    # tfMRIWMLR
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _make_scan(subject_id=SUBJECT_A, task='rfMRIREST1LR', modality='MRI3T',
-               session=SESSION, seg=SEG, space=SPACE, tr=0.72, rbc=False):
+               session=SESSION, seg=SEG, space=SPACE, tr=0.72):
     return ScanInfo(subject_id=subject_id, task=task, space=space, seg=seg,
-                    modality=modality, tr=tr, session=session, rbc=rbc)
+                    modality=modality, tr=tr, session=session)
 
 
 # ==============================================================================
@@ -58,7 +58,7 @@ class TestConfig:
 
     def test_modalities_present(self):
         cfg = load_dataset_config('HCP-YA')
-        assert set(cfg.modalities) == {'MRI3T', 'MRI7T', 'MEG'}
+        assert set(cfg.modalities) == {'MRI3T', 'MRI7T'}
 
     def test_tr_mri3t(self):
         cfg = load_dataset_config('HCP-YA')
@@ -68,12 +68,6 @@ class TestConfig:
         cfg = load_dataset_config('HCP-YA')
         assert cfg.modalities['MRI7T'].tr == pytest.approx(1.0)
 
-    def test_tr_meg(self):
-        cfg = load_dataset_config('HCP-YA')
-        assert cfg.modalities['MEG'].tr == pytest.approx(1 / 508.63, rel=1e-3)
-
-    def test_rbc_false(self):
-        assert load_dataset_config('HCP-YA').rbc is False
 
     def test_behavior_handler(self):
         assert load_dataset_config('HCP-YA').behavior_handler == 'hcp_unrestricted_restricted'
@@ -81,10 +75,6 @@ class TestConfig:
     def test_mri3t_file_ext(self):
         cfg = load_dataset_config('HCP-YA')
         assert cfg.modalities['MRI3T'].file_ext == '.ptseries.nii'
-
-    def test_meg_file_ext(self):
-        cfg = load_dataset_config('HCP-YA')
-        assert cfg.modalities['MEG'].file_ext == '.ptseries.npy'
 
     def test_unknown_dataset_raises(self):
         with pytest.raises(FileNotFoundError, match="No config found"):
@@ -116,13 +106,10 @@ class TestScanInfo:
         assert reconstructed.session is None
         assert reconstructed == scan
 
-    def test_roundtrip_preserves_rbc_true(self):
-        scan = _make_scan(rbc=True)
-        assert ScanInfo.from_dict(scan.to_dict()).rbc is True
-
-    def test_roundtrip_preserves_rbc_false(self):
-        scan = _make_scan(rbc=False)
-        assert ScanInfo.from_dict(scan.to_dict()).rbc is False
+    def test_from_dict_ignores_the_retired_rbc_column(self):
+        """Registries exported before the rbc flag was removed still load."""
+        scan = _make_scan()
+        assert ScanInfo.from_dict({**scan.to_dict(), 'rbc': 'False'}) == scan
 
     def test_str_contains_subject(self):
         assert f'sub-{SUBJECT_A}' in str(_make_scan())
@@ -139,7 +126,7 @@ class TestScanInfo:
     def test_to_dict_keys(self):
         d = _make_scan().to_dict()
         for key in ('sub', 'ses', 'task', 'space', 'seg', 'modality', 'tr',
-                    'condition', 'rbc', 'scan_string'):
+                    'condition', 'scan_string'):
             assert key in d
 
     def test_different_subjects_not_equal(self):
@@ -160,7 +147,6 @@ class TestPathConstruction:
         ('rfMRIREST1LR',  'MRI3T', 'parcellated_data',     '.ptseries.nii'),
         ('tfMRIWMLR',     'MRI3T', 'parcellated_data',     '.ptseries.nii'),
         ('rfMRIREST17TPA','MRI7T', 'parcellated_data_7T',  '.ptseries.nii'),
-        ('3Restin',       'MEG',   'parcellated_data_meg', '.ptseries.npy'),
     ])
     def test_subdir_and_ext(self, hcpya_loader, task, modality, expected_subdir, expected_ext):
         scan = _make_scan(task=task, modality=modality, tr=hcpya_loader.get_tr(modality))
