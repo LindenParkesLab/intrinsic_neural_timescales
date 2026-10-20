@@ -1,4 +1,5 @@
 # Intrinsic neural timescales
+[![DOI](https://zenodo.org/badge/1029321749.svg)](https://doi.org/10.5281/zenodo.23503423)
 
 ## Background
 
